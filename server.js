@@ -97,9 +97,19 @@ app.post("/publish-draft", async (req, res) => {
 
     const page = await context.newPage();
 
-    // Navigate to the draft editor using TikTok's exact URL shape from
-    // the captured publish-request referer. Both campaign_draft_id and
-    // temp_campaign_id point at the sketch id.
+    // First, hit the campaign manager for THIS advertiser. The captured
+    // cookies' "last active" advertiser may differ from the one we want
+    // to publish in — this initial navigation tells TikTok to activate
+    // the requested account so subsequent draft-editor calls have the
+    // right context.
+    await page.goto(
+      `https://ads.tiktok.com/i18n/manage/campaign?aadvid=${encodeURIComponent(advertiserId)}`,
+      { waitUntil: "domcontentloaded", timeout: 30_000 }
+    ).catch(() => {});
+    await page.waitForTimeout(1500);
+
+    // Now navigate to the draft editor using TikTok's exact URL shape
+    // from the captured publish-request referer.
     const editorUrl =
       `https://ads.tiktok.com/i18n/creation/1nn/create/campaign?aadvid=${encodeURIComponent(advertiserId)}` +
       `&source=campaign_list` +
@@ -228,15 +238,37 @@ app.post("/publish-draft", async (req, res) => {
       return false;
     }).catch(() => {});
 
-    // Wait for the publish XHR to flush. 3s is enough for TikTok's
-    // /create_by_snap/ to complete; the campaign appears in the list a
-    // few seconds later.
-    await page.waitForTimeout(3000);
+    // Wait for the publish XHR to flush.
+    await page.waitForTimeout(4000);
+
+    // Verify: check if a success toast appeared, or look for error
+    // indicators. Take a screenshot either way so we can debug.
+    const postState = await page.evaluate(() => {
+      const bodyText = (document.body.innerText || "").slice(0, 5000);
+      // Common TikTok success/error markers
+      const hasSuccess = /publish.*success|published successfully|create success|成功/i.test(bodyText);
+      const hasError = /failed|error|insufficient|permission denied|risk/i.test(bodyText.slice(0, 2000));
+      return { hasSuccess, hasError, bodyText: bodyText.slice(0, 800), url: location.href };
+    });
+
+    const shot = await page.screenshot({ fullPage: false }).catch(() => null);
+    const shotId = shot ? saveScreenshot(shot) : null;
+    const base = req.protocol + "://" + req.get("host");
 
     await browser.close();
+
+    // If we explicitly see an error and no success, fail.
+    if (postState.hasError && !postState.hasSuccess) {
+      return res.status(500).json({
+        ok: false,
+        error: `Post-publish state shows error. screenshot=${shotId ? `${base}/screenshots/${shotId}` : "n/a"} | body=${postState.bodyText}`,
+      });
+    }
+
     return res.json({
       ok: true,
       newCampaignId: campaignSketchId,
+      screenshot: shotId ? `${base}/screenshots/${shotId}` : undefined,
     });
   } catch (err) {
     if (browser) await browser.close().catch(() => {});
