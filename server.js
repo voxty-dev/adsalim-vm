@@ -74,16 +74,16 @@ app.post("/publish-draft", async (req, res) => {
 
     const page = await context.newPage();
 
-    // Navigate to the draft editor. TikTok serves the "edit draft" view
-    // when we pass campaign_draft_id WITHOUT creation_type=create_new.
-    // The create_new flag instead routes to a "Create campaign from
-    // scratch" flow that, when submitted, makes ANOTHER draft instead
-    // of publishing the existing one. Use source=draft_list to mirror
-    // what TikTok's drafts page hands the editor.
+    // Navigate to the draft editor using TikTok's exact URL shape from
+    // the captured publish-request referer. Both campaign_draft_id and
+    // temp_campaign_id point at the sketch id.
     const editorUrl =
       `https://ads.tiktok.com/i18n/creation/1nn/create/campaign?aadvid=${encodeURIComponent(advertiserId)}` +
+      `&source=campaign_list` +
       `&campaign_draft_id=${encodeURIComponent(campaignSketchId)}` +
-      `&source=draft_list&is_from_campaign_list=1`;
+      `&creation_type=create_new` +
+      `&objective_type=3` +
+      `&temp_campaign_id=${encodeURIComponent(campaignSketchId)}`;
     await page.goto(editorUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
 
     if (page.url().includes("/login") || page.url().includes("/passport")) {
