@@ -1,0 +1,18 @@
+{
+  "name": "adsalim-vm-service",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Headless-browser duplicate service for TikTok Smart+ campaigns. Runs Playwright with real Chromium on a VM (Railway / Render / etc.) so it can drive TikTok's UI without tripping anti-bot protection.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "playwright": "^1.49.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
