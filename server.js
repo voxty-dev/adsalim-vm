@@ -150,19 +150,30 @@ app.post("/publish-draft", async (req, res) => {
     await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
     await page.waitForTimeout(1000);
 
-    // Step D: click "Publish all" — the actual publish action.
+    // Step D: click "Publish all". TikTok renders this as a styled <div>
+    // (with a dropdown arrow), not a <button> — so we widen the
+    // selector to any clickable element. Match strictly on visible text
+    // so we don't accidentally click the dropdown arrow's own item.
     const publishClicked = await page.evaluate(() => {
-      const buttons = Array.from(document.querySelectorAll("button"));
-      const patterns = [/publish all/, /^publish$/];
+      const all = Array.from(document.querySelectorAll(
+        'button, [role="button"], a, [class*="btn" i], [class*="button" i]'
+      ));
+      const patterns = [/^publish all$/, /^publish$/];
       for (const pat of patterns) {
-        const match = buttons.find(b => {
-          const t = (b.innerText || b.textContent || "").trim().toLowerCase();
-          return pat.test(t) && !b.disabled;
+        const match = all.find(el => {
+          if (el.disabled) return false;
+          // Skip hidden elements
+          const style = window.getComputedStyle(el);
+          if (style.display === "none" || style.visibility === "hidden") return false;
+          const text = (el.innerText || el.textContent || "").trim().toLowerCase();
+          // Some elements wrap "Publish all" with a dropdown arrow icon
+          // ("Publish all ▾") — match if text starts with publish all.
+          return pat.test(text) || /^publish all\s*[▾▼⌄]/i.test(text);
         });
         if (match) {
           match.scrollIntoView({ block: "center" });
           match.click();
-          return match.innerText.trim();
+          return (match.innerText || match.textContent || "").trim();
         }
       }
       return false;
@@ -170,18 +181,21 @@ app.post("/publish-draft", async (req, res) => {
 
     if (!publishClicked) {
       const diag = await page.evaluate(() => {
-        const buttons = Array.from(document.querySelectorAll("button")).map(b => ({
-          text: (b.innerText || "").trim().slice(0, 50),
-          disabled: b.disabled,
-        })).filter(b => b.text).slice(0, 30);
-        return { url: location.href, buttons };
+        const all = Array.from(document.querySelectorAll(
+          'button, [role="button"], a, [class*="btn" i], [class*="button" i]'
+        )).map(b => ({
+          tag: b.tagName.toLowerCase(),
+          text: (b.innerText || b.textContent || "").trim().slice(0, 60),
+          disabled: !!b.disabled,
+        })).filter(b => b.text).slice(0, 50);
+        return { url: location.href, all };
       });
       const shot = await page.screenshot({ fullPage: true }).catch(() => null);
       const shotId = shot ? saveScreenshot(shot) : null;
       const base = req.protocol + "://" + req.get("host");
       await browser.close();
       return res.status(500).json({
-        error: `Publish button not found. url=${diag.url} | screenshot=${shotId ? `${base}/screenshots/${shotId}` : "n/a"} | buttons=${JSON.stringify(diag.buttons).slice(0, 800)}`,
+        error: `Publish button not found. url=${diag.url} | screenshot=${shotId ? `${base}/screenshots/${shotId}` : "n/a"} | clickables=${JSON.stringify(diag.all).slice(0, 1500)}`,
       });
     }
 
