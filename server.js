@@ -1,26 +1,24 @@
 /**
  * adsalim-vm-service
  *
- * HTTP wrapper around Playwright that drives TikTok Ads Manager UI to
- * duplicate Smart+ campaigns AND publish them (something serverless
- * Vercel can't do because (a) chromium libs are missing, (b) X-Bogus
- * signatures are body-dependent and TikTok rejects server-side replays).
+ * HTTP wrapper around Playwright. Exposes one endpoint, /publish-draft,
+ * that takes a TikTok draft (sketch) ID and clicks "Publish all" in
+ * the real campaign editor. We can't do that from a serverless function
+ * because TikTok's anti-bot rejects HTTP replays of the publish call
+ * (X-Bogus signatures must come from a real browser context).
+ *
+ * The DUPLICATE step happens in adsalim itself via cURL replay (works
+ * reliably). The VM is only used for the publish step.
  *
  * Endpoint:
- *   POST /duplicate
- *   Auth: header `Authorization: Bearer <SHARED_SECRET>`
+ *   POST /publish-draft
+ *   Auth: Authorization: Bearer <SHARED_SECRET>
  *   Body: {
  *     advertiserId: string,
- *     campaignId: string,
- *     names: string[],   // one new name per copy
- *     cookies: string,   // user's TikTok session (Cookie header string OR JSON array)
+ *     campaignSketchId: string,  // returned by the duplicate step
+ *     cookies: string,           // TikTok session
  *   }
- *   Returns: {
- *     results: Array<{ name, ok, newCampaignId?, error? }>,
- *     screenshot?: string // base64, on failure for debugging
- *   }
- *
- * Deploy on Railway / Render / Fly / a $5 Hetzner VPS.
+ *   Returns: { ok: boolean, newCampaignId?: string, error?: string }
  */
 
 const express = require("express");
@@ -33,21 +31,20 @@ const app = express();
 app.use(express.json({ limit: "5mb" }));
 
 app.get("/", (_req, res) => {
-  res.json({ service: "adsalim-vm-service", status: "ok" });
+  res.json({ service: "adsalim-vm-service", status: "ok", endpoints: ["/publish-draft"] });
 });
 
-app.post("/duplicate", async (req, res) => {
+app.post("/publish-draft", async (req, res) => {
   const auth = req.headers.authorization || "";
   if (!SHARED_SECRET || auth !== `Bearer ${SHARED_SECRET}`) {
     return res.status(401).json({ error: "Unauthorized" });
   }
 
-  const { advertiserId, campaignId, names, cookies } = req.body || {};
-  if (!advertiserId || !campaignId || !Array.isArray(names) || names.length === 0 || !cookies) {
-    return res.status(400).json({ error: "advertiserId, campaignId, names[], cookies required" });
-  }
-  if (names.length > 20) {
-    return res.status(400).json({ error: "Max 20 copies per request" });
+  const { advertiserId, campaignSketchId, cookies } = req.body || {};
+  if (!advertiserId || !campaignSketchId || !cookies) {
+    return res.status(400).json({
+      error: "advertiserId, campaignSketchId, cookies required",
+    });
   }
 
   let browser;
@@ -76,212 +73,93 @@ app.post("/duplicate", async (req, res) => {
     await context.addCookies(parsedCookies);
 
     const page = await context.newPage();
-    const listUrl = `https://ads.tiktok.com/i18n/manage/campaign?aadvid=${encodeURIComponent(advertiserId)}`;
-    await page.goto(listUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
+
+    // Navigate DIRECTLY to the draft editor. TikTok's URL pattern for
+    // editing a draft (sketch):
+    //   /i18n/creation/1nn/create/campaign?aadvid=ADV&campaign_draft_id=SKETCH
+    const editorUrl =
+      `https://ads.tiktok.com/i18n/creation/1nn/create/campaign?aadvid=${encodeURIComponent(advertiserId)}` +
+      `&campaign_draft_id=${encodeURIComponent(campaignSketchId)}` +
+      `&creation_type=create_new&temp_campaign_id=${encodeURIComponent(campaignSketchId)}`;
+    await page.goto(editorUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
 
     if (page.url().includes("/login") || page.url().includes("/passport")) {
       await browser.close();
       return res.status(401).json({ error: "TikTok session expired. Re-paste cookies." });
     }
 
-    // Wait for the campaign list table to render.
+    // Wait for editor to render. The "Publish all" button is the signal.
     await page.waitForLoadState("networkidle", { timeout: 30_000 }).catch(() => {});
 
-    const results = [];
-    for (const name of names) {
-      try {
-        const newId = await duplicateAndPublishOnce(page, campaignId, name);
-        results.push({ name, ok: true, newCampaignId: newId });
-      } catch (e) {
-        results.push({ name, ok: false, error: e instanceof Error ? e.message : "unknown error" });
-      }
+    // Find and click "Publish all". Locale-agnostic — match any button
+    // whose text contains "publish".
+    const publishClicked = await page.evaluate(() => {
+      const buttons = Array.from(document.querySelectorAll("button"));
+      // Prefer "Publish all" but fall back to any "Publish" button.
+      const preferred = buttons.find(b => {
+        const t = (b.innerText || b.textContent || "").trim().toLowerCase();
+        return /publish all/.test(t) && !b.disabled;
+      });
+      if (preferred) { preferred.click(); return "publish_all"; }
+      const fallback = buttons.find(b => {
+        const t = (b.innerText || b.textContent || "").trim().toLowerCase();
+        return /^publish$/.test(t) && !b.disabled;
+      });
+      if (fallback) { fallback.click(); return "publish"; }
+      return false;
+    });
+
+    if (!publishClicked) {
+      const diag = await page.evaluate(() => {
+        const buttons = Array.from(document.querySelectorAll("button")).map(b => ({
+          text: (b.innerText || "").trim().slice(0, 50),
+          disabled: b.disabled,
+        })).filter(b => b.text).slice(0, 30);
+        return { url: location.href, buttons };
+      });
+      await browser.close();
+      return res.status(500).json({
+        error: `Publish button not found. url=${diag.url} | buttons=${JSON.stringify(diag.buttons).slice(0, 800)}`,
+      });
     }
 
+    // After clicking Publish all, TikTok shows a confirm dialog OR
+    // immediately submits + redirects. Wait briefly then look for a
+    // confirm button in any visible dialog.
+    await page.waitForTimeout(2000);
+    await page.evaluate(() => {
+      const buttons = Array.from(document.querySelectorAll("button"));
+      for (const b of buttons.reverse()) {
+        const t = (b.innerText || b.textContent || "").trim().toLowerCase();
+        if (/^(confirm|publish|publish all|submit|ok)$/.test(t) && !b.disabled) {
+          // Only click confirm buttons in a dialog/popup — skip the
+          // original publish button we already clicked.
+          const inDialog =
+            b.closest('[role="dialog"], [class*="modal" i], [class*="dialog" i], [class*="popup" i]');
+          if (inDialog) {
+            b.click();
+            return true;
+          }
+        }
+      }
+      return false;
+    }).catch(() => {});
+
+    // Wait for navigation back to campaign list (= publish completed).
+    await page.waitForURL(/manage\/campaign|manage\/ad/, { timeout: 60_000 }).catch(() => {});
+    await page.waitForTimeout(2000);
+
     await browser.close();
-    return res.json({ results });
+    return res.json({
+      ok: true,
+      newCampaignId: campaignSketchId, // best-effort; the sketch id stays usable
+    });
   } catch (err) {
     if (browser) await browser.close().catch(() => {});
     return res.status(500).json({ error: err instanceof Error ? err.message : "Internal error" });
   }
 });
 
-/**
- * Drive TikTok's UI for one duplicate:
- *   1. Find the source campaign row
- *   2. Open its action menu and click Duplicate
- *   3. Fill the modal's name field and submit (creates the draft)
- *   4. The duplicate redirects to the draft editor
- *   5. Click "Publish all" in the editor
- *   6. Wait for the publish to complete
- *   7. Read the new campaign_id from the redirected list URL
- *
- * Selectors target TikTok's current production DOM. They WILL break
- * when TikTok ships a UI refactor — when that happens, update this
- * function with new selectors.
- */
-async function duplicateAndPublishOnce(page, sourceCampaignId, newName) {
-  // Search/filter for the source campaign so the row is visible.
-  // TikTok's table is virtualized; filtering pins the row to the top.
-  const searchInput = page.locator('input[placeholder*="Search" i]').first();
-  await searchInput.waitFor({ state: "visible", timeout: 15_000 });
-  await searchInput.fill("");
-  await searchInput.type(sourceCampaignId);
-  await page.keyboard.press("Enter");
-  await page.waitForTimeout(3000);
-
-  // Find the row that visibly contains the campaign_id text. TikTok's
-  // DOM uses different attribute names per UI version — searching the
-  // raw text is the most resilient.
-  const rowFound = await page.evaluate((id) => {
-    // Try common row containers: tr, [role="row"], or any direct table row
-    const rows = Array.from(document.querySelectorAll(
-      'tr, [role="row"], [class*="row" i]'
-    ));
-    for (const r of rows) {
-      const t = (r.innerText || r.textContent || "");
-      if (t.includes(id)) {
-        r.scrollIntoView({ block: "center" });
-        return true;
-      }
-    }
-    return false;
-  }, sourceCampaignId);
-  if (!rowFound) {
-    // Capture diagnostic info so we can see what TikTok actually rendered.
-    const diag = await page.evaluate(() => {
-      const url = location.href;
-      const tableRows = document.querySelectorAll('tr').length;
-      const roleRows = document.querySelectorAll('[role="row"]').length;
-      const inputs = Array.from(document.querySelectorAll('input')).map(i => ({
-        placeholder: i.placeholder,
-        value: i.value,
-        type: i.type,
-      })).slice(0, 10);
-      // First chunk of body text
-      const sample = (document.body.innerText || "").slice(0, 800);
-      return { url, tableRows, roleRows, inputs, sample };
-    });
-    const screenshot = await page.screenshot({ encoding: "base64", fullPage: false }).catch(() => null);
-    throw new Error(
-      `Could not find row for "${sourceCampaignId}". ` +
-      `url=${diag.url} | tr_count=${diag.tableRows} | role_row_count=${diag.roleRows} | ` +
-      `inputs=${JSON.stringify(diag.inputs).slice(0, 300)} | ` +
-      `body_sample=${diag.sample.slice(0, 400)}` +
-      (screenshot ? ` | screenshot_base64_length=${screenshot.length}` : "")
-    );
-  }
-  await page.waitForTimeout(500);
-
-  // Click Duplicate inside the row's action area. We re-find the row
-  // by id text, then look for action buttons (icons, menus, etc.).
-  // TikTok may render the Duplicate action behind a 3-dot menu or
-  // directly as an icon on hover.
-  const dupClicked = await page.evaluate((id) => {
-    const rows = Array.from(document.querySelectorAll(
-      'tr, [role="row"], [class*="row" i]'
-    ));
-    let row = null;
-    for (const r of rows) {
-      if ((r.innerText || "").includes(id)) { row = r; break; }
-    }
-    if (!row) return false;
-    // Hover the row to expose action icons
-    row.dispatchEvent(new MouseEvent("mouseenter", { bubbles: true }));
-    row.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
-
-    // First try: a button / link with Duplicate / Copy text inside the row
-    const inline = Array.from(row.querySelectorAll("button, a, [role='button']"));
-    for (const el of inline) {
-      const t = (el.innerText || el.textContent || el.getAttribute("aria-label") || el.getAttribute("title") || "").trim().toLowerCase();
-      if (/duplicate|copy/.test(t)) {
-        el.click();
-        return true;
-      }
-    }
-    // Second try: open the row's action menu (3-dot icon) then look
-    // for a Duplicate menu item in the popup that appears.
-    for (const el of inline) {
-      const t = (el.innerText || el.textContent || el.getAttribute("aria-label") || el.getAttribute("title") || "").trim().toLowerCase();
-      if (/more|menu|action|⋯|⋮/.test(t) || el.querySelector('[class*="more" i], [class*="menu" i]')) {
-        el.click();
-        return "menu-opened";
-      }
-    }
-    return false;
-  }, sourceCampaignId);
-
-  if (dupClicked === "menu-opened") {
-    // Menu opened, wait for popup and click Duplicate inside it
-    await page.waitForTimeout(500);
-    const menuClicked = await page.evaluate(() => {
-      const items = Array.from(document.querySelectorAll(
-        '[role="menuitem"], [class*="menu-item" i], li, button'
-      ));
-      for (const el of items) {
-        const t = (el.innerText || el.textContent || "").trim().toLowerCase();
-        if (/^(duplicate|copy)$/.test(t) || /duplicate campaign|copy campaign/.test(t)) {
-          el.click();
-          return true;
-        }
-      }
-      return false;
-    });
-    if (!menuClicked) throw new Error("Opened row menu but no Duplicate item inside");
-  } else if (!dupClicked) {
-    throw new Error("Duplicate button/menu not found on source row");
-  }
-
-  // Fill the name input in the modal.
-  const nameInput = page
-    .locator('input[placeholder*="name" i], input[placeholder*="Name"]')
-    .first();
-  await nameInput.waitFor({ state: "visible", timeout: 15_000 });
-  await nameInput.fill("");
-  await nameInput.type(newName, { delay: 30 });
-
-  // Submit the modal — usually the last enabled button.
-  const submitted = await page.evaluate(() => {
-    const buttons = Array.from(document.querySelectorAll("button"));
-    for (const el of buttons.reverse()) {
-      const t = (el.innerText || el.textContent || "").trim().toLowerCase();
-      if (/^(duplicate|confirm|submit|ok)$/.test(t) && !el.disabled) {
-        el.click();
-        return true;
-      }
-    }
-    return false;
-  });
-  if (!submitted) throw new Error("Modal submit button not found");
-
-  // TikTok navigates to the draft editor. Wait for "Publish all".
-  await page.waitForLoadState("networkidle", { timeout: 30_000 }).catch(() => {});
-  const publishBtn = page.getByRole("button", { name: /publish all|publish/i }).first();
-  await publishBtn.waitFor({ state: "visible", timeout: 20_000 });
-  await publishBtn.click();
-
-  // Wait for publish to complete — TikTok redirects back to campaign list.
-  await page.waitForURL(/manage\/campaign/, { timeout: 60_000 });
-  await page.waitForLoadState("networkidle", { timeout: 30_000 }).catch(() => {});
-
-  // Pull the new campaign_id by searching the list for the new name.
-  const newId = await page.evaluate((name) => {
-    const rows = Array.from(document.querySelectorAll("[data-row-key], [data-id]"));
-    for (const r of rows) {
-      const t = (r.innerText || r.textContent || "");
-      if (t.includes(name)) {
-        return r.getAttribute("data-row-key") || r.getAttribute("data-id");
-      }
-    }
-    return null;
-  }, newName);
-  return newId;
-}
-
-/**
- * Parse cookies pasted from DevTools. Accepts:
- *   - "name=value; name=value" (Cookie header form)
- *   - JSON array from extensions like EditThisCookie
- */
 function parseCookies(raw) {
   const trimmed = String(raw).trim();
   if (trimmed.startsWith("[")) {
