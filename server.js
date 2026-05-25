@@ -114,9 +114,15 @@ app.post("/publish-draft", async (req, res) => {
       return res.status(401).json({ error: "TikTok session expired. Re-paste cookies." });
     }
 
-    // Wait for editor to render fully.
-    await page.waitForLoadState("networkidle", { timeout: 30_000 }).catch(() => {});
-    await page.waitForTimeout(3000);
+    // Wait just for DOM-ready instead of networkidle — TikTok's
+    // analytics pings keep the network busy forever, so networkidle
+    // wastes its full 30s timeout. domcontentloaded fires fast.
+    await page.waitForLoadState("domcontentloaded", { timeout: 15_000 }).catch(() => {});
+
+    // Wait specifically until SOME button is rendered. Most of the
+    // page's UI mounts within a second of DOM-ready.
+    await page.waitForSelector('button, [role="button"]', { timeout: 15_000 }).catch(() => {});
+    await page.waitForTimeout(800);
 
     // Step A: dismiss any onboarding tooltips ("Got it" buttons) so they
     // don't block subsequent clicks.
@@ -125,7 +131,6 @@ app.post("/publish-draft", async (req, res) => {
         .filter(b => /^got it$/i.test((b.innerText || "").trim()));
       for (const b of gotItButtons) b.click();
     }).catch(() => {});
-    await page.waitForTimeout(500);
 
     // Step B: if a validation warning is shown ("Check ad groups" +
     // "Create anyway"), click "Create anyway" to dismiss and transition
@@ -143,12 +148,13 @@ app.post("/publish-draft", async (req, res) => {
       return false;
     });
     if (dismissedWarning) {
-      await page.waitForTimeout(2000); // let the editor transition render
+      // Editor transition is fast — 800ms is plenty.
+      await page.waitForTimeout(800);
     }
 
     // Step C: scroll to surface the sticky-footer Publish button.
     await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-    await page.waitForTimeout(1000);
+    await page.waitForTimeout(400);
 
     // Step D: click "Publish all". TikTok renders this as a styled <div>
     // (with a dropdown arrow), not a <button> — so we widen the
@@ -200,16 +206,15 @@ app.post("/publish-draft", async (req, res) => {
     }
 
     // After clicking Publish all, TikTok shows a confirm dialog OR
-    // immediately submits + redirects. Wait briefly then look for a
-    // confirm button in any visible dialog.
-    await page.waitForTimeout(2000);
+    // immediately submits + redirects. Capture the pre-click URL so we
+    // can detect ANY change as "publish completed".
+    const preClickUrl = page.url();
+    await page.waitForTimeout(800);
     await page.evaluate(() => {
       const buttons = Array.from(document.querySelectorAll("button"));
       for (const b of buttons.reverse()) {
         const t = (b.innerText || b.textContent || "").trim().toLowerCase();
         if (/^(confirm|publish|publish all|submit|ok)$/.test(t) && !b.disabled) {
-          // Only click confirm buttons in a dialog/popup — skip the
-          // original publish button we already clicked.
           const inDialog =
             b.closest('[role="dialog"], [class*="modal" i], [class*="dialog" i], [class*="popup" i]');
           if (inDialog) {
@@ -221,12 +226,15 @@ app.post("/publish-draft", async (req, res) => {
       return false;
     }).catch(() => {});
 
-    // Wait for navigation back to campaign list (= publish completed).
-    const navigated = await page.waitForURL(
-      /manage\/campaign|manage\/ad/,
-      { timeout: 60_000 }
+    // Detect ANY URL change as success. Faster than waitForURL with a
+    // specific pattern (which was hitting the 60s timeout when TikTok
+    // navigated to e.g. /adgroup/draft instead of /manage/campaign).
+    const navigated = await page.waitForFunction(
+      (oldUrl) => location.href !== oldUrl,
+      preClickUrl,
+      { timeout: 15_000 }
     ).then(() => true).catch(() => false);
-    await page.waitForTimeout(2000);
+    await page.waitForTimeout(500);
 
     // If we never navigated away, publish probably didn't happen.
     if (!navigated) {
