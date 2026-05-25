@@ -31,7 +31,30 @@ const app = express();
 app.use(express.json({ limit: "5mb" }));
 
 app.get("/", (_req, res) => {
-  res.json({ service: "adsalim-vm-service", status: "ok", endpoints: ["/publish-draft"] });
+  res.json({ service: "adsalim-vm-service", status: "ok", endpoints: ["/publish-draft", "/screenshots/:id"] });
+});
+
+// In-memory screenshot store (last 20). Each /publish-draft failure
+// saves a screenshot of the page state and surfaces a URL in the error.
+const screenshots = new Map();
+let screenshotCounter = 0;
+
+function saveScreenshot(buf) {
+  const id = `${Date.now()}-${++screenshotCounter}`;
+  screenshots.set(id, buf);
+  // Keep only the last 20.
+  if (screenshots.size > 20) {
+    const oldest = screenshots.keys().next().value;
+    screenshots.delete(oldest);
+  }
+  return id;
+}
+
+app.get("/screenshots/:id", (req, res) => {
+  const buf = screenshots.get(req.params.id);
+  if (!buf) return res.status(404).send("Not found");
+  res.setHeader("Content-Type", "image/png");
+  res.send(buf);
 });
 
 app.post("/publish-draft", async (req, res) => {
@@ -139,9 +162,12 @@ app.post("/publish-draft", async (req, res) => {
         })).filter(b => b.text).slice(0, 30);
         return { url: location.href, buttons };
       });
+      const shot = await page.screenshot({ fullPage: true }).catch(() => null);
+      const shotId = shot ? saveScreenshot(shot) : null;
+      const base = req.protocol + "://" + req.get("host");
       await browser.close();
       return res.status(500).json({
-        error: `Publish button not found. url=${diag.url} | buttons=${JSON.stringify(diag.buttons).slice(0, 800)}`,
+        error: `Publish button not found. url=${diag.url} | screenshot=${shotId ? `${base}/screenshots/${shotId}` : "n/a"} | buttons=${JSON.stringify(diag.buttons).slice(0, 800)}`,
       });
     }
 
@@ -185,10 +211,13 @@ app.post("/publish-draft", async (req, res) => {
         const dialogs = Array.from(document.querySelectorAll('[role="dialog"], [class*="modal" i]')).length;
         return { url, buttons, dialogs };
       });
+      const shot = await page.screenshot({ fullPage: true }).catch(() => null);
+      const shotId = shot ? saveScreenshot(shot) : null;
+      const base = req.protocol + "://" + req.get("host");
       await browser.close();
       return res.status(500).json({
         ok: false,
-        error: `Clicked "${publishClicked}" but didn't navigate to campaign list. Current url=${diag.url} | dialogs=${diag.dialogs} | buttons=${JSON.stringify(diag.buttons).slice(0, 800)}`,
+        error: `Clicked "${publishClicked}" but didn't navigate to campaign list. screenshot=${shotId ? `${base}/screenshots/${shotId}` : "n/a"} | url=${diag.url} | dialogs=${diag.dialogs} | buttons=${JSON.stringify(diag.buttons).slice(0, 800)}`,
       });
     }
 
