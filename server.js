@@ -122,37 +122,92 @@ app.post("/duplicate", async (req, res) => {
 async function duplicateAndPublishOnce(page, sourceCampaignId, newName) {
   // Search/filter for the source campaign so the row is visible.
   // TikTok's table is virtualized; filtering pins the row to the top.
-  const searchInput = page.locator('input[placeholder*="Search"]').first();
+  const searchInput = page.locator('input[placeholder*="Search" i]').first();
   await searchInput.waitFor({ state: "visible", timeout: 15_000 });
   await searchInput.fill("");
   await searchInput.type(sourceCampaignId);
   await page.keyboard.press("Enter");
-  await page.waitForTimeout(2000);
+  await page.waitForTimeout(3000);
 
-  // Row identification: TikTok renders rows with data-row-key=campaign_id
-  // or sets data-id; we accept either.
-  const rowSelector =
-    `[data-row-key="${sourceCampaignId}"], [data-id="${sourceCampaignId}"]`;
-  const row = page.locator(rowSelector).first();
-  await row.waitFor({ state: "visible", timeout: 15_000 });
-  await row.hover();
-
-  // Click Duplicate inside the row's action area. Text might be in any locale.
-  const dupClicked = await page.evaluate((id) => {
-    const sel = `[data-row-key="${id}"], [data-id="${id}"]`;
-    const r = document.querySelector(sel);
-    if (!r) return false;
-    const els = Array.from(r.querySelectorAll("button, a, [role='button']"));
-    for (const el of els) {
-      const t = (el.innerText || el.textContent || "").trim().toLowerCase();
-      if (/duplicate|copy/.test(t)) {
-        el.click();
+  // Find the row that visibly contains the campaign_id text. TikTok's
+  // DOM uses different attribute names per UI version — searching the
+  // raw text is the most resilient.
+  const rowFound = await page.evaluate((id) => {
+    // Try common row containers: tr, [role="row"], or any direct table row
+    const rows = Array.from(document.querySelectorAll(
+      'tr, [role="row"], [class*="row" i]'
+    ));
+    for (const r of rows) {
+      const t = (r.innerText || r.textContent || "");
+      if (t.includes(id)) {
+        // scroll the row into view so subsequent click works
+        r.scrollIntoView({ block: "center" });
         return true;
       }
     }
     return false;
   }, sourceCampaignId);
-  if (!dupClicked) throw new Error("Duplicate button not found on source row");
+  if (!rowFound) throw new Error(`Could not find row containing campaign id "${sourceCampaignId}" in the table`);
+  await page.waitForTimeout(500);
+
+  // Click Duplicate inside the row's action area. We re-find the row
+  // by id text, then look for action buttons (icons, menus, etc.).
+  // TikTok may render the Duplicate action behind a 3-dot menu or
+  // directly as an icon on hover.
+  const dupClicked = await page.evaluate((id) => {
+    const rows = Array.from(document.querySelectorAll(
+      'tr, [role="row"], [class*="row" i]'
+    ));
+    let row = null;
+    for (const r of rows) {
+      if ((r.innerText || "").includes(id)) { row = r; break; }
+    }
+    if (!row) return false;
+    // Hover the row to expose action icons
+    row.dispatchEvent(new MouseEvent("mouseenter", { bubbles: true }));
+    row.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+
+    // First try: a button / link with Duplicate / Copy text inside the row
+    const inline = Array.from(row.querySelectorAll("button, a, [role='button']"));
+    for (const el of inline) {
+      const t = (el.innerText || el.textContent || el.getAttribute("aria-label") || el.getAttribute("title") || "").trim().toLowerCase();
+      if (/duplicate|copy/.test(t)) {
+        el.click();
+        return true;
+      }
+    }
+    // Second try: open the row's action menu (3-dot icon) then look
+    // for a Duplicate menu item in the popup that appears.
+    for (const el of inline) {
+      const t = (el.innerText || el.textContent || el.getAttribute("aria-label") || el.getAttribute("title") || "").trim().toLowerCase();
+      if (/more|menu|action|⋯|⋮/.test(t) || el.querySelector('[class*="more" i], [class*="menu" i]')) {
+        el.click();
+        return "menu-opened";
+      }
+    }
+    return false;
+  }, sourceCampaignId);
+
+  if (dupClicked === "menu-opened") {
+    // Menu opened, wait for popup and click Duplicate inside it
+    await page.waitForTimeout(500);
+    const menuClicked = await page.evaluate(() => {
+      const items = Array.from(document.querySelectorAll(
+        '[role="menuitem"], [class*="menu-item" i], li, button'
+      ));
+      for (const el of items) {
+        const t = (el.innerText || el.textContent || "").trim().toLowerCase();
+        if (/^(duplicate|copy)$/.test(t) || /duplicate campaign|copy campaign/.test(t)) {
+          el.click();
+          return true;
+        }
+      }
+      return false;
+    });
+    if (!menuClicked) throw new Error("Opened row menu but no Duplicate item inside");
+  } else if (!dupClicked) {
+    throw new Error("Duplicate button/menu not found on source row");
+  }
 
   // Fill the name input in the modal.
   const nameInput = page
