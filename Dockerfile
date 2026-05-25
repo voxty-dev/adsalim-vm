@@ -1,7 +1,7 @@
 # Playwright's official image ships a real Chromium + every shared library
 # it needs (libnss3, libxkbcommon, fonts, etc.) on Debian. Matches the
 # playwright npm version we install on top of it — keep them in sync.
-FROM mcr.microsoft.com/playwright:v1.49.0-jammy
+FROM mcr.microsoft.com/playwright:v1.60.0-jammy
 
 WORKDIR /app
 
