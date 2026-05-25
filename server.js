@@ -91,22 +91,39 @@ app.post("/publish-draft", async (req, res) => {
       return res.status(401).json({ error: "TikTok session expired. Re-paste cookies." });
     }
 
-    // Wait for editor to render. The "Publish all" button is the signal.
+    // Wait for editor to render fully.
     await page.waitForLoadState("networkidle", { timeout: 30_000 }).catch(() => {});
+    await page.waitForTimeout(3000);
 
-    // Find and click "Publish all". This is the ONLY button we want —
-    // "Create anyway" etc create new drafts instead of publishing.
+    // Scroll to the bottom of the page — TikTok's "Publish all" button
+    // lives in a sticky footer that might not render until the page is
+    // scrolled. Some validation banners ("Check ad groups", "Create
+    // anyway") appear inline at the top; the real publish action is at
+    // the bottom.
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+    await page.waitForTimeout(1500);
+    await page.evaluate(() => window.scrollTo(0, 0));
+    await page.waitForTimeout(500);
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+    await page.waitForTimeout(1000);
+
+    // Try Publish first; fall back to Create anyway only if Publish
+    // truly isn't there. "Create anyway" in some flows DOES publish
+    // despite validation warnings — it's still our second-best option.
     const publishClicked = await page.evaluate(() => {
       const buttons = Array.from(document.querySelectorAll("button"));
-      // Strictly Publish-flavored buttons. "Create anyway" routes to
-      // create-new flow which makes more drafts.
-      const patterns = [/publish all/, /^publish$/];
+      const patterns = [
+        /publish all/,
+        /^publish$/,
+        /create anyway/,  // fallback — publishes with warnings
+      ];
       for (const pat of patterns) {
         const match = buttons.find(b => {
           const t = (b.innerText || b.textContent || "").trim().toLowerCase();
           return pat.test(t) && !b.disabled;
         });
         if (match) {
+          match.scrollIntoView({ block: "center" });
           match.click();
           return match.innerText.trim();
         }
