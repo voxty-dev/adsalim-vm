@@ -91,21 +91,32 @@ app.post("/publish-draft", async (req, res) => {
     // Wait for editor to render. The "Publish all" button is the signal.
     await page.waitForLoadState("networkidle", { timeout: 30_000 }).catch(() => {});
 
-    // Find and click "Publish all". Locale-agnostic — match any button
-    // whose text contains "publish".
+    // Find and click the "publish/create" primary action. TikTok labels
+    // this button differently depending on the draft's validation state:
+    //   - "Publish all" — clean draft, no warnings
+    //   - "Create anyway" — draft has warnings (missing ads, etc.) but
+    //     can be published as-is
+    //   - "Publish"      — older / alternative wording
     const publishClicked = await page.evaluate(() => {
       const buttons = Array.from(document.querySelectorAll("button"));
-      // Prefer "Publish all" but fall back to any "Publish" button.
-      const preferred = buttons.find(b => {
-        const t = (b.innerText || b.textContent || "").trim().toLowerCase();
-        return /publish all/.test(t) && !b.disabled;
-      });
-      if (preferred) { preferred.click(); return "publish_all"; }
-      const fallback = buttons.find(b => {
-        const t = (b.innerText || b.textContent || "").trim().toLowerCase();
-        return /^publish$/.test(t) && !b.disabled;
-      });
-      if (fallback) { fallback.click(); return "publish"; }
+      // Priority order: most specific first.
+      const patterns = [
+        /publish all/,
+        /^publish$/,
+        /create anyway/,
+        /^create$/,
+        /submit/,
+      ];
+      for (const pat of patterns) {
+        const match = buttons.find(b => {
+          const t = (b.innerText || b.textContent || "").trim().toLowerCase();
+          return pat.test(t) && !b.disabled;
+        });
+        if (match) {
+          match.click();
+          return match.innerText.trim();
+        }
+      }
       return false;
     });
 
