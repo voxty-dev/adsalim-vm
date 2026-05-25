@@ -140,14 +140,36 @@ async function duplicateAndPublishOnce(page, sourceCampaignId, newName) {
     for (const r of rows) {
       const t = (r.innerText || r.textContent || "");
       if (t.includes(id)) {
-        // scroll the row into view so subsequent click works
         r.scrollIntoView({ block: "center" });
         return true;
       }
     }
     return false;
   }, sourceCampaignId);
-  if (!rowFound) throw new Error(`Could not find row containing campaign id "${sourceCampaignId}" in the table`);
+  if (!rowFound) {
+    // Capture diagnostic info so we can see what TikTok actually rendered.
+    const diag = await page.evaluate(() => {
+      const url = location.href;
+      const tableRows = document.querySelectorAll('tr').length;
+      const roleRows = document.querySelectorAll('[role="row"]').length;
+      const inputs = Array.from(document.querySelectorAll('input')).map(i => ({
+        placeholder: i.placeholder,
+        value: i.value,
+        type: i.type,
+      })).slice(0, 10);
+      // First chunk of body text
+      const sample = (document.body.innerText || "").slice(0, 800);
+      return { url, tableRows, roleRows, inputs, sample };
+    });
+    const screenshot = await page.screenshot({ encoding: "base64", fullPage: false }).catch(() => null);
+    throw new Error(
+      `Could not find row for "${sourceCampaignId}". ` +
+      `url=${diag.url} | tr_count=${diag.tableRows} | role_row_count=${diag.roleRows} | ` +
+      `inputs=${JSON.stringify(diag.inputs).slice(0, 300)} | ` +
+      `body_sample=${diag.sample.slice(0, 400)}` +
+      (screenshot ? ` | screenshot_base64_length=${screenshot.length}` : "")
+    );
+  }
   await page.waitForTimeout(500);
 
   // Click Duplicate inside the row's action area. We re-find the row
