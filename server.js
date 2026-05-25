@@ -118,28 +118,42 @@ app.post("/publish-draft", async (req, res) => {
     await page.waitForLoadState("networkidle", { timeout: 30_000 }).catch(() => {});
     await page.waitForTimeout(3000);
 
-    // Scroll to the bottom of the page — TikTok's "Publish all" button
-    // lives in a sticky footer that might not render until the page is
-    // scrolled. Some validation banners ("Check ad groups", "Create
-    // anyway") appear inline at the top; the real publish action is at
-    // the bottom.
-    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-    await page.waitForTimeout(1500);
-    await page.evaluate(() => window.scrollTo(0, 0));
+    // Step A: dismiss any onboarding tooltips ("Got it" buttons) so they
+    // don't block subsequent clicks.
+    await page.evaluate(() => {
+      const gotItButtons = Array.from(document.querySelectorAll("button"))
+        .filter(b => /^got it$/i.test((b.innerText || "").trim()));
+      for (const b of gotItButtons) b.click();
+    }).catch(() => {});
     await page.waitForTimeout(500);
+
+    // Step B: if a validation warning is shown ("Check ad groups" +
+    // "Create anyway"), click "Create anyway" to dismiss and transition
+    // to the real editor. The URL won't change but the DOM will.
+    const dismissedWarning = await page.evaluate(() => {
+      const buttons = Array.from(document.querySelectorAll("button"));
+      const createAnyway = buttons.find(b => {
+        const t = (b.innerText || "").trim().toLowerCase();
+        return /create anyway/.test(t) && !b.disabled;
+      });
+      if (createAnyway) {
+        createAnyway.click();
+        return true;
+      }
+      return false;
+    });
+    if (dismissedWarning) {
+      await page.waitForTimeout(2000); // let the editor transition render
+    }
+
+    // Step C: scroll to surface the sticky-footer Publish button.
     await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
     await page.waitForTimeout(1000);
 
-    // Try Publish first; fall back to Create anyway only if Publish
-    // truly isn't there. "Create anyway" in some flows DOES publish
-    // despite validation warnings — it's still our second-best option.
+    // Step D: click "Publish all" — the actual publish action.
     const publishClicked = await page.evaluate(() => {
       const buttons = Array.from(document.querySelectorAll("button"));
-      const patterns = [
-        /publish all/,
-        /^publish$/,
-        /create anyway/,  // fallback — publishes with warnings
-      ];
+      const patterns = [/publish all/, /^publish$/];
       for (const pat of patterns) {
         const match = buttons.find(b => {
           const t = (b.innerText || b.textContent || "").trim().toLowerCase();
