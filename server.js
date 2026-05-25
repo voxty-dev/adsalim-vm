@@ -74,13 +74,16 @@ app.post("/publish-draft", async (req, res) => {
 
     const page = await context.newPage();
 
-    // Navigate DIRECTLY to the draft editor. TikTok's URL pattern for
-    // editing a draft (sketch):
-    //   /i18n/creation/1nn/create/campaign?aadvid=ADV&campaign_draft_id=SKETCH
+    // Navigate to the draft editor. TikTok serves the "edit draft" view
+    // when we pass campaign_draft_id WITHOUT creation_type=create_new.
+    // The create_new flag instead routes to a "Create campaign from
+    // scratch" flow that, when submitted, makes ANOTHER draft instead
+    // of publishing the existing one. Use source=draft_list to mirror
+    // what TikTok's drafts page hands the editor.
     const editorUrl =
       `https://ads.tiktok.com/i18n/creation/1nn/create/campaign?aadvid=${encodeURIComponent(advertiserId)}` +
       `&campaign_draft_id=${encodeURIComponent(campaignSketchId)}` +
-      `&creation_type=create_new&temp_campaign_id=${encodeURIComponent(campaignSketchId)}`;
+      `&source=draft_list&is_from_campaign_list=1`;
     await page.goto(editorUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
 
     if (page.url().includes("/login") || page.url().includes("/passport")) {
@@ -91,22 +94,13 @@ app.post("/publish-draft", async (req, res) => {
     // Wait for editor to render. The "Publish all" button is the signal.
     await page.waitForLoadState("networkidle", { timeout: 30_000 }).catch(() => {});
 
-    // Find and click the "publish/create" primary action. TikTok labels
-    // this button differently depending on the draft's validation state:
-    //   - "Publish all" — clean draft, no warnings
-    //   - "Create anyway" — draft has warnings (missing ads, etc.) but
-    //     can be published as-is
-    //   - "Publish"      — older / alternative wording
+    // Find and click "Publish all". This is the ONLY button we want —
+    // "Create anyway" etc create new drafts instead of publishing.
     const publishClicked = await page.evaluate(() => {
       const buttons = Array.from(document.querySelectorAll("button"));
-      // Priority order: most specific first.
-      const patterns = [
-        /publish all/,
-        /^publish$/,
-        /create anyway/,
-        /^create$/,
-        /submit/,
-      ];
+      // Strictly Publish-flavored buttons. "Create anyway" routes to
+      // create-new flow which makes more drafts.
+      const patterns = [/publish all/, /^publish$/];
       for (const pat of patterns) {
         const match = buttons.find(b => {
           const t = (b.innerText || b.textContent || "").trim().toLowerCase();
@@ -157,13 +151,34 @@ app.post("/publish-draft", async (req, res) => {
     }).catch(() => {});
 
     // Wait for navigation back to campaign list (= publish completed).
-    await page.waitForURL(/manage\/campaign|manage\/ad/, { timeout: 60_000 }).catch(() => {});
+    const navigated = await page.waitForURL(
+      /manage\/campaign|manage\/ad/,
+      { timeout: 60_000 }
+    ).then(() => true).catch(() => false);
     await page.waitForTimeout(2000);
+
+    // If we never navigated away, publish probably didn't happen.
+    if (!navigated) {
+      const diag = await page.evaluate(() => {
+        const url = location.href;
+        const buttons = Array.from(document.querySelectorAll("button")).map(b => ({
+          text: (b.innerText || "").trim().slice(0, 40),
+          disabled: b.disabled,
+        })).filter(b => b.text).slice(0, 25);
+        const dialogs = Array.from(document.querySelectorAll('[role="dialog"], [class*="modal" i]')).length;
+        return { url, buttons, dialogs };
+      });
+      await browser.close();
+      return res.status(500).json({
+        ok: false,
+        error: `Clicked "${publishClicked}" but didn't navigate to campaign list. Current url=${diag.url} | dialogs=${diag.dialogs} | buttons=${JSON.stringify(diag.buttons).slice(0, 800)}`,
+      });
+    }
 
     await browser.close();
     return res.json({
       ok: true,
-      newCampaignId: campaignSketchId, // best-effort; the sketch id stays usable
+      newCampaignId: campaignSketchId,
     });
   } catch (err) {
     if (browser) await browser.close().catch(() => {});
