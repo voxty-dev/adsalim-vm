@@ -26,14 +26,32 @@ const { chromium } = require("playwright");
 
 const PORT = process.env.PORT || 3000;
 const SHARED_SECRET = process.env.SHARED_SECRET || "";
-const MAX_CONCURRENT_PUBLISH = Number(process.env.MAX_CONCURRENT_PUBLISH || 2);
+const MAX_CONCURRENT_PUBLISH = Number(process.env.MAX_CONCURRENT_PUBLISH || 1);
+const SERVICE_VERSION = "1.1.1";
 
 const app = express();
 app.use(express.json({ limit: "5mb" }));
 
 app.get("/", (_req, res) => {
-  res.json({ service: "adsalim-vm-service", status: "ok", endpoints: ["/publish-draft", "/screenshots/:id"] });
+  res.json({
+    service: "adsalim-vm-service",
+    status: "ok",
+    version: SERVICE_VERSION,
+    maxConcurrentPublish: MAX_CONCURRENT_PUBLISH,
+    endpoints: ["/publish-draft", "/screenshots/:id"],
+  });
 });
+
+function buildEditorUrl(advertiserId, campaignSketchId) {
+  return (
+    `https://ads.tiktok.com/i18n/creation/1nn/create/campaign?aadvid=${encodeURIComponent(advertiserId)}` +
+    `&source=campaign_list` +
+    `&campaign_draft_id=${encodeURIComponent(campaignSketchId)}` +
+    `&creation_type=create_new` +
+    `&objective_type=3` +
+    `&temp_campaign_id=${encodeURIComponent(campaignSketchId)}`
+  );
+}
 
 // In-memory screenshot store (last 20). Each /publish-draft failure
 // saves a screenshot of the page state and surfaces a URL in the error.
@@ -134,14 +152,9 @@ async function waitForPublishOutcome(page, timeoutMs = 45_000) {
       await responseWatcher;
       return { verified: true, reason: "success_signal", state: lastState, apiDetail };
     }
-    if (!lastState.publishStillVisible) {
-      await page.waitForTimeout(1500);
-      const followUp = await readPublishPageState(page);
-      if (followUp.hasSuccess || (!followUp.publishStillVisible && !followUp.hasError)) {
-        await responseWatcher;
-        return { verified: true, reason: "publish_ui_cleared", state: followUp, apiDetail };
-      }
-      lastState = followUp;
+    if (!lastState.publishStillVisible && (lastState.hasSuccess || apiOk)) {
+      await responseWatcher;
+      return { verified: true, reason: "publish_ui_cleared", state: lastState, apiDetail };
     }
     await page.waitForTimeout(1000);
   }
@@ -154,6 +167,92 @@ async function waitForPublishOutcome(page, timeoutMs = 45_000) {
     return { verified: false, reason: "api_error", state: lastState, apiDetail };
   }
   return { verified: false, reason: "timeout", state: lastState, apiDetail };
+}
+
+async function confirmDraftGone(page, advertiserId, campaignSketchId) {
+  await page.goto(buildEditorUrl(advertiserId, campaignSketchId), {
+    waitUntil: "domcontentloaded",
+    timeout: 45_000,
+  });
+  await page.waitForTimeout(2500);
+
+  const check = await page.evaluate(() => {
+    const bodyText = (document.body.innerText || "").slice(0, 4000);
+    const publishStillVisible = Array.from(
+      document.querySelectorAll(
+        'button, [role="button"], a, [class*="btn" i], [class*="button" i]'
+      )
+    ).some((el) => {
+      if (el.disabled) return false;
+      const style = window.getComputedStyle(el);
+      if (style.display === "none" || style.visibility === "hidden") return false;
+      const text = (el.innerText || el.textContent || "").trim().toLowerCase();
+      return /^publish all(\s*[▾▼⌄])?$|^publish$/.test(text);
+    });
+    const draftMissing = /draft.*not found|no longer available|doesn't exist|已删除|不存在|invalid draft/i.test(
+      bodyText
+    );
+    return {
+      publishStillVisible,
+      draftMissing,
+      bodyText: bodyText.slice(0, 400),
+      url: location.href,
+    };
+  });
+
+  if (check.draftMissing) return { gone: true, reason: "draft_not_found" };
+  if (check.publishStillVisible) {
+    return { gone: false, reason: "publish_button_still_visible", check };
+  }
+  if (!check.url.includes("campaign_draft_id")) {
+    return { gone: true, reason: "redirected_from_editor" };
+  }
+  return { gone: false, reason: "draft_editor_still_accessible", check };
+}
+
+async function clickPublishAll(page) {
+  await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+  await page.waitForTimeout(400);
+  return page.evaluate(() => {
+    const all = Array.from(document.querySelectorAll(
+      'button, [role="button"], a, [class*="btn" i], [class*="button" i]'
+    ));
+    const patterns = [/^publish all$/, /^publish$/];
+    for (const pat of patterns) {
+      const match = all.find(el => {
+        if (el.disabled) return false;
+        const style = window.getComputedStyle(el);
+        if (style.display === "none" || style.visibility === "hidden") return false;
+        const text = (el.innerText || el.textContent || "").trim().toLowerCase();
+        return pat.test(text) || /^publish all\s*[▾▼⌄]/i.test(text);
+      });
+      if (match) {
+        match.scrollIntoView({ block: "center" });
+        match.click();
+        return (match.innerText || match.textContent || "").trim();
+      }
+    }
+    return false;
+  });
+}
+
+async function clickConfirmDialog(page) {
+  await page.waitForTimeout(800);
+  return page.evaluate(() => {
+    const buttons = Array.from(document.querySelectorAll("button"));
+    for (const b of buttons.reverse()) {
+      const t = (b.innerText || b.textContent || "").trim().toLowerCase();
+      if (/^(confirm|publish|publish all|submit|ok)$/.test(t) && !b.disabled) {
+        const inDialog =
+          b.closest('[role="dialog"], [class*="modal" i], [class*="dialog" i], [class*="popup" i]');
+        if (inDialog) {
+          b.click();
+          return true;
+        }
+      }
+    }
+    return false;
+  }).catch(() => false);
 }
 
 function saveScreenshot(buf) {
@@ -229,13 +328,7 @@ app.post("/publish-draft", async (req, res) => {
 
     // Now navigate to the draft editor using TikTok's exact URL shape
     // from the captured publish-request referer.
-    const editorUrl =
-      `https://ads.tiktok.com/i18n/creation/1nn/create/campaign?aadvid=${encodeURIComponent(advertiserId)}` +
-      `&source=campaign_list` +
-      `&campaign_draft_id=${encodeURIComponent(campaignSketchId)}` +
-      `&creation_type=create_new` +
-      `&objective_type=3` +
-      `&temp_campaign_id=${encodeURIComponent(campaignSketchId)}`;
+    const editorUrl = buildEditorUrl(advertiserId, campaignSketchId);
     await page.goto(editorUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
 
     if (page.url().includes("/login") || page.url().includes("/passport")) {
@@ -281,80 +374,45 @@ app.post("/publish-draft", async (req, res) => {
       await page.waitForTimeout(800);
     }
 
-    // Step C: scroll to surface the sticky-footer Publish button.
-    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-    await page.waitForTimeout(400);
-
-    // Step D: click "Publish all". TikTok renders this as a styled <div>
-    // (with a dropdown arrow), not a <button> — so we widen the
-    // selector to any clickable element. Match strictly on visible text
-    // so we don't accidentally click the dropdown arrow's own item.
-    const publishClicked = await page.evaluate(() => {
-      const all = Array.from(document.querySelectorAll(
-        'button, [role="button"], a, [class*="btn" i], [class*="button" i]'
-      ));
-      const patterns = [/^publish all$/, /^publish$/];
-      for (const pat of patterns) {
-        const match = all.find(el => {
-          if (el.disabled) return false;
-          // Skip hidden elements
-          const style = window.getComputedStyle(el);
-          if (style.display === "none" || style.visibility === "hidden") return false;
-          const text = (el.innerText || el.textContent || "").trim().toLowerCase();
-          // Some elements wrap "Publish all" with a dropdown arrow icon
-          // ("Publish all ▾") — match if text starts with publish all.
-          return pat.test(text) || /^publish all\s*[▾▼⌄]/i.test(text);
+    // Step C/D: click Publish all (retry once if verification fails).
+    let outcome = null;
+    let draftCheck = null;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      const publishClicked = await clickPublishAll(page);
+      if (!publishClicked) {
+        const diag = await page.evaluate(() => {
+          const all = Array.from(document.querySelectorAll(
+            'button, [role="button"], a, [class*="btn" i], [class*="button" i]'
+          )).map(b => ({
+            tag: b.tagName.toLowerCase(),
+            text: (b.innerText || b.textContent || "").trim().slice(0, 60),
+            disabled: !!b.disabled,
+          })).filter(b => b.text).slice(0, 50);
+          return { url: location.href, all };
         });
-        if (match) {
-          match.scrollIntoView({ block: "center" });
-          match.click();
-          return (match.innerText || match.textContent || "").trim();
-        }
+        const shot = await page.screenshot({ fullPage: true }).catch(() => null);
+        const shotId = shot ? saveScreenshot(shot) : null;
+        const base = req.protocol + "://" + req.get("host");
+        await browser.close();
+        browser = null;
+        return res.status(500).json({
+          error: `Publish button not found. url=${diag.url} | screenshot=${shotId ? `${base}/screenshots/${shotId}` : "n/a"} | clickables=${JSON.stringify(diag.all).slice(0, 1500)}`,
+        });
       }
-      return false;
-    });
 
-    if (!publishClicked) {
-      const diag = await page.evaluate(() => {
-        const all = Array.from(document.querySelectorAll(
-          'button, [role="button"], a, [class*="btn" i], [class*="button" i]'
-        )).map(b => ({
-          tag: b.tagName.toLowerCase(),
-          text: (b.innerText || b.textContent || "").trim().slice(0, 60),
-          disabled: !!b.disabled,
-        })).filter(b => b.text).slice(0, 50);
-        return { url: location.href, all };
-      });
-      const shot = await page.screenshot({ fullPage: true }).catch(() => null);
-      const shotId = shot ? saveScreenshot(shot) : null;
-      const base = req.protocol + "://" + req.get("host");
-      await browser.close();
-      return res.status(500).json({
-        error: `Publish button not found. url=${diag.url} | screenshot=${shotId ? `${base}/screenshots/${shotId}` : "n/a"} | clickables=${JSON.stringify(diag.all).slice(0, 1500)}`,
-      });
+      await clickConfirmDialog(page);
+      outcome = await waitForPublishOutcome(page);
+      draftCheck = await confirmDraftGone(page, advertiserId, campaignSketchId);
+
+      if (outcome.verified && draftCheck.gone) break;
+
+      if (attempt === 1) {
+        await page.goto(editorUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
+        await page.waitForLoadState("domcontentloaded", { timeout: 15_000 }).catch(() => {});
+        await page.waitForSelector('button, [role="button"]', { timeout: 15_000 }).catch(() => {});
+        await page.waitForTimeout(800);
+      }
     }
-
-    // After clicking Publish all, TikTok may show a confirm dialog OR
-    // immediately submit. Click confirm if present, then wait for a real
-    // success signal — do NOT trust the click alone (false positives).
-    await page.waitForTimeout(800);
-    await page.evaluate(() => {
-      const buttons = Array.from(document.querySelectorAll("button"));
-      for (const b of buttons.reverse()) {
-        const t = (b.innerText || b.textContent || "").trim().toLowerCase();
-        if (/^(confirm|publish|publish all|submit|ok)$/.test(t) && !b.disabled) {
-          const inDialog =
-            b.closest('[role="dialog"], [class*="modal" i], [class*="dialog" i], [class*="popup" i]');
-          if (inDialog) {
-            b.click();
-            return true;
-          }
-        }
-      }
-      return false;
-    }).catch(() => {});
-
-    const outcome = await waitForPublishOutcome(page);
 
     const shot = await page.screenshot({ fullPage: false }).catch(() => null);
     const shotId = shot ? saveScreenshot(shot) : null;
@@ -363,11 +421,12 @@ app.post("/publish-draft", async (req, res) => {
     await browser.close();
     browser = null;
 
-    if (!outcome.verified) {
+    if (!outcome?.verified || !draftCheck?.gone) {
       const detail = [
-        `reason=${outcome.reason}`,
-        outcome.apiDetail ? `api=${JSON.stringify(outcome.apiDetail)}` : null,
-        outcome.state?.bodyText ? `body=${outcome.state.bodyText}` : null,
+        outcome?.verified ? null : `outcome=${outcome?.reason || "unknown"}`,
+        draftCheck?.gone ? null : `draft=${draftCheck?.reason || "still_present"}`,
+        outcome?.apiDetail ? `api=${JSON.stringify(outcome.apiDetail)}` : null,
+        draftCheck?.check?.bodyText ? `body=${draftCheck.check.bodyText}` : outcome?.state?.bodyText ? `body=${outcome.state.bodyText}` : null,
         shotId ? `screenshot=${base}/screenshots/${shotId}` : null,
       ]
         .filter(Boolean)
@@ -382,7 +441,7 @@ app.post("/publish-draft", async (req, res) => {
     return res.json({
       ok: true,
       newCampaignId: campaignSketchId,
-      verifiedBy: outcome.reason,
+      verifiedBy: `${outcome.reason}+${draftCheck.reason}`,
       screenshot: shotId ? `${base}/screenshots/${shotId}` : undefined,
     });
   } catch (err) {
