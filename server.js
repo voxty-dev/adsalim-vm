@@ -27,7 +27,7 @@ const { chromium } = require("playwright");
 const PORT = process.env.PORT || 3000;
 const SHARED_SECRET = process.env.SHARED_SECRET || "";
 const MAX_CONCURRENT_PUBLISH = Number(process.env.MAX_CONCURRENT_PUBLISH || 1);
-const SERVICE_VERSION = "1.1.1";
+const SERVICE_VERSION = "1.1.2";
 
 const app = express();
 app.use(express.json({ limit: "5mb" }));
@@ -78,6 +78,77 @@ function releasePublishSlot() {
   }
 }
 
+async function findPublishAllHandle(page) {
+  const selectors =
+    'button, [role="button"], a, div, span, [class*="btn" i], [class*="button" i]';
+  const handle = await page.evaluateHandle((sel) => {
+    const all = Array.from(document.querySelectorAll(sel));
+    return all.find((el) => {
+      if (el.disabled) return false;
+      const style = window.getComputedStyle(el);
+      if (style.display === "none" || style.visibility === "hidden") return false;
+      if (Number(style.opacity) < 0.1) return false;
+      const text = (el.innerText || el.textContent || "").trim().toLowerCase();
+      return /^publish all(\s*[▾▼⌄↓])?$|^publish$/.test(text);
+    }) || null;
+  }, selectors);
+  const element = handle.asElement();
+  await handle.dispose();
+  return element;
+}
+
+async function prepareEditorForPublish(page, timeoutMs = 60_000) {
+  const deadline = Date.now() + timeoutMs;
+  let lastAction = "waiting";
+
+  while (Date.now() < deadline) {
+    const publishHandle = await findPublishAllHandle(page);
+    if (publishHandle) {
+      await publishHandle.dispose();
+      return { ready: true, lastAction: "publish_visible" };
+    }
+
+    const gotIt = page.getByRole("button", { name: /^got it$/i });
+    if ((await gotIt.count()) > 0) {
+      await gotIt.first().click({ timeout: 3000 }).catch(() => {});
+      lastAction = "got_it";
+      await page.waitForTimeout(1200);
+      continue;
+    }
+
+    const createAnyway = page.getByRole("button", { name: /create anyway/i });
+    if ((await createAnyway.count()) > 0) {
+      await createAnyway.first().click({ timeout: 3000 }).catch(() => {});
+      lastAction = "create_anyway";
+      await page.waitForTimeout(3000);
+      continue;
+    }
+
+    const continued = await page.evaluate(() => {
+      const buttons = Array.from(document.querySelectorAll("button"));
+      const cont = buttons.find((b) => {
+        const t = (b.innerText || b.textContent || "").trim().toLowerCase();
+        return t === "continue" && !b.disabled;
+      });
+      if (cont) {
+        cont.click();
+        return true;
+      }
+      return false;
+    });
+    if (continued) {
+      lastAction = "continue";
+      await page.waitForTimeout(2000);
+      continue;
+    }
+
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight)).catch(() => {});
+    await page.waitForTimeout(1000);
+  }
+
+  return { ready: false, lastAction };
+}
+
 async function readPublishPageState(page) {
   return page.evaluate(() => {
     const bodyText = (document.body.innerText || "").slice(0, 8000);
@@ -89,14 +160,14 @@ async function readPublishPageState(page) {
     );
     const publishStillVisible = Array.from(
       document.querySelectorAll(
-        'button, [role="button"], a, [class*="btn" i], [class*="button" i]'
+        'button, [role="button"], a, div, span, [class*="btn" i], [class*="button" i]'
       )
     ).some((el) => {
       if (el.disabled) return false;
       const style = window.getComputedStyle(el);
       if (style.display === "none" || style.visibility === "hidden") return false;
       const text = (el.innerText || el.textContent || "").trim().toLowerCase();
-      return /^publish all(\s*[▾▼⌄])?$|^publish$/.test(text);
+      return /^publish all(\s*[▾▼⌄↓])?$|^publish$/.test(text);
     });
     return {
       hasSuccess,
@@ -213,27 +284,19 @@ async function confirmDraftGone(page, advertiserId, campaignSketchId) {
 async function clickPublishAll(page) {
   await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
   await page.waitForTimeout(400);
-  return page.evaluate(() => {
-    const all = Array.from(document.querySelectorAll(
-      'button, [role="button"], a, [class*="btn" i], [class*="button" i]'
-    ));
-    const patterns = [/^publish all$/, /^publish$/];
-    for (const pat of patterns) {
-      const match = all.find(el => {
-        if (el.disabled) return false;
-        const style = window.getComputedStyle(el);
-        if (style.display === "none" || style.visibility === "hidden") return false;
-        const text = (el.innerText || el.textContent || "").trim().toLowerCase();
-        return pat.test(text) || /^publish all\s*[▾▼⌄]/i.test(text);
-      });
-      if (match) {
-        match.scrollIntoView({ block: "center" });
-        match.click();
-        return (match.innerText || match.textContent || "").trim();
-      }
-    }
-    return false;
+
+  const handle = await findPublishAllHandle(page);
+  if (!handle) return false;
+
+  const label = await handle.evaluate(
+    (el) => (el.innerText || el.textContent || "").trim()
+  );
+  await handle.scrollIntoViewIfNeeded().catch(() => {});
+  await handle.click({ timeout: 5000 }).catch(async () => {
+    await handle.evaluate((el) => el.click());
   });
+  await handle.dispose();
+  return label || "Publish all";
 }
 
 async function clickConfirmDialog(page) {
@@ -329,49 +392,43 @@ app.post("/publish-draft", async (req, res) => {
     // Now navigate to the draft editor using TikTok's exact URL shape
     // from the captured publish-request referer.
     const editorUrl = buildEditorUrl(advertiserId, campaignSketchId);
-    await page.goto(editorUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
 
-    if (page.url().includes("/login") || page.url().includes("/passport")) {
+    async function loadEditorAndPrepare() {
+      await page.goto(editorUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
+      if (page.url().includes("/login") || page.url().includes("/passport")) {
+        return { loginExpired: true };
+      }
+      await page.waitForLoadState("domcontentloaded", { timeout: 15_000 }).catch(() => {});
+      await page.waitForSelector('button, [role="button"]', { timeout: 15_000 }).catch(() => {});
+      await page.waitForTimeout(800);
+      const prep = await prepareEditorForPublish(page);
+      return { loginExpired: false, prep };
+    }
+
+    const initial = await loadEditorAndPrepare();
+    if (initial.loginExpired) {
       await browser.close();
       return res.status(401).json({ error: "TikTok session expired. Re-paste cookies." });
     }
-
-    // Wait just for DOM-ready instead of networkidle — TikTok's
-    // analytics pings keep the network busy forever, so networkidle
-    // wastes its full 30s timeout. domcontentloaded fires fast.
-    await page.waitForLoadState("domcontentloaded", { timeout: 15_000 }).catch(() => {});
-
-    // Wait specifically until SOME button is rendered. Most of the
-    // page's UI mounts within a second of DOM-ready.
-    await page.waitForSelector('button, [role="button"]', { timeout: 15_000 }).catch(() => {});
-    await page.waitForTimeout(800);
-
-    // Step A: dismiss any onboarding tooltips ("Got it" buttons) so they
-    // don't block subsequent clicks.
-    await page.evaluate(() => {
-      const gotItButtons = Array.from(document.querySelectorAll("button"))
-        .filter(b => /^got it$/i.test((b.innerText || "").trim()));
-      for (const b of gotItButtons) b.click();
-    }).catch(() => {});
-
-    // Step B: if a validation warning is shown ("Check ad groups" +
-    // "Create anyway"), click "Create anyway" to dismiss and transition
-    // to the real editor. The URL won't change but the DOM will.
-    const dismissedWarning = await page.evaluate(() => {
-      const buttons = Array.from(document.querySelectorAll("button"));
-      const createAnyway = buttons.find(b => {
-        const t = (b.innerText || "").trim().toLowerCase();
-        return /create anyway/.test(t) && !b.disabled;
+    if (!initial.prep.ready) {
+      const diag = await page.evaluate(() => {
+        const all = Array.from(document.querySelectorAll(
+          'button, [role="button"], a, div, span, [class*="btn" i], [class*="button" i]'
+        )).map(b => ({
+          tag: b.tagName.toLowerCase(),
+          text: (b.innerText || b.textContent || "").trim().slice(0, 60),
+          disabled: !!b.disabled,
+        })).filter(b => b.text).slice(0, 50);
+        return { url: location.href, all };
       });
-      if (createAnyway) {
-        createAnyway.click();
-        return true;
-      }
-      return false;
-    });
-    if (dismissedWarning) {
-      // Editor transition is fast — 800ms is plenty.
-      await page.waitForTimeout(800);
+      const shot = await page.screenshot({ fullPage: true }).catch(() => null);
+      const shotId = shot ? saveScreenshot(shot) : null;
+      const base = req.protocol + "://" + req.get("host");
+      await browser.close();
+      browser = null;
+      return res.status(500).json({
+        error: `Editor not ready for publish (last=${initial.prep.lastAction}). url=${diag.url} | screenshot=${shotId ? `${base}/screenshots/${shotId}` : "n/a"} | clickables=${JSON.stringify(diag.all).slice(0, 1500)}`,
+      });
     }
 
     // Step C/D: click Publish all (retry once if verification fails).
@@ -407,10 +464,9 @@ app.post("/publish-draft", async (req, res) => {
       if (outcome.verified && draftCheck.gone) break;
 
       if (attempt === 1) {
-        await page.goto(editorUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
-        await page.waitForLoadState("domcontentloaded", { timeout: 15_000 }).catch(() => {});
-        await page.waitForSelector('button, [role="button"]', { timeout: 15_000 }).catch(() => {});
-        await page.waitForTimeout(800);
+        const retry = await loadEditorAndPrepare();
+        if (retry.loginExpired) break;
+        if (!retry.prep.ready) break;
       }
     }
 
