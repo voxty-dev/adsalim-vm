@@ -27,7 +27,7 @@ const { chromium } = require("playwright");
 const PORT = process.env.PORT || 3000;
 const SHARED_SECRET = process.env.SHARED_SECRET || "";
 const MAX_CONCURRENT_PUBLISH = Number(process.env.MAX_CONCURRENT_PUBLISH || 1);
-const SERVICE_VERSION = "1.1.4";
+const SERVICE_VERSION = "1.1.5";
 
 const app = express();
 app.use(express.json({ limit: "5mb" }));
@@ -166,6 +166,110 @@ async function prepareEditorForPublish(page, timeoutMs = 60_000) {
   return { ready: false, lastAction };
 }
 
+function isPublishApiUrl(url) {
+  return /\/publish|publish_all|batch_publish|submit_publish/i.test(String(url));
+}
+
+function isTikTokApiSuccess(apiDetail) {
+  if (!apiDetail) return false;
+  const code = apiDetail.code;
+  if (code === 0 || code === "0") return true;
+  return /success/i.test(String(apiDetail.msg || ""));
+}
+
+function isPublishApiSuccess(apiDetail) {
+  return isTikTokApiSuccess(apiDetail) && isPublishApiUrl(apiDetail.url);
+}
+
+function waitForPublishApi(page, timeoutMs = 60_000) {
+  return page
+    .waitForResponse(
+      (resp) => {
+        if (!/ads\.tiktok\.com/i.test(resp.url())) return false;
+        if (resp.request().method() !== "POST") return false;
+        return isPublishApiUrl(resp.url());
+      },
+      { timeout: timeoutMs }
+    )
+    .then(async (resp) => {
+      try {
+        const json = await resp.json();
+        const code = json?.code ?? json?.status_code ?? json?.statusCode;
+        const msg = json?.msg ?? json?.message ?? "";
+        const detail = { code, msg, url: resp.url() };
+        return { ok: isTikTokApiSuccess(detail), detail };
+      } catch {
+        return { ok: false, detail: { url: resp.url(), parseError: true } };
+      }
+    })
+    .catch(() => ({ ok: false, detail: { reason: "publish_api_timeout" } }));
+}
+
+async function waitForUiPublishSuccess(page, timeoutMs = 30_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (page.isClosed()) return { ok: false, reason: "page_closed" };
+    const state = await readPublishPageState(page);
+    if (state.hasError && !state.hasSuccess) {
+      return { ok: false, reason: "ui_error", state };
+    }
+    if (state.hasSuccess) {
+      return { ok: true, reason: "ui_success_toast", state };
+    }
+    await page.waitForTimeout(1000);
+  }
+  return { ok: false, reason: "ui_timeout" };
+}
+
+async function verifyDraftLeftDraftState(page, advertiserId, campaignSketchId) {
+  await page.goto(buildEditorUrl(advertiserId, campaignSketchId), {
+    waitUntil: "domcontentloaded",
+    timeout: 45_000,
+  });
+  await page.waitForTimeout(2500);
+
+  const check = await page.evaluate(() => {
+    const bodyText = (document.body.innerText || "").slice(0, 5000);
+    const publishStillVisible = Array.from(
+      document.querySelectorAll(
+        'button, [role="button"], a, div, span, [class*="btn" i], [class*="button" i]'
+      )
+    ).some((el) => {
+      if (el.disabled) return false;
+      const style = window.getComputedStyle(el);
+      if (style.display === "none" || style.visibility === "hidden") return false;
+      const text = (el.innerText || el.textContent || "").trim().toLowerCase();
+      return /^publish all(\s*[▾▼⌄↓])?$|^publish$/.test(text);
+    });
+    const draftStatus = /\bStatus\b[\s\S]{0,40}\bDraft\b/.test(bodyText);
+    return {
+      publishStillVisible,
+      draftStatus,
+      bodyText: bodyText.slice(0, 400),
+    };
+  });
+
+  if (check.publishStillVisible) {
+    return {
+      published: false,
+      reason: "publish_all_still_visible",
+      check,
+    };
+  }
+  if (check.draftStatus) {
+    return { published: false, reason: "draft_status_still_shown", check };
+  }
+  return { published: true, reason: "left_draft_state" };
+}
+
+function publishSucceeded(apiResult, uiResult, draftCheck) {
+  if (draftCheck?.published) {
+    if (isPublishApiSuccess(apiResult?.detail)) return true;
+    if (uiResult?.ok) return true;
+  }
+  return false;
+}
+
 async function readPublishPageState(page) {
   if (page.isClosed()) {
     return {
@@ -203,125 +307,6 @@ async function readPublishPageState(page) {
       url: location.href,
     };
   });
-}
-
-async function waitForPublishOutcome(page, timeoutMs = 45_000) {
-  let apiOk = false;
-  let apiDetail = null;
-
-  const responseWatcher = page
-    .waitForResponse(
-      (resp) => {
-        const url = resp.url();
-        if (!/ads\.tiktok\.com/i.test(url)) return false;
-        if (resp.request().method() !== "POST") return false;
-        return /publish|submit|creation|campaign|sketch/i.test(url);
-      },
-      { timeout: timeoutMs }
-    )
-    .then(async (resp) => {
-      try {
-        const json = await resp.json();
-        const code = json?.code ?? json?.status_code ?? json?.statusCode;
-        const msg = json?.msg ?? json?.message ?? "";
-        if (code === 0 || code === "0" || /success/i.test(String(msg))) {
-          apiOk = true;
-          apiDetail = { code, msg };
-        } else {
-          apiDetail = { code, msg, url: resp.url() };
-        }
-      } catch {
-        apiDetail = { url: resp.url(), parseError: true };
-      }
-    })
-    .catch(() => {});
-
-  const deadline = Date.now() + timeoutMs;
-  let lastState = null;
-
-  while (Date.now() < deadline) {
-    if (page.isClosed()) {
-      return { verified: false, reason: "page_closed", state: lastState, apiDetail };
-    }
-    lastState = await readPublishPageState(page);
-    if (lastState.hasError && !lastState.hasSuccess) {
-      await responseWatcher;
-      return { verified: false, reason: "ui_error", state: lastState, apiDetail };
-    }
-    if (lastState.hasSuccess || apiOk) {
-      await responseWatcher;
-      return { verified: true, reason: "success_signal", state: lastState, apiDetail };
-    }
-    if (!lastState.publishStillVisible && (lastState.hasSuccess || apiOk)) {
-      await responseWatcher;
-      return { verified: true, reason: "publish_ui_cleared", state: lastState, apiDetail };
-    }
-    await page.waitForTimeout(1000);
-  }
-
-  await responseWatcher;
-  if (apiOk) {
-    return { verified: true, reason: "api_ok", state: lastState, apiDetail };
-  }
-  if (apiDetail && apiDetail.code != null && apiDetail.code !== 0 && apiDetail.code !== "0") {
-    return { verified: false, reason: "api_error", state: lastState, apiDetail };
-  }
-  return { verified: false, reason: "timeout", state: lastState, apiDetail };
-}
-
-function isTikTokApiSuccess(apiDetail) {
-  if (!apiDetail) return false;
-  const code = apiDetail.code;
-  if (code === 0 || code === "0") return true;
-  return /success/i.test(String(apiDetail.msg || ""));
-}
-
-function publishSucceeded(outcome, draftCheck) {
-  if (isTikTokApiSuccess(outcome?.apiDetail)) return true;
-  if (outcome?.verified && outcome?.state?.hasSuccess) return true;
-  if (outcome?.verified && draftCheck?.gone) return true;
-  return false;
-}
-
-async function confirmDraftGone(page, advertiserId, campaignSketchId) {
-  await page.goto(buildEditorUrl(advertiserId, campaignSketchId), {
-    waitUntil: "domcontentloaded",
-    timeout: 45_000,
-  });
-  await page.waitForTimeout(2500);
-
-  const check = await page.evaluate(() => {
-    const bodyText = (document.body.innerText || "").slice(0, 4000);
-    const publishStillVisible = Array.from(
-      document.querySelectorAll(
-        'button, [role="button"], a, [class*="btn" i], [class*="button" i]'
-      )
-    ).some((el) => {
-      if (el.disabled) return false;
-      const style = window.getComputedStyle(el);
-      if (style.display === "none" || style.visibility === "hidden") return false;
-      const text = (el.innerText || el.textContent || "").trim().toLowerCase();
-      return /^publish all(\s*[▾▼⌄])?$|^publish$/.test(text);
-    });
-    const draftMissing = /draft.*not found|no longer available|doesn't exist|已删除|不存在|invalid draft/i.test(
-      bodyText
-    );
-    return {
-      publishStillVisible,
-      draftMissing,
-      bodyText: bodyText.slice(0, 400),
-      url: location.href,
-    };
-  });
-
-  if (check.draftMissing) return { gone: true, reason: "draft_not_found" };
-  if (check.publishStillVisible) {
-    return { gone: false, reason: "publish_button_still_visible", check };
-  }
-  if (!check.url.includes("campaign_draft_id")) {
-    return { gone: true, reason: "redirected_from_editor" };
-  }
-  return { gone: false, reason: "draft_editor_still_accessible", check };
 }
 
 async function clickPublishAll(page) {
@@ -481,14 +466,16 @@ app.post("/publish-draft", async (req, res) => {
     }
 
     // Step C/D: click Publish all (retry once if verification fails).
-    let outcome = null;
+    let apiResult = null;
+    let uiResult = null;
     let draftCheck = null;
     for (let attempt = 1; attempt <= 2; attempt++) {
+      const publishApiPromise = waitForPublishApi(page, 60_000);
       const publishClicked = await clickPublishAll(page);
       if (!publishClicked) {
         const diag = await page.evaluate(() => {
           const all = Array.from(document.querySelectorAll(
-            'button, [role="button"], a, [class*="btn" i], [class*="button" i]'
+            'button, [role="button"], a, div, span, [class*="btn" i], [class*="button" i]'
           )).map(b => ({
             tag: b.tagName.toLowerCase(),
             text: (b.innerText || b.textContent || "").trim().slice(0, 60),
@@ -507,15 +494,11 @@ app.post("/publish-draft", async (req, res) => {
       }
 
       await clickConfirmDialog(page);
-      outcome = await waitForPublishOutcome(page);
+      apiResult = await publishApiPromise;
+      uiResult = await waitForUiPublishSuccess(page, 25_000);
+      draftCheck = await verifyDraftLeftDraftState(page, advertiserId, campaignSketchId);
 
-      if (isTikTokApiSuccess(outcome.apiDetail)) {
-        draftCheck = { gone: true, reason: "tiktok_api_success" };
-        break;
-      }
-
-      draftCheck = await confirmDraftGone(page, advertiserId, campaignSketchId);
-      if (publishSucceeded(outcome, draftCheck)) break;
+      if (publishSucceeded(apiResult, uiResult, draftCheck)) break;
 
       if (attempt === 1) {
         const retry = await loadEditorAndPrepare();
@@ -531,12 +514,12 @@ app.post("/publish-draft", async (req, res) => {
     await browser.close();
     browser = null;
 
-    if (!publishSucceeded(outcome, draftCheck)) {
+    if (!publishSucceeded(apiResult, uiResult, draftCheck)) {
       const detail = [
-        outcome?.verified ? null : `outcome=${outcome?.reason || "unknown"}`,
-        draftCheck?.gone ? null : `draft=${draftCheck?.reason || "still_present"}`,
-        outcome?.apiDetail ? `api=${JSON.stringify(outcome.apiDetail)}` : null,
-        draftCheck?.check?.bodyText ? `body=${draftCheck.check.bodyText}` : outcome?.state?.bodyText ? `body=${outcome.state.bodyText}` : null,
+        draftCheck?.published ? null : `draft=${draftCheck?.reason || "still_draft"}`,
+        apiResult?.ok ? null : `publish_api=${JSON.stringify(apiResult?.detail || { reason: "no_publish_api" })}`,
+        uiResult?.ok ? null : `ui=${uiResult?.reason || "no_ui_success"}`,
+        draftCheck?.check?.bodyText ? `body=${draftCheck.check.bodyText}` : null,
         shotId ? `screenshot=${base}/screenshots/${shotId}` : null,
       ]
         .filter(Boolean)
@@ -548,9 +531,9 @@ app.post("/publish-draft", async (req, res) => {
       });
     }
 
-    const verifiedBy = isTikTokApiSuccess(outcome?.apiDetail)
-      ? "tiktok_api_success"
-      : `${outcome.reason}+${draftCheck.reason}`;
+    const verifiedBy = isPublishApiSuccess(apiResult?.detail)
+      ? "publish_api+left_draft"
+      : `${uiResult?.reason || "ui"}+${draftCheck?.reason || "left_draft"}`;
 
     return res.json({
       ok: true,
