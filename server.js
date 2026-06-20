@@ -26,8 +26,8 @@ const { chromium } = require("playwright");
 
 const PORT = process.env.PORT || 3000;
 const SHARED_SECRET = process.env.SHARED_SECRET || "";
-const MAX_CONCURRENT_PUBLISH = Number(process.env.MAX_CONCURRENT_PUBLISH || 1);
-const SERVICE_VERSION = "1.1.5";
+const MAX_CONCURRENT_PUBLISH = Number(process.env.MAX_CONCURRENT_PUBLISH || 2);
+const SERVICE_VERSION = "1.1.6";
 
 const app = express();
 app.use(express.json({ limit: "5mb" }));
@@ -116,7 +116,7 @@ async function clickButtonMatching(page, patternSource, patternFlags) {
     .catch(() => null);
 }
 
-async function prepareEditorForPublish(page, timeoutMs = 60_000) {
+async function prepareEditorForPublish(page, timeoutMs = 45_000) {
   const deadline = Date.now() + timeoutMs;
   let lastAction = "waiting";
 
@@ -181,7 +181,7 @@ function isPublishApiSuccess(apiDetail) {
   return isTikTokApiSuccess(apiDetail) && isPublishApiUrl(apiDetail.url);
 }
 
-function waitForPublishApi(page, timeoutMs = 60_000) {
+function waitForPublishApi(page, timeoutMs = 45_000) {
   return page
     .waitForResponse(
       (resp) => {
@@ -205,7 +205,7 @@ function waitForPublishApi(page, timeoutMs = 60_000) {
     .catch(() => ({ ok: false, detail: { reason: "publish_api_timeout" } }));
 }
 
-async function waitForUiPublishSuccess(page, timeoutMs = 30_000) {
+async function waitForUiPublishSuccess(page, timeoutMs = 12_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (page.isClosed()) return { ok: false, reason: "page_closed" };
@@ -216,19 +216,16 @@ async function waitForUiPublishSuccess(page, timeoutMs = 30_000) {
     if (state.hasSuccess) {
       return { ok: true, reason: "ui_success_toast", state };
     }
-    await page.waitForTimeout(1000);
+    await page.waitForTimeout(500);
   }
   return { ok: false, reason: "ui_timeout" };
 }
 
-async function verifyDraftLeftDraftState(page, advertiserId, campaignSketchId) {
-  await page.goto(buildEditorUrl(advertiserId, campaignSketchId), {
-    waitUntil: "domcontentloaded",
-    timeout: 45_000,
-  });
-  await page.waitForTimeout(2500);
-
-  const check = await page.evaluate(() => {
+async function readDraftCheckOnPage(page) {
+  if (page.isClosed()) {
+    return { publishStillVisible: true, draftStatus: true, bodyText: "page closed" };
+  }
+  return page.evaluate(() => {
     const bodyText = (document.body.innerText || "").slice(0, 5000);
     const publishStillVisible = Array.from(
       document.querySelectorAll(
@@ -248,18 +245,33 @@ async function verifyDraftLeftDraftState(page, advertiserId, campaignSketchId) {
       bodyText: bodyText.slice(0, 400),
     };
   });
+}
+
+async function verifyPublishComplete(page, advertiserId, campaignSketchId) {
+  await page.waitForTimeout(1200);
+  let check = await readDraftCheckOnPage(page);
+  if (!check.publishStillVisible && !check.draftStatus) {
+    return { published: true, reason: "on_page_left_draft", check };
+  }
+
+  await page.goto(buildEditorUrl(advertiserId, campaignSketchId), {
+    waitUntil: "domcontentloaded",
+    timeout: 30_000,
+  });
+  await page.waitForTimeout(1200);
+  check = await readDraftCheckOnPage(page);
 
   if (check.publishStillVisible) {
-    return {
-      published: false,
-      reason: "publish_all_still_visible",
-      check,
-    };
+    return { published: false, reason: "publish_all_still_visible", check };
   }
   if (check.draftStatus) {
     return { published: false, reason: "draft_status_still_shown", check };
   }
-  return { published: true, reason: "left_draft_state" };
+  return { published: true, reason: "left_draft_state", check };
+}
+
+async function verifyDraftLeftDraftState(page, advertiserId, campaignSketchId) {
+  return verifyPublishComplete(page, advertiserId, campaignSketchId);
 }
 
 function publishSucceeded(apiResult, uiResult, draftCheck) {
@@ -470,7 +482,7 @@ app.post("/publish-draft", async (req, res) => {
     let uiResult = null;
     let draftCheck = null;
     for (let attempt = 1; attempt <= 2; attempt++) {
-      const publishApiPromise = waitForPublishApi(page, 60_000);
+      const publishApiPromise = waitForPublishApi(page, 45_000);
       const publishClicked = await clickPublishAll(page);
       if (!publishClicked) {
         const diag = await page.evaluate(() => {
@@ -494,9 +506,11 @@ app.post("/publish-draft", async (req, res) => {
       }
 
       await clickConfirmDialog(page);
-      apiResult = await publishApiPromise;
-      uiResult = await waitForUiPublishSuccess(page, 25_000);
-      draftCheck = await verifyDraftLeftDraftState(page, advertiserId, campaignSketchId);
+      [apiResult, uiResult] = await Promise.all([
+        publishApiPromise,
+        waitForUiPublishSuccess(page, 12_000),
+      ]);
+      draftCheck = await verifyPublishComplete(page, advertiserId, campaignSketchId);
 
       if (publishSucceeded(apiResult, uiResult, draftCheck)) break;
 
@@ -507,14 +521,12 @@ app.post("/publish-draft", async (req, res) => {
       }
     }
 
-    const shot = await page.screenshot({ fullPage: false }).catch(() => null);
-    const shotId = shot ? saveScreenshot(shot) : null;
-    const base = req.protocol + "://" + req.get("host");
-
-    await browser.close();
-    browser = null;
-
     if (!publishSucceeded(apiResult, uiResult, draftCheck)) {
+      const shot = await page.screenshot({ fullPage: false }).catch(() => null);
+      const shotId = shot ? saveScreenshot(shot) : null;
+      const base = req.protocol + "://" + req.get("host");
+      await browser.close();
+      browser = null;
       const detail = [
         draftCheck?.published ? null : `draft=${draftCheck?.reason || "still_draft"}`,
         apiResult?.ok ? null : `publish_api=${JSON.stringify(apiResult?.detail || { reason: "no_publish_api" })}`,
@@ -531,6 +543,9 @@ app.post("/publish-draft", async (req, res) => {
       });
     }
 
+    await browser.close();
+    browser = null;
+
     const verifiedBy = isPublishApiSuccess(apiResult?.detail)
       ? "publish_api+left_draft"
       : `${uiResult?.reason || "ui"}+${draftCheck?.reason || "left_draft"}`;
@@ -539,7 +554,6 @@ app.post("/publish-draft", async (req, res) => {
       ok: true,
       newCampaignId: campaignSketchId,
       verifiedBy,
-      screenshot: shotId ? `${base}/screenshots/${shotId}` : undefined,
     });
   } catch (err) {
     if (browser) await browser.close().catch(() => {});
