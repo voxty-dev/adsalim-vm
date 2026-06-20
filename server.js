@@ -26,6 +26,7 @@ const { chromium } = require("playwright");
 
 const PORT = process.env.PORT || 3000;
 const SHARED_SECRET = process.env.SHARED_SECRET || "";
+const MAX_CONCURRENT_PUBLISH = Number(process.env.MAX_CONCURRENT_PUBLISH || 2);
 
 const app = express();
 app.use(express.json({ limit: "5mb" }));
@@ -38,6 +39,122 @@ app.get("/", (_req, res) => {
 // saves a screenshot of the page state and surfaces a URL in the error.
 const screenshots = new Map();
 let screenshotCounter = 0;
+
+let activePublishJobs = 0;
+const publishWaiters = [];
+
+function acquirePublishSlot() {
+  if (activePublishJobs < MAX_CONCURRENT_PUBLISH) {
+    activePublishJobs++;
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => publishWaiters.push(resolve));
+}
+
+function releasePublishSlot() {
+  activePublishJobs--;
+  const next = publishWaiters.shift();
+  if (next) {
+    activePublishJobs++;
+    next();
+  }
+}
+
+async function readPublishPageState(page) {
+  return page.evaluate(() => {
+    const bodyText = (document.body.innerText || "").slice(0, 8000);
+    const hasSuccess = /publish(ed)?(\s+all)?\s+success|published successfully|create success|submission successful|成功发布|发布成功/i.test(
+      bodyText
+    );
+    const hasError = /publish.*fail|failed to publish|permission denied|insufficient balance|risk control|unable to publish/i.test(
+      bodyText
+    );
+    const publishStillVisible = Array.from(
+      document.querySelectorAll(
+        'button, [role="button"], a, [class*="btn" i], [class*="button" i]'
+      )
+    ).some((el) => {
+      if (el.disabled) return false;
+      const style = window.getComputedStyle(el);
+      if (style.display === "none" || style.visibility === "hidden") return false;
+      const text = (el.innerText || el.textContent || "").trim().toLowerCase();
+      return /^publish all(\s*[▾▼⌄])?$|^publish$/.test(text);
+    });
+    return {
+      hasSuccess,
+      hasError,
+      publishStillVisible,
+      bodyText: bodyText.slice(0, 800),
+      url: location.href,
+    };
+  });
+}
+
+async function waitForPublishOutcome(page, timeoutMs = 45_000) {
+  let apiOk = false;
+  let apiDetail = null;
+
+  const responseWatcher = page
+    .waitForResponse(
+      (resp) => {
+        const url = resp.url();
+        if (!/ads\.tiktok\.com/i.test(url)) return false;
+        if (resp.request().method() !== "POST") return false;
+        return /publish|submit|creation|campaign|sketch/i.test(url);
+      },
+      { timeout: timeoutMs }
+    )
+    .then(async (resp) => {
+      try {
+        const json = await resp.json();
+        const code = json?.code ?? json?.status_code ?? json?.statusCode;
+        const msg = json?.msg ?? json?.message ?? "";
+        if (code === 0 || code === "0" || /success/i.test(String(msg))) {
+          apiOk = true;
+          apiDetail = { code, msg };
+        } else {
+          apiDetail = { code, msg, url: resp.url() };
+        }
+      } catch {
+        apiDetail = { url: resp.url(), parseError: true };
+      }
+    })
+    .catch(() => {});
+
+  const deadline = Date.now() + timeoutMs;
+  let lastState = null;
+
+  while (Date.now() < deadline) {
+    lastState = await readPublishPageState(page);
+    if (lastState.hasError && !lastState.hasSuccess) {
+      await responseWatcher;
+      return { verified: false, reason: "ui_error", state: lastState, apiDetail };
+    }
+    if (lastState.hasSuccess || apiOk) {
+      await responseWatcher;
+      return { verified: true, reason: "success_signal", state: lastState, apiDetail };
+    }
+    if (!lastState.publishStillVisible) {
+      await page.waitForTimeout(1500);
+      const followUp = await readPublishPageState(page);
+      if (followUp.hasSuccess || (!followUp.publishStillVisible && !followUp.hasError)) {
+        await responseWatcher;
+        return { verified: true, reason: "publish_ui_cleared", state: followUp, apiDetail };
+      }
+      lastState = followUp;
+    }
+    await page.waitForTimeout(1000);
+  }
+
+  await responseWatcher;
+  if (apiOk) {
+    return { verified: true, reason: "api_ok", state: lastState, apiDetail };
+  }
+  if (apiDetail && apiDetail.code != null && apiDetail.code !== 0 && apiDetail.code !== "0") {
+    return { verified: false, reason: "api_error", state: lastState, apiDetail };
+  }
+  return { verified: false, reason: "timeout", state: lastState, apiDetail };
+}
 
 function saveScreenshot(buf) {
   const id = `${Date.now()}-${++screenshotCounter}`;
@@ -69,6 +186,8 @@ app.post("/publish-draft", async (req, res) => {
       error: "advertiserId, campaignSketchId, cookies required",
     });
   }
+
+  await acquirePublishSlot();
 
   let browser;
   try {
@@ -216,11 +335,8 @@ app.post("/publish-draft", async (req, res) => {
     }
 
     // After clicking Publish all, TikTok may show a confirm dialog OR
-    // immediately submit. We click any confirm button if present, then
-    // wait briefly for the submit to fire. URL doesn't reliably change
-    // (TikTok often stays on the same page post-publish + shows a
-    // success toast), so we just trust the click — the campaign list
-    // will show the new state.
+    // immediately submit. Click confirm if present, then wait for a real
+    // success signal — do NOT trust the click alone (false positives).
     await page.waitForTimeout(800);
     await page.evaluate(() => {
       const buttons = Array.from(document.querySelectorAll("button"));
@@ -238,41 +354,42 @@ app.post("/publish-draft", async (req, res) => {
       return false;
     }).catch(() => {});
 
-    // Wait for the publish XHR to flush.
-    await page.waitForTimeout(4000);
-
-    // Verify: check if a success toast appeared, or look for error
-    // indicators. Take a screenshot either way so we can debug.
-    const postState = await page.evaluate(() => {
-      const bodyText = (document.body.innerText || "").slice(0, 5000);
-      // Common TikTok success/error markers
-      const hasSuccess = /publish.*success|published successfully|create success|成功/i.test(bodyText);
-      const hasError = /failed|error|insufficient|permission denied|risk/i.test(bodyText.slice(0, 2000));
-      return { hasSuccess, hasError, bodyText: bodyText.slice(0, 800), url: location.href };
-    });
+    const outcome = await waitForPublishOutcome(page);
 
     const shot = await page.screenshot({ fullPage: false }).catch(() => null);
     const shotId = shot ? saveScreenshot(shot) : null;
     const base = req.protocol + "://" + req.get("host");
 
     await browser.close();
+    browser = null;
 
-    // If we explicitly see an error and no success, fail.
-    if (postState.hasError && !postState.hasSuccess) {
+    if (!outcome.verified) {
+      const detail = [
+        `reason=${outcome.reason}`,
+        outcome.apiDetail ? `api=${JSON.stringify(outcome.apiDetail)}` : null,
+        outcome.state?.bodyText ? `body=${outcome.state.bodyText}` : null,
+        shotId ? `screenshot=${base}/screenshots/${shotId}` : null,
+      ]
+        .filter(Boolean)
+        .join(" | ");
       return res.status(500).json({
         ok: false,
-        error: `Post-publish state shows error. screenshot=${shotId ? `${base}/screenshots/${shotId}` : "n/a"} | body=${postState.bodyText}`,
+        error: `Publish not verified. ${detail}`,
+        screenshot: shotId ? `${base}/screenshots/${shotId}` : undefined,
       });
     }
 
     return res.json({
       ok: true,
       newCampaignId: campaignSketchId,
+      verifiedBy: outcome.reason,
       screenshot: shotId ? `${base}/screenshots/${shotId}` : undefined,
     });
   } catch (err) {
     if (browser) await browser.close().catch(() => {});
     return res.status(500).json({ error: err instanceof Error ? err.message : "Internal error" });
+  } finally {
+    releasePublishSlot();
   }
 });
 
