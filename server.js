@@ -27,7 +27,7 @@ const { chromium } = require("playwright");
 const PORT = process.env.PORT || 3000;
 const SHARED_SECRET = process.env.SHARED_SECRET || "";
 const MAX_CONCURRENT_PUBLISH = Number(process.env.MAX_CONCURRENT_PUBLISH || 1);
-const SERVICE_VERSION = "1.1.2";
+const SERVICE_VERSION = "1.1.3";
 
 const app = express();
 app.use(express.json({ limit: "5mb" }));
@@ -78,23 +78,42 @@ function releasePublishSlot() {
   }
 }
 
-async function findPublishAllHandle(page) {
-  const selectors =
-    'button, [role="button"], a, div, span, [class*="btn" i], [class*="button" i]';
-  const handle = await page.evaluateHandle((sel) => {
-    const all = Array.from(document.querySelectorAll(sel));
-    return all.find((el) => {
+function publishAllSelector() {
+  return 'button, [role="button"], a, div, span, [class*="btn" i], [class*="button" i]';
+}
+
+async function isPublishAllVisible(page) {
+  if (page.isClosed()) return false;
+  return page.evaluate((sel) => {
+    return Array.from(document.querySelectorAll(sel)).some((el) => {
       if (el.disabled) return false;
       const style = window.getComputedStyle(el);
       if (style.display === "none" || style.visibility === "hidden") return false;
       if (Number(style.opacity) < 0.1) return false;
       const text = (el.innerText || el.textContent || "").trim().toLowerCase();
       return /^publish all(\s*[▾▼⌄↓])?$|^publish$/.test(text);
-    }) || null;
-  }, selectors);
-  const element = handle.asElement();
-  await handle.dispose();
-  return element;
+    });
+  }, publishAllSelector()).catch(() => false);
+}
+
+async function clickButtonMatching(page, patternSource, patternFlags) {
+  if (page.isClosed()) return null;
+  return page
+    .evaluate(
+      ({ sel, patSource, patFlags }) => {
+        const pat = new RegExp(patSource, patFlags);
+        for (const b of document.querySelectorAll("button, [role='button']")) {
+          const t = (b.innerText || b.textContent || "").trim();
+          if (pat.test(t) && !b.disabled) {
+            b.click();
+            return t;
+          }
+        }
+        return null;
+      },
+      { sel: publishAllSelector(), patSource: patternSource, patFlags: patternFlags }
+    )
+    .catch(() => null);
 }
 
 async function prepareEditorForPublish(page, timeoutMs = 60_000) {
@@ -102,23 +121,21 @@ async function prepareEditorForPublish(page, timeoutMs = 60_000) {
   let lastAction = "waiting";
 
   while (Date.now() < deadline) {
-    const publishHandle = await findPublishAllHandle(page);
-    if (publishHandle) {
-      await publishHandle.dispose();
+    if (page.isClosed()) return { ready: false, lastAction: "page_closed" };
+
+    if (await isPublishAllVisible(page)) {
       return { ready: true, lastAction: "publish_visible" };
     }
 
-    const gotIt = page.getByRole("button", { name: /^got it$/i });
-    if ((await gotIt.count()) > 0) {
-      await gotIt.first().click({ timeout: 3000 }).catch(() => {});
+    const gotIt = await clickButtonMatching(page, "^got it$", "i");
+    if (gotIt) {
       lastAction = "got_it";
       await page.waitForTimeout(1200);
       continue;
     }
 
-    const createAnyway = page.getByRole("button", { name: /create anyway/i });
-    if ((await createAnyway.count()) > 0) {
-      await createAnyway.first().click({ timeout: 3000 }).catch(() => {});
+    const createAnyway = await clickButtonMatching(page, "create anyway", "i");
+    if (createAnyway) {
       lastAction = "create_anyway";
       await page.waitForTimeout(3000);
       continue;
@@ -135,7 +152,7 @@ async function prepareEditorForPublish(page, timeoutMs = 60_000) {
         return true;
       }
       return false;
-    });
+    }).catch(() => false);
     if (continued) {
       lastAction = "continue";
       await page.waitForTimeout(2000);
@@ -150,6 +167,15 @@ async function prepareEditorForPublish(page, timeoutMs = 60_000) {
 }
 
 async function readPublishPageState(page) {
+  if (page.isClosed()) {
+    return {
+      hasSuccess: false,
+      hasError: true,
+      publishStillVisible: false,
+      bodyText: "page closed",
+      url: "",
+    };
+  }
   return page.evaluate(() => {
     const bodyText = (document.body.innerText || "").slice(0, 8000);
     const hasSuccess = /publish(ed)?(\s+all)?\s+success|published successfully|create success|submission successful|成功发布|发布成功/i.test(
@@ -214,6 +240,9 @@ async function waitForPublishOutcome(page, timeoutMs = 45_000) {
   let lastState = null;
 
   while (Date.now() < deadline) {
+    if (page.isClosed()) {
+      return { verified: false, reason: "page_closed", state: lastState, apiDetail };
+    }
     lastState = await readPublishPageState(page);
     if (lastState.hasError && !lastState.hasSuccess) {
       await responseWatcher;
@@ -282,21 +311,27 @@ async function confirmDraftGone(page, advertiserId, campaignSketchId) {
 }
 
 async function clickPublishAll(page) {
-  await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+  if (page.isClosed()) return false;
+  await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight)).catch(() => {});
   await page.waitForTimeout(400);
-
-  const handle = await findPublishAllHandle(page);
-  if (!handle) return false;
-
-  const label = await handle.evaluate(
-    (el) => (el.innerText || el.textContent || "").trim()
-  );
-  await handle.scrollIntoViewIfNeeded().catch(() => {});
-  await handle.click({ timeout: 5000 }).catch(async () => {
-    await handle.evaluate((el) => el.click());
-  });
-  await handle.dispose();
-  return label || "Publish all";
+  return page
+    .evaluate((sel) => {
+      const all = Array.from(document.querySelectorAll(sel));
+      for (const el of all) {
+        if (el.disabled) continue;
+        const style = window.getComputedStyle(el);
+        if (style.display === "none" || style.visibility === "hidden") continue;
+        if (Number(style.opacity) < 0.1) continue;
+        const text = (el.innerText || el.textContent || "").trim().toLowerCase();
+        if (/^publish all(\s*[▾▼⌄↓])?$|^publish$/.test(text)) {
+          el.scrollIntoView({ block: "center" });
+          el.click();
+          return (el.innerText || el.textContent || "").trim();
+        }
+      }
+      return false;
+    }, publishAllSelector())
+    .catch(() => false);
 }
 
 async function clickConfirmDialog(page) {
