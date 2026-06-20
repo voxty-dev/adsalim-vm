@@ -27,7 +27,7 @@ const { chromium } = require("playwright");
 const PORT = process.env.PORT || 3000;
 const SHARED_SECRET = process.env.SHARED_SECRET || "";
 const MAX_CONCURRENT_PUBLISH = Number(process.env.MAX_CONCURRENT_PUBLISH || 1);
-const SERVICE_VERSION = "1.1.3";
+const SERVICE_VERSION = "1.1.4";
 
 const app = express();
 app.use(express.json({ limit: "5mb" }));
@@ -269,6 +269,20 @@ async function waitForPublishOutcome(page, timeoutMs = 45_000) {
   return { verified: false, reason: "timeout", state: lastState, apiDetail };
 }
 
+function isTikTokApiSuccess(apiDetail) {
+  if (!apiDetail) return false;
+  const code = apiDetail.code;
+  if (code === 0 || code === "0") return true;
+  return /success/i.test(String(apiDetail.msg || ""));
+}
+
+function publishSucceeded(outcome, draftCheck) {
+  if (isTikTokApiSuccess(outcome?.apiDetail)) return true;
+  if (outcome?.verified && outcome?.state?.hasSuccess) return true;
+  if (outcome?.verified && draftCheck?.gone) return true;
+  return false;
+}
+
 async function confirmDraftGone(page, advertiserId, campaignSketchId) {
   await page.goto(buildEditorUrl(advertiserId, campaignSketchId), {
     waitUntil: "domcontentloaded",
@@ -494,9 +508,14 @@ app.post("/publish-draft", async (req, res) => {
 
       await clickConfirmDialog(page);
       outcome = await waitForPublishOutcome(page);
-      draftCheck = await confirmDraftGone(page, advertiserId, campaignSketchId);
 
-      if (outcome.verified && draftCheck.gone) break;
+      if (isTikTokApiSuccess(outcome.apiDetail)) {
+        draftCheck = { gone: true, reason: "tiktok_api_success" };
+        break;
+      }
+
+      draftCheck = await confirmDraftGone(page, advertiserId, campaignSketchId);
+      if (publishSucceeded(outcome, draftCheck)) break;
 
       if (attempt === 1) {
         const retry = await loadEditorAndPrepare();
@@ -512,7 +531,7 @@ app.post("/publish-draft", async (req, res) => {
     await browser.close();
     browser = null;
 
-    if (!outcome?.verified || !draftCheck?.gone) {
+    if (!publishSucceeded(outcome, draftCheck)) {
       const detail = [
         outcome?.verified ? null : `outcome=${outcome?.reason || "unknown"}`,
         draftCheck?.gone ? null : `draft=${draftCheck?.reason || "still_present"}`,
@@ -529,10 +548,14 @@ app.post("/publish-draft", async (req, res) => {
       });
     }
 
+    const verifiedBy = isTikTokApiSuccess(outcome?.apiDetail)
+      ? "tiktok_api_success"
+      : `${outcome.reason}+${draftCheck.reason}`;
+
     return res.json({
       ok: true,
       newCampaignId: campaignSketchId,
-      verifiedBy: `${outcome.reason}+${draftCheck.reason}`,
+      verifiedBy,
       screenshot: shotId ? `${base}/screenshots/${shotId}` : undefined,
     });
   } catch (err) {
