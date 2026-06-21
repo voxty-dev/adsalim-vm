@@ -20,7 +20,7 @@ const { chromium } = require("playwright");
 const PORT = process.env.PORT || 3000;
 const SHARED_SECRET = process.env.SHARED_SECRET || "";
 const MAX_CONCURRENT_PUBLISH = Number(process.env.MAX_CONCURRENT_PUBLISH || 8);
-const SERVICE_VERSION = "1.6.1";
+const SERVICE_VERSION = "1.6.2";
 
 function detectTikTokBlocker(bodyText) {
   const t = String(bodyText || "");
@@ -71,6 +71,7 @@ app.get("/", (_req, res) => {
     endpoints: [
       "/test-cookies",
       "/duplicate/inject",
+      "/adsalim-bridge.user.js",
       "/duplicate/ui",
       "/duplicate",
       "/duplicate/async",
@@ -1508,6 +1509,11 @@ app.post("/test-cookies", async (req, res) => {
 
 app.get("/duplicate/inject", (_req, res) => {
   res.sendFile(path.join(__dirname, "public", "duplicate-inject.html"));
+});
+
+app.get("/adsalim-bridge.user.js", (req, res) => {
+  res.setHeader("Content-Type", "text/javascript; charset=utf-8");
+  res.sendFile(path.join(__dirname, "public", "adsalim-bridge.user.js"));
 });
 
 // Alias — static hosting may 404 nested paths on older deploys

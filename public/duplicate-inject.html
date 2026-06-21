@@ -12,45 +12,77 @@
     p, li { color: #94a3b8; }
     code, pre { background: #111827; border: 1px solid #334155; border-radius: 8px; }
     code { padding: 2px 6px; font-size: 13px; }
-    pre { padding: 14px; overflow: auto; font-size: 12px; }
+    pre { padding: 14px; overflow: auto; font-size: 12px; white-space: pre-wrap; word-break: break-all; }
     .step { margin: 20px 0; padding: 16px; border: 1px solid #334155; border-radius: 12px; background: #111827; }
-    button { padding: 10px 14px; border: 0; border-radius: 8px; background: #06b6d4; color: #042f2e; font-weight: 700; cursor: pointer; }
+    .bad { background: #450a0a; border: 1px solid #b91c1c; color: #fecaca; padding: 12px; border-radius: 8px; margin: 16px 0; }
+    .good { background: #052e16; border: 1px solid #166534; color: #86efac; padding: 12px; border-radius: 8px; margin: 16px 0; }
+    button { padding: 10px 14px; border: 0; border-radius: 8px; background: #06b6d4; color: #042f2e; font-weight: 700; cursor: pointer; margin-right: 8px; margin-top: 8px; }
+    button.secondary { background: #334155; color: #e2e8f0; }
     a { color: #22d3ee; }
+    input { width: 100%; box-sizing: border-box; padding: 10px; border-radius: 8px; border: 1px solid #334155; background: #0f172a; color: #f8fafc; margin-top: 6px; }
+    label { display: block; font-size: 0.85rem; color: #cbd5e1; margin-top: 10px; }
   </style>
 </head>
 <body>
   <main>
-    <h1>Fix adsalim duplicate (stops at ~4–5)</h1>
-    <p>
-      adsalim.com still duplicates on <strong>Vercel</strong> → timeout → JSON error.
-      This bridge sends duplicate requests to the <strong>VM</strong> instead (20 copies OK).
-    </p>
+    <h1>Fix adsalim duplicate</h1>
 
-    <div class="step">
-      <strong>Step 1</strong> — Open <a href="https://www.adsalim.com" target="_blank">adsalim.com</a> TikTok campaigns (logged in).
+    <div class="bad">
+      <strong>Mixed Content error?</strong><br>
+      adsalim.com = <code>https://</code> — VM = <code>http://</code><br>
+      Browser blocks loading HTTP script from HTTPS page. Console paste with <code>s.src='http://...'</code> <strong>will NOT work</strong>.
+    </div>
+
+    <div class="good">
+      <strong>Option A — simplest (no bridge):</strong>
+      <a href="/duplicate/ui">Open /duplicate/ui</a> → paste cookies + Campaign ID → Start duplicate (20 copies OK).
     </div>
 
     <div class="step">
-      <strong>Step 2</strong> — Press <code>F12</code> → Console → paste this once per browser session:
-      <pre id="snippet"></pre>
-      <button id="copy">Copy script</button>
+      <strong>Option B — Tampermonkey (works with HTTP VM on adsalim.com)</strong>
+      <ol>
+        <li>Install <a href="https://www.tampermonkey.net/" target="_blank">Tampermonkey</a> extension</li>
+        <li>Click button below → Tampermonkey opens → <strong>Install</strong></li>
+        <li>Enter VM secret when prompted on adsalim.com</li>
+        <li>Cyan badge <code>VM duplicate bridge ON</code> bottom-right → duplicate as normal</li>
+      </ol>
+      <label>VM URL (optional — default is this server)</label>
+      <input id="vmUrl" />
+      <label>VM secret (saved in Tampermonkey, not in page)</label>
+      <input id="vmSecret" type="password" />
+      <button id="installTm">Install Tampermonkey bridge</button>
+      <button class="secondary" id="copyTm">Copy userscript URL</button>
     </div>
 
     <div class="step">
-      <strong>Step 3</strong> — You should see a cyan badge <code>VM duplicate bridge ON</code> bottom-right.
-      Then use Duplicate as normal (10x / 20x).
+      <strong>Option C — HTTPS on VM (then console paste works)</strong>
+      <p>In Coolify: add domain + Let's Encrypt SSL. Then use:</p>
+      <pre id="httpsSnippet"></pre>
+      <button class="secondary" id="copyHttps">Copy HTTPS snippet</button>
     </div>
-
-    <p>Alternative: open <a href="/duplicate/ui">/duplicate/ui</a> and run copies manually.</p>
   </main>
   <script>
     const vmOrigin = location.origin;
-    const snippet =
-      `(function(){var s=document.createElement('script');s.src='${vmOrigin}/adsalim-bridge.js?v=1.4.2';document.head.appendChild(s);})();`;
-    document.getElementById("snippet").textContent = snippet;
-    document.getElementById("copy").onclick = () => {
-      navigator.clipboard.writeText(snippet);
-      document.getElementById("copy").textContent = "Copied!";
+    const isHttps = location.protocol === "https:";
+    document.getElementById("vmUrl").value = vmOrigin;
+
+    document.getElementById("httpsSnippet").textContent = isHttps
+      ? `(function(){var s=document.createElement('script');s.src='${vmOrigin}/adsalim-bridge.js?v=1.6.1';document.head.appendChild(s);})();`
+      : `# Enable HTTPS on Coolify first, then snippet becomes:\n(function(){var s=document.createElement('script');s.src='https://YOUR-DOMAIN/adsalim-bridge.js?v=1.6.1';document.head.appendChild(s);})();`;
+
+    document.getElementById("installTm").onclick = () => {
+      const url = document.getElementById("vmUrl").value.trim() || vmOrigin;
+      window.open(`${vmOrigin}/adsalim-bridge.user.js?vm=${encodeURIComponent(url)}`, "_blank");
+    };
+
+    document.getElementById("copyTm").onclick = () => {
+      navigator.clipboard.writeText(`${vmOrigin}/adsalim-bridge.user.js`);
+      document.getElementById("copyTm").textContent = "Copied!";
+    };
+
+    document.getElementById("copyHttps").onclick = () => {
+      navigator.clipboard.writeText(document.getElementById("httpsSnippet").textContent);
+      document.getElementById("copyHttps").textContent = "Copied!";
     };
   </script>
 </body>
