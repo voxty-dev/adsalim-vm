@@ -65,10 +65,10 @@
     <input id="secret" type="password" />
 
     <div class="row">
-      <div><label>Advertiser ID</label><input id="advertiserId" /></div>
-      <div><label>Campaign ID</label><input id="campaignId" /></div>
+      <div><label>Advertiser ID (aadvid in URL)</label><input id="advertiserId" /></div>
+      <div><label>Campaign ID (optional — data-row-key)</label><input id="campaignId" placeholder="leave empty if using name" /></div>
     </div>
-    <label>Campaign name (smiya f TikTok)</label>
+    <label>Campaign name — exact smiya f TikTok (required if no ID)</label>
     <input id="campaignName" placeholder="PRST TR G1" />
     <label>Names (1 per line)</label>
     <textarea id="names" rows="4"></textarea>
@@ -161,8 +161,11 @@
       const campaignId = $("campaignId").value.trim();
       const campaignName = $("campaignName").value.trim();
       const names = $("names").value.split("\n").map(s => s.trim()).filter(Boolean);
-      if (!secret || !advertiserId || !campaignId || !names.length) {
-        setLog("Fill secret, IDs, names", "err"); return;
+      if (!secret || !advertiserId || !names.length) {
+        setLog("Fill secret, advertiser ID, names", "err"); return;
+      }
+      if (!campaignId && !campaignName) {
+        setLog("Fill campaign name OR campaign ID", "err"); return;
       }
       $("run").disabled = true;
       setLog(`Starting ${names.length} copies…`);

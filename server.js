@@ -20,7 +20,7 @@ const { chromium } = require("playwright");
 const PORT = process.env.PORT || 3000;
 const SHARED_SECRET = process.env.SHARED_SECRET || "";
 const MAX_CONCURRENT_PUBLISH = Number(process.env.MAX_CONCURRENT_PUBLISH || 8);
-const SERVICE_VERSION = "1.4.5";
+const SERVICE_VERSION = "1.4.6";
 const CORS_ORIGINS = (process.env.CORS_ORIGINS || "https://www.adsalim.com,https://adsalim.com")
   .split(",")
   .map((s) => s.trim())
@@ -461,78 +461,140 @@ async function savePageScreenshot(page, tag) {
 
 async function fillCampaignSearch(page, query) {
   const searchInput = page.locator(
-    'input[placeholder*="Search" i], input[aria-label*="Search" i], input[type="search"]'
+    'input[placeholder*="Search" i], input[aria-label*="Search" i], input[type="search"], input[class*="search" i]'
   ).first();
-  await searchInput.waitFor({ state: "visible", timeout: 20_000 });
+  await searchInput.waitFor({ state: "visible", timeout: 25_000 });
+  await searchInput.click({ clickCount: 3 }).catch(() => {});
   await searchInput.fill("");
+  await page.waitForTimeout(200);
   await searchInput.fill(String(query));
+  await page.waitForTimeout(400);
   await page.keyboard.press("Enter").catch(() => {});
-  await page.waitForTimeout(2000);
+  await page.waitForTimeout(3500);
+}
+
+async function scanCampaignRows(page) {
+  return page.evaluate(() => {
+    const rows = [];
+    for (const el of Array.from(document.querySelectorAll("[data-row-key], [data-id], tr"))) {
+      const key = el.getAttribute("data-row-key") || el.getAttribute("data-id") || "";
+      const text = (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
+      if (!text || text.length < 3) continue;
+      if (key || text.length < 200) rows.push({ key, text: text.slice(0, 120) });
+    }
+    return rows.slice(0, 40);
+  });
+}
+
+async function findCampaignRowMeta(page, sourceCampaignId, sourceCampaignName) {
+  const id = String(sourceCampaignId || "").trim();
+  const name = String(sourceCampaignName || "").trim().toLowerCase();
+
+  const matchInRows = (rows) => {
+    if (id) {
+      const byId = rows.find(
+        (r) => r.key === id || r.key.endsWith(id) || r.text.includes(id)
+      );
+      if (byId?.key) return { key: byId.key, method: "id", sample: rows.slice(0, 5) };
+    }
+    if (name) {
+      const byName = rows.find((r) => r.text.toLowerCase().includes(name));
+      if (byName?.key) return { key: byName.key, method: "name", sample: rows.slice(0, 5) };
+    }
+    return null;
+  };
+
+  let rows = await scanCampaignRows(page);
+  let hit = matchInRows(rows);
+  if (hit) return hit;
+
+  if (name) {
+    await fillCampaignSearch(page, sourceCampaignName);
+    rows = await scanCampaignRows(page);
+    hit = matchInRows(rows);
+    if (hit) return hit;
+  }
+
+  if (id) {
+    await fillCampaignSearch(page, id);
+    rows = await scanCampaignRows(page);
+    hit = matchInRows(rows);
+    if (hit) return hit;
+  }
+
+  return { key: null, sample: rows.slice(0, 8) };
 }
 
 async function locateSourceCampaignRow(page, sourceCampaignId, sourceCampaignName) {
-  const id = String(sourceCampaignId);
-  const rowSelector = `[data-row-key="${id}"], [data-id="${id}"]`;
-  let row = page.locator(rowSelector).first();
-  if (await row.isVisible().catch(() => false)) return row;
-
-  await fillCampaignSearch(page, id);
-  row = page.locator(rowSelector).first();
-  if (await row.isVisible().catch(() => false)) return row;
-
-  if (sourceCampaignName) {
-    await fillCampaignSearch(page, sourceCampaignName);
-    row = page.locator(rowSelector).first();
-    if (await row.isVisible().catch(() => false)) return row;
-    row = page.locator("tr, [class*='row' i], [role='row']").filter({
-      hasText: String(sourceCampaignName),
-    }).first();
-    if (await row.isVisible().catch(() => false)) return row;
+  const meta = await findCampaignRowMeta(page, sourceCampaignId, sourceCampaignName);
+  if (!meta.key) {
+    const shot = await savePageScreenshot(page, "row-not-found");
+    const hint = (meta.sample || [])
+      .map((r) => `${r.key || "?"} → ${r.text.slice(0, 50)}`)
+      .join(" | ");
+    throw new Error(
+      `Campaign not found. TikTok rows seen: ${hint || "none"}. ` +
+        `Use Campaign ID from row (data-row-key) or exact name. Screenshot: ${shot || "n/a"}`
+    );
   }
 
-  throw new Error(
-    `Campaign row not found for id=${id}` +
-      (sourceCampaignName ? ` name="${sourceCampaignName}"` : "") +
-      ". Check campaign ID in TikTok URL (data-row-key)."
-  );
+  const row = page.locator(`[data-row-key="${meta.key}"], [data-id="${meta.key}"]`).first();
+  if (await row.isVisible().catch(() => false)) return row;
+
+  return page.locator("*").filter({ hasText: sourceCampaignName || meta.key }).first();
 }
 
-async function duplicateDraftOnce(page, listUrl, sourceCampaignId, newName, sourceCampaignName) {
-  const row = await locateSourceCampaignRow(page, sourceCampaignId, sourceCampaignName);
+async function clickDuplicateOnRow(page, row) {
   await row.scrollIntoViewIfNeeded().catch(() => {});
   await row.hover().catch(() => {});
+  await page.waitForTimeout(700);
 
-  const dupClicked = await row.evaluate((r) => {
-    for (const el of Array.from(r.querySelectorAll("button, a, [role='button'], span"))) {
+  const clicked = await row.evaluate((r) => {
+    for (const el of Array.from(r.querySelectorAll("a, button, span, [role='button']"))) {
       const t = (el.innerText || el.textContent || "").trim().toLowerCase();
-      if (/^duplicate$|^copy$|duplicate campaign/.test(t)) {
+      if (t === "duplicate" || t.startsWith("duplicate ")) {
         el.click();
-        return true;
+        return "dup";
       }
     }
-    const menuBtn = r.querySelector('[class*="more" i], [aria-label*="more" i]');
-    if (menuBtn) {
-      menuBtn.click();
+    const more = r.querySelector(
+      '[class*="more" i], [aria-label*="more" i], [class*="action" i] button, [class*="Action"]'
+    );
+    if (more) {
+      more.click();
       return "menu";
     }
     return false;
   });
-  if (dupClicked === "menu") {
-    await page.waitForTimeout(500);
-    const fromMenu = await page.evaluate(() => {
-      for (const el of Array.from(document.querySelectorAll("button, [role='menuitem'], li, span"))) {
+
+  if (clicked === "menu") {
+    await page.waitForTimeout(600);
+    const menuDup = await page.evaluate(() => {
+      for (const el of Array.from(
+        document.querySelectorAll("button, a, li, span, [role='menuitem'], [class*='dropdown' i] *")
+      )) {
         const t = (el.innerText || el.textContent || "").trim().toLowerCase();
-        if (/duplicate/.test(t)) {
+        if (t === "duplicate" || /^duplicate\b/.test(t)) {
           el.click();
           return true;
         }
       }
       return false;
     });
-    if (!fromMenu) throw new Error("Duplicate not found in row menu");
-  } else if (!dupClicked) {
-    throw new Error("Duplicate button not found on source row");
+    if (!menuDup) throw new Error("Duplicate not in row menu — open campaign in TikTok and check UI");
+  } else if (clicked !== "dup") {
+    const globalDup = page.getByText(/^duplicate$/i).first();
+    if (await globalDup.isVisible().catch(() => false)) {
+      await globalDup.click();
+    } else {
+      throw new Error("Duplicate button not found — hover row in TikTok and check Actions menu");
+    }
   }
+}
+
+async function duplicateDraftOnce(page, listUrl, sourceCampaignId, newName, sourceCampaignName) {
+  const row = await locateSourceCampaignRow(page, sourceCampaignId, sourceCampaignName);
+  await clickDuplicateOnRow(page, row);
 
   const nameInput = page.locator('input[placeholder*="name" i], input[placeholder*="Name"]').first();
   await nameInput.waitFor({ state: "visible", timeout: 15_000 });
@@ -848,8 +910,11 @@ app.get("/screenshots/:id", (req, res) => {
 
 function validateDuplicateBody(body) {
   const { advertiserId, campaignId, campaignName, names, cookies } = body || {};
-  if (!advertiserId || !campaignId || !Array.isArray(names) || names.length === 0 || !cookies) {
-    return { error: "advertiserId, campaignId, names[], cookies required" };
+  if (!advertiserId || !Array.isArray(names) || names.length === 0 || !cookies) {
+    return { error: "advertiserId, names[], cookies required" };
+  }
+  if (!campaignId && !campaignName) {
+    return { error: "campaignId or campaignName required" };
   }
   if (names.length > 20) {
     return { error: "Max 20 copies per request" };
