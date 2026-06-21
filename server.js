@@ -20,7 +20,8 @@ const { chromium } = require("playwright");
 const PORT = process.env.PORT || 3000;
 const SHARED_SECRET = process.env.SHARED_SECRET || "";
 const MAX_CONCURRENT_PUBLISH = Number(process.env.MAX_CONCURRENT_PUBLISH || 8);
-const SERVICE_VERSION = "1.6.3";
+const SERVICE_VERSION = "1.6.4";
+const HEADLESS = process.env.HEADLESS !== "false";
 
 function detectTikTokBlocker(bodyText) {
   const t = String(bodyText || "");
@@ -132,7 +133,7 @@ async function getSharedBrowser() {
     }
   }
   sharedBrowserPromise = chromium.launch({
-    headless: true,
+    headless: HEADLESS,
     args: BROWSER_ARGS,
   }).catch((err) => {
     sharedBrowserPromise = null;
@@ -168,20 +169,29 @@ async function verifyTikTokSession({ advertiserId, cookies }) {
       return { ok: false, error: "Login page — sessionid_ads expired, re-copy JSON cookies" };
     }
     const hint = await readAccountHint(page);
-    const zeroCampaigns = hint.totalCampaigns === 0 || (diag.rowKeys === 0 && diag.tableRows <= 1);
+    const apiList = await fetchCampaignListViaApi(page, advertiserId || "");
+    const zeroCampaigns =
+      apiList.count === 0 && (hint.totalCampaigns === 0 || (diag.rowKeys === 0 && diag.tableRows <= 1));
+    const found =
+      apiList.campaigns.length > 0
+        ? findCampaignInApiList(apiList.campaigns, null, "PRST")
+        : null;
     return {
       ok: true,
       message:
-        diag.rowKeys > 0
-          ? `TikTok OK — ${diag.rowKeys} campaigns visible`
-          : zeroCampaigns
-            ? "Session OK but 0 campaigns — export cookies FROM the TikTok account that has PRST TR G1 (check aadvid= in URL)"
-            : "Session OK — will duplicate via Campaign ID",
+        apiList.count > 0
+          ? `TikTok OK — API sees ${apiList.count} campaigns${found ? " (incl. PRST TR G1 area)" : ""}`
+          : diag.rowKeys > 0
+            ? `TikTok OK — ${diag.rowKeys} campaigns visible`
+            : zeroCampaigns
+              ? "Session OK but API sees 0 campaigns — re-export Cookie-Editor JSON from campaign list page"
+              : "Session OK — duplicate via Campaign ID",
       url: diag.url,
       rowKeys: diag.rowKeys,
+      apiCampaignCount: apiList.count,
       totalCampaigns: hint.totalCampaigns,
       warning: zeroCampaigns
-        ? "Wrong account or empty list — on ads.tiktok.com verify aadvid matches Advertiser ID before exporting cookies"
+        ? "Export cookies while on ads.tiktok.com/i18n/manage/campaign?aadvid=YOUR_ID with PRST TR G1 visible"
         : null,
     };
   } catch (err) {
@@ -200,21 +210,46 @@ async function createTikTokContext(browser, cookies) {
   if (parsed.length === 0) throw new Error("No usable cookies parsed");
 
   const isJsonExport = String(cookies).trim().startsWith("[");
-  const toAdd = isJsonExport
-    ? parsed
-    : parsed.flatMap((c) => [
-        { ...c, domain: ".tiktok.com", path: c.path || "/" },
-        { ...c, domain: "ads.tiktok.com", path: c.path || "/" },
-      ]);
+  let toAdd = isJsonExport ? parsed : parsed;
+  if (!isJsonExport) {
+    toAdd = parsed.flatMap((c) => [
+      { ...c, domain: ".tiktok.com", path: c.path || "/" },
+      { ...c, domain: "ads.tiktok.com", path: c.path || "/" },
+    ]);
+  } else {
+    const expanded = [];
+    const seen = new Set();
+    for (const c of parsed) {
+      const bases = [
+        c.domain || ".tiktok.com",
+        ".tiktok.com",
+        "ads.tiktok.com",
+        "business.tiktok.com",
+      ];
+      for (const domain of bases) {
+        const key = `${c.name}|${domain}|${c.path || "/"}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        expanded.push({ ...c, domain, path: c.path || "/" });
+      }
+    }
+    toAdd = expanded;
+  }
 
   const context = await browser.newContext({
     userAgent: USER_AGENT,
     viewport: { width: 1440, height: 900 },
     locale: "en-US",
     timezoneId: "Europe/Madrid",
+    extraHTTPHeaders: {
+      "Accept-Language": "en-US,en;q=0.9",
+    },
   });
   await context.addInitScript(() => {
     Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+    Object.defineProperty(navigator, "plugins", { get: () => [1, 2, 3, 4, 5] });
+    Object.defineProperty(navigator, "languages", { get: () => ["en-US", "en"] });
+    window.chrome = window.chrome || { runtime: {} };
   });
   await context.addCookies(toAdd);
   return context;
@@ -479,20 +514,15 @@ async function replayDuplicateRequest(page, template, newName) {
     if (Object.prototype.hasOwnProperty.call(body, k)) body[k] = newName;
   }
 
-  const csrf = await getCsrfToken(page);
+  const headers = await getTikTokApiHeaders(page);
   const url = template.query ? `${template.url}?${template.query}` : template.url;
   const result = await page.evaluate(
-    async ({ fetchUrl, fetchBody, csrfToken }) => {
+    async ({ fetchUrl, fetchBody, fetchHeaders }) => {
       try {
-        const headers = { "Content-Type": "application/json", Accept: "application/json" };
-        if (csrfToken) {
-          headers["X-CSRFToken"] = csrfToken;
-          headers["x-csrftoken"] = csrfToken;
-        }
         const resp = await fetch(fetchUrl, {
           method: "POST",
           credentials: "include",
-          headers,
+          headers: fetchHeaders,
           body: JSON.stringify(fetchBody),
         });
         const text = await resp.text();
@@ -507,7 +537,7 @@ async function replayDuplicateRequest(page, template, newName) {
         return { error: String(e), url: fetchUrl };
       }
     },
-    { fetchUrl: url, fetchBody: body, csrfToken: csrf }
+    { fetchUrl: url, fetchBody: body, fetchHeaders: headers }
   );
 
   const draftId = extractDraftIdFromApiJson(result?.json);
@@ -726,21 +756,36 @@ async function getCsrfToken(page) {
   });
 }
 
+async function getTikTokApiHeaders(page) {
+  return page.evaluate(() => {
+    const headers = { Accept: "application/json", "Content-Type": "application/json" };
+    const cookie = document.cookie || "";
+    const pick = (name) => {
+      const m = cookie.match(new RegExp(`(?:^|;\\s*)${name}=([^;]+)`));
+      return m ? decodeURIComponent(m[1]) : "";
+    };
+    const csrf = pick("csrftoken");
+    if (csrf) {
+      headers["X-CSRFToken"] = csrf;
+      headers["x-csrftoken"] = csrf;
+    }
+    const passportCsrf = pick("passport_csrf_token") || pick("passport_csrf_token_default");
+    if (passportCsrf) headers["x-tt-passport-csrf-token"] = passportCsrf;
+    const msToken = pick("msToken");
+    if (msToken) headers["x-secsdk-csrf-token"] = msToken;
+    return headers;
+  });
+}
+
 async function tiktokApiCall(page, url, method, body) {
-  const csrf = await getCsrfToken(page);
+  const headers = await getTikTokApiHeaders(page);
   return page.evaluate(
-    async ({ fetchUrl, fetchMethod, fetchBody, csrfToken }) => {
+    async ({ fetchUrl, fetchMethod, fetchBody, fetchHeaders }) => {
       try {
-        const headers = { Accept: "application/json" };
-        if (fetchBody != null) headers["Content-Type"] = "application/json";
-        if (csrfToken) {
-          headers["X-CSRFToken"] = csrfToken;
-          headers["x-csrftoken"] = csrfToken;
-        }
         const resp = await fetch(fetchUrl, {
           method: fetchMethod,
           credentials: "include",
-          headers,
+          headers: fetchHeaders,
           body: fetchBody != null ? JSON.stringify(fetchBody) : undefined,
         });
         const text = await resp.text();
@@ -755,8 +800,67 @@ async function tiktokApiCall(page, url, method, body) {
         return { error: String(e), url: fetchUrl };
       }
     },
-    { fetchUrl: url, fetchMethod: method, fetchBody: body ?? null, csrfToken: csrf }
+    { fetchUrl: url, fetchMethod: method, fetchBody: body ?? null, fetchHeaders: headers }
   );
+}
+
+function extractCampaignList(json) {
+  if (!json || typeof json !== "object") return [];
+  const d = json.data ?? json;
+  if (Array.isArray(d)) return d;
+  if (Array.isArray(d.list)) return d.list;
+  if (Array.isArray(d.campaigns)) return d.campaigns;
+  if (Array.isArray(d.data)) return d.data;
+  if (Array.isArray(d.campaign_list)) return d.campaign_list;
+  return [];
+}
+
+async function fetchCampaignListViaApi(page, advertiserId) {
+  const attempts = [
+    {
+      url: `https://ads.tiktok.com/api/v2/i18n/manage/campaign/list/?aadvid=${encodeURIComponent(advertiserId)}`,
+      body: {
+        aadvid: String(advertiserId),
+        page: 1,
+        page_size: 100,
+        query_type: "all",
+        sort_stat: "create_time",
+        sort_order: 1,
+      },
+    },
+    {
+      url: `https://ads.tiktok.com/api/v2/i18n/performance/campaign/list/?aadvid=${encodeURIComponent(advertiserId)}`,
+      body: { aadvid: String(advertiserId), page: 1, page_size: 100 },
+    },
+    {
+      url: `https://ads.tiktok.com/api/v3/i18n/manage/campaign/list/?aadvid=${encodeURIComponent(advertiserId)}`,
+      body: { aadvid: String(advertiserId), page: 1, page_size: 100 },
+    },
+  ];
+
+  for (const attempt of attempts) {
+    const result = await tiktokApiCall(page, attempt.url, "POST", attempt.body);
+    const code = result?.json?.code ?? result?.json?.status_code;
+    if (code === 0 || code === "0" || code === 200) {
+      const campaigns = extractCampaignList(result.json);
+      if (campaigns.length > 0) {
+        return { ok: true, campaigns, count: campaigns.length, source: attempt.url };
+      }
+    }
+  }
+  return { ok: false, campaigns: [], count: 0 };
+}
+
+function findCampaignInApiList(campaigns, campaignId, campaignName) {
+  const id = String(campaignId || "").trim();
+  const name = String(campaignName || "").trim().toLowerCase();
+  return campaigns.find((c) => {
+    const cid = String(c.campaign_id || c.id || c.campaignId || c.campaignIdStr || "");
+    const cname = String(c.campaign_name || c.name || "").toLowerCase();
+    if (id && (cid === id || cid.endsWith(id))) return true;
+    if (name && cname.includes(name)) return true;
+    return false;
+  });
 }
 
 async function waitForCampaignRowKey(page, campaignId, timeoutMs = 45_000) {
@@ -830,6 +934,37 @@ async function tryDuplicateViaEditorUrls(page, advertiserId, campaignId, newName
   return null;
 }
 
+function attachDuplicateApiSniffer(page, apiTemplateRef) {
+  page.on("response", async (resp) => {
+    try {
+      if (resp.request().method() !== "POST") return;
+      if (!isDuplicateApiUrl(resp.url())) return;
+      const req = resp.request();
+      let body = null;
+      try {
+        const raw = req.postData();
+        body = raw ? JSON.parse(raw) : null;
+      } catch {
+        /* ignore */
+      }
+      let json = null;
+      try {
+        json = await resp.json();
+      } catch {
+        /* ignore */
+      }
+      const draftId = extractDraftIdFromApiJson(json);
+      if (draftId && body && apiTemplateRef && !apiTemplateRef.url) {
+        apiTemplateRef.url = resp.url().split("?")[0];
+        apiTemplateRef.query = resp.url().includes("?") ? resp.url().split("?")[1] : "";
+        apiTemplateRef.body = body;
+      }
+    } catch {
+      /* ignore */
+    }
+  });
+}
+
 function extractDraftIdFromApiJson(json) {
   if (!json || typeof json !== "object") return null;
   const code = json.code ?? json.status_code ?? json.statusCode;
@@ -847,7 +982,7 @@ function extractDraftIdFromApiJson(json) {
   );
 }
 
-async function tryDuplicateViaHttp(page, advertiserId, campaignId, newName) {
+async function tryDuplicateViaHttp(page, advertiserId, campaignId, newName, campaignName) {
   if (!campaignId) return null;
 
   await page
@@ -857,53 +992,67 @@ async function tryDuplicateViaHttp(page, advertiserId, campaignId, newName) {
     )
     .catch(() => {});
   await dismissOverlays(page);
-  await page.waitForTimeout(800);
+  await page.waitForTimeout(1200);
 
-  const csrf = await getCsrfToken(page);
+  const apiList = await fetchCampaignListViaApi(page, advertiserId);
+  const src = findCampaignInApiList(apiList.campaigns, campaignId, campaignName);
+  const srcId = String(src?.campaign_id || src?.id || campaignId);
+  const isSmartPlus = Boolean(src?.spc_flag || src?.smart_plus || src?.campaign_type === "SMART_PLUS");
+
+  const headers = await getTikTokApiHeaders(page);
   const attempts = [
     {
-      url: `https://ads.tiktok.com/api/v2/i18n/manage/campaign/duplicate/?aadvid=${encodeURIComponent(advertiserId)}`,
-      body: { aadvid: advertiserId, campaign_id: String(campaignId), campaign_name: newName },
-    },
-    {
-      url: `https://ads.tiktok.com/api/v2/i18n/creation/1nn/campaign/duplicate/?aadvid=${encodeURIComponent(advertiserId)}`,
-      body: { aadvid: advertiserId, campaign_id: String(campaignId), campaign_name: newName },
-    },
-    {
       url: `https://ads.tiktok.com/api/v2/i18n/creation/1nn/campaign/copy/?aadvid=${encodeURIComponent(advertiserId)}`,
-      body: { aadvid: advertiserId, src_campaign_id: String(campaignId), campaign_name: newName },
+      body: {
+        aadvid: String(advertiserId),
+        src_campaign_id: srcId,
+        campaign_id: srcId,
+        campaign_name: newName,
+        copy_num: 1,
+      },
     },
     {
-      url: `https://ads.tiktok.com/api/v2/i18n/creation/1nn/campaign/copy/?aadvid=${encodeURIComponent(advertiserId)}`,
-      body: { aadvid: advertiserId, campaign_id: String(campaignId), campaign_name: newName },
-    },
-    {
-      url: `https://ads.tiktok.com/api/v2/i18n/creation/1nn/campaign/sketch/copy/?aadvid=${encodeURIComponent(advertiserId)}`,
-      body: { aadvid: advertiserId, campaign_id: String(campaignId), name: newName },
+      url: `https://ads.tiktok.com/api/v2/i18n/creation/1nn/smart_plus/campaign/copy/?aadvid=${encodeURIComponent(advertiserId)}`,
+      body: { aadvid: String(advertiserId), campaign_id: srcId, campaign_name: newName },
     },
     {
       url: `https://ads.tiktok.com/api/v2/i18n/creation/1nn/smart_campaign/copy/?aadvid=${encodeURIComponent(advertiserId)}`,
-      body: { aadvid: advertiserId, campaign_id: String(campaignId), campaign_name: newName },
+      body: { aadvid: String(advertiserId), campaign_id: srcId, campaign_name: newName },
+    },
+    {
+      url: `https://ads.tiktok.com/api/v2/i18n/manage/campaign/duplicate/?aadvid=${encodeURIComponent(advertiserId)}`,
+      body: { aadvid: String(advertiserId), campaign_id: srcId, campaign_name: newName },
+    },
+    {
+      url: `https://ads.tiktok.com/api/v2/i18n/creation/1nn/campaign/duplicate/?aadvid=${encodeURIComponent(advertiserId)}`,
+      body: { aadvid: String(advertiserId), campaign_id: srcId, campaign_name: newName },
+    },
+    {
+      url: `https://ads.tiktok.com/api/v2/i18n/creation/1nn/campaign/sketch/copy/?aadvid=${encodeURIComponent(advertiserId)}`,
+      body: { aadvid: String(advertiserId), campaign_id: srcId, name: newName },
     },
     {
       url: `https://ads.tiktok.com/api/v3/i18n/manage/campaign/duplicate/?aadvid=${encodeURIComponent(advertiserId)}`,
-      body: { aadvid: advertiserId, campaign_id: String(campaignId), name: newName },
+      body: { aadvid: String(advertiserId), campaign_id: srcId, name: newName },
     },
   ];
 
+  if (isSmartPlus) {
+    attempts.unshift({
+      url: `https://ads.tiktok.com/api/v2/i18n/spc/campaign/copy/?aadvid=${encodeURIComponent(advertiserId)}`,
+      body: { aadvid: String(advertiserId), campaign_id: srcId, campaign_name: newName },
+    });
+  }
+
+  let lastErr = "";
   for (const attempt of attempts) {
     const result = await page.evaluate(
-      async ({ url, body, csrfToken }) => {
+      async ({ url, body, fetchHeaders }) => {
         try {
-          const headers = { "Content-Type": "application/json", Accept: "application/json" };
-          if (csrfToken) {
-            headers["X-CSRFToken"] = csrfToken;
-            headers["x-csrftoken"] = csrfToken;
-          }
           const resp = await fetch(url, {
             method: "POST",
             credentials: "include",
-            headers,
+            headers: fetchHeaders,
             body: JSON.stringify(body),
           });
           const text = await resp.text();
@@ -913,16 +1062,23 @@ async function tryDuplicateViaHttp(page, advertiserId, campaignId, newName) {
           } catch {
             /* ignore */
           }
-          return { status: resp.status, json, text: text.slice(0, 400), url };
+          return { status: resp.status, json, text: text.slice(0, 300), url };
         } catch (e) {
           return { error: String(e), url };
         }
       },
-      { url: attempt.url, body: attempt.body, csrfToken: csrf }
+      { url: attempt.url, body: attempt.body, fetchHeaders: headers }
     );
 
     const draftId = extractDraftIdFromApiJson(result?.json);
     if (draftId) return String(draftId);
+    const code = result?.json?.code ?? result?.json?.status_code;
+    const msg = result?.json?.msg ?? result?.json?.message ?? result?.text ?? result?.error;
+    if (msg) lastErr = `${attempt.url.split("/").slice(-2).join("/")}: ${msg}`;
+  }
+
+  if (apiList.count > 0 && lastErr) {
+    console.warn("[duplicate] HTTP failed but API list OK:", lastErr);
   }
   return null;
 }
@@ -1188,7 +1344,13 @@ async function duplicateDraftOnce(
   }
 
   if (sourceCampaignId) {
-    const fromHttp = await tryDuplicateViaHttp(page, advertiserId, sourceCampaignId, newName);
+    const fromHttp = await tryDuplicateViaHttp(
+      page,
+      advertiserId,
+      sourceCampaignId,
+      newName,
+      sourceCampaignName
+    );
     if (fromHttp) return fromHttp;
     attempts.push("http endpoints failed");
 
@@ -1304,11 +1466,12 @@ async function duplicateCampaignsCore({
 
   const browser = await getSharedBrowser();
   const context = await createTikTokContext(browser, cookies);
+  const duplicateApiTemplate = {};
   const page = await context.newPage();
+  attachDuplicateApiSniffer(page, duplicateApiTemplate);
   const listUrl = `https://ads.tiktok.com/i18n/manage/campaign?aadvid=${encodeURIComponent(advertiserId)}`;
 
   const draftResults = [];
-  const duplicateApiTemplate = {};
   try {
     onProgress?.({
       phase: "duplicating",
