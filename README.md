@@ -90,6 +90,16 @@ Poll `GET /duplicate/jobs/:jobId` until `status` is `completed` or `failed`. Pro
 
 **adsalim Browser (Smart+) mode should call this instead of replaying duplicate on Vercel.**
 
+### `GET /duplicate/ui`
+
+Browser tool to run 6–20 copies directly on the VM (bypasses adsalim.com timeout). Open:
+
+`https://<your-vm-url>/duplicate/ui`
+
+Paste `SHARED_SECRET`, advertiser/campaign IDs, names, and cookies. Uses `/duplicate/async` with live polling.
+
+**Why adsalim stops at ~5:** Vercel serverless times out after ~5 serial duplicate+publish cycles. The UI error `Unexpected token 'A'` is Vercel returning `"An error occurred..."` instead of JSON.
+
 ## When selectors break
 
 TikTok ships UI changes regularly. When the duplicate flow stops working,

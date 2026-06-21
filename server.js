@@ -14,12 +14,13 @@
  */
 
 const express = require("express");
+const path = require("path");
 const { chromium } = require("playwright");
 
 const PORT = process.env.PORT || 3000;
 const SHARED_SECRET = process.env.SHARED_SECRET || "";
 const MAX_CONCURRENT_PUBLISH = Number(process.env.MAX_CONCURRENT_PUBLISH || 8);
-const SERVICE_VERSION = "1.4.0";
+const SERVICE_VERSION = "1.4.1";
 const MAX_DUPLICATE_JOBS = 30;
 
 const BROWSER_ARGS = [
@@ -34,6 +35,7 @@ const USER_AGENT =
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
+app.use(express.static(path.join(__dirname, "public")));
 
 app.get("/", (_req, res) => {
   res.json({
@@ -42,6 +44,7 @@ app.get("/", (_req, res) => {
     version: SERVICE_VERSION,
     maxConcurrentPublish: MAX_CONCURRENT_PUBLISH,
     endpoints: [
+      "/duplicate/ui",
       "/duplicate",
       "/duplicate/async",
       "/duplicate/jobs/:id",
@@ -737,6 +740,10 @@ function startDuplicateJob(params) {
   return jobId;
 }
 
+app.get("/duplicate/ui", (_req, res) => {
+  res.sendFile(path.join(__dirname, "public", "duplicate-ui.html"));
+});
+
 app.post("/duplicate/async", (req, res) => {
   if (!checkAuth(req, res)) return;
 
@@ -764,6 +771,18 @@ app.post("/duplicate", async (req, res) => {
 
   const parsed = validateDuplicateBody(req.body);
   if (parsed.error) return res.status(400).json({ error: parsed.error });
+
+  // More than 5 copies usually exceeds Vercel/proxy timeouts — use async.
+  if (parsed.names.length > 5 && req.query.sync !== "1") {
+    const jobId = startDuplicateJob(parsed);
+    return res.status(202).json({
+      jobId,
+      status: "running",
+      async: true,
+      message: "Use GET /duplicate/jobs/:jobId to poll. For sync, add ?sync=1",
+      pollUrl: `/duplicate/jobs/${jobId}`,
+    });
+  }
 
   const started = Date.now();
   try {
