@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Fix adsalim.com duplicate (1 minute)</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; }
+    body { margin: 0; background: #0b1220; color: #e5e7eb; }
+    main { max-width: 720px; margin: 0 auto; padding: 24px; line-height: 1.6; }
+    h1 { font-size: 1.35rem; }
+    p, li { color: #94a3b8; }
+    code, pre { background: #111827; border: 1px solid #334155; border-radius: 8px; }
+    code { padding: 2px 6px; font-size: 13px; }
+    pre { padding: 14px; overflow: auto; font-size: 12px; }
+    .step { margin: 20px 0; padding: 16px; border: 1px solid #334155; border-radius: 12px; background: #111827; }
+    button { padding: 10px 14px; border: 0; border-radius: 8px; background: #06b6d4; color: #042f2e; font-weight: 700; cursor: pointer; }
+    a { color: #22d3ee; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Fix adsalim duplicate (stops at ~4–5)</h1>
+    <p>
+      adsalim.com still duplicates on <strong>Vercel</strong> → timeout → JSON error.
+      This bridge sends duplicate requests to the <strong>VM</strong> instead (20 copies OK).
+    </p>
+
+    <div class="step">
+      <strong>Step 1</strong> — Open <a href="https://www.adsalim.com" target="_blank">adsalim.com</a> TikTok campaigns (logged in).
+    </div>
+
+    <div class="step">
+      <strong>Step 2</strong> — Press <code>F12</code> → Console → paste this once per browser session:
+      <pre id="snippet"></pre>
+      <button id="copy">Copy script</button>
+    </div>
+
+    <div class="step">
+      <strong>Step 3</strong> — You should see a cyan badge <code>VM duplicate bridge ON</code> bottom-right.
+      Then use Duplicate as normal (10x / 20x).
+    </div>
+
+    <p>Alternative: open <a href="/duplicate/ui">/duplicate/ui</a> and run copies manually.</p>
+  </main>
+  <script>
+    const vmOrigin = location.origin;
+    const snippet =
+      `(function(){var s=document.createElement('script');s.src='${vmOrigin}/adsalim-bridge.js?v=1.4.2';document.head.appendChild(s);})();`;
+    document.getElementById("snippet").textContent = snippet;
+    document.getElementById("copy").onclick = () => {
+      navigator.clipboard.writeText(snippet);
+      document.getElementById("copy").textContent = "Copied!";
+    };
+  </script>
+</body>
+</html>

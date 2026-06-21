@@ -90,7 +90,15 @@ Poll `GET /duplicate/jobs/:jobId` until `status` is `completed` or `failed`. Pro
 
 **adsalim Browser (Smart+) mode should call this instead of replaying duplicate on Vercel.**
 
-### `GET /duplicate/ui`
+### `GET /duplicate/inject`
+
+One-time browser fix for adsalim.com (when duplicate stops at ~4–5):
+
+1. Open `https://<your-vm-url>/duplicate/inject`
+2. Copy the script → paste in adsalim.com DevTools console
+3. Duplicate 10x/20x as normal — requests go to VM async, not Vercel
+
+Requires CORS (`CORS_ORIGINS` defaults to `https://www.adsalim.com`).
 
 Browser tool to run 6–20 copies directly on the VM (bypasses adsalim.com timeout). Open:
 

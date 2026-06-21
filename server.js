@@ -20,7 +20,11 @@ const { chromium } = require("playwright");
 const PORT = process.env.PORT || 3000;
 const SHARED_SECRET = process.env.SHARED_SECRET || "";
 const MAX_CONCURRENT_PUBLISH = Number(process.env.MAX_CONCURRENT_PUBLISH || 8);
-const SERVICE_VERSION = "1.4.1";
+const SERVICE_VERSION = "1.4.2";
+const CORS_ORIGINS = (process.env.CORS_ORIGINS || "https://www.adsalim.com,https://adsalim.com")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
 const MAX_DUPLICATE_JOBS = 30;
 
 const BROWSER_ARGS = [
@@ -34,6 +38,19 @@ const USER_AGENT =
   "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
 const app = express();
+
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin && CORS_ORIGINS.includes(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  }
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
+
 app.use(express.json({ limit: "10mb" }));
 app.use(express.static(path.join(__dirname, "public")));
 
@@ -44,6 +61,7 @@ app.get("/", (_req, res) => {
     version: SERVICE_VERSION,
     maxConcurrentPublish: MAX_CONCURRENT_PUBLISH,
     endpoints: [
+      "/duplicate/inject",
       "/duplicate/ui",
       "/duplicate",
       "/duplicate/async",
@@ -739,6 +757,10 @@ function startDuplicateJob(params) {
 
   return jobId;
 }
+
+app.get("/duplicate/inject", (_req, res) => {
+  res.sendFile(path.join(__dirname, "public", "duplicate-inject.html"));
+});
 
 app.get("/duplicate/ui", (_req, res) => {
   res.sendFile(path.join(__dirname, "public", "duplicate-ui.html"));
