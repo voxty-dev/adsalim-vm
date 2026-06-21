@@ -20,7 +20,7 @@ const { chromium } = require("playwright");
 const PORT = process.env.PORT || 3000;
 const SHARED_SECRET = process.env.SHARED_SECRET || "";
 const MAX_CONCURRENT_PUBLISH = Number(process.env.MAX_CONCURRENT_PUBLISH || 8);
-const SERVICE_VERSION = "1.8.0";
+const SERVICE_VERSION = "1.9.0";
 const HEADLESS = process.env.HEADLESS !== "false";
 
 function detectTikTokBlocker(bodyText) {
@@ -276,6 +276,7 @@ async function dismissOverlays(page) {
         for (const btn of document.querySelectorAll("button, [role='button']")) {
           const t = (btn.innerText || btn.textContent || "").trim();
           if (/^got it$/i.test(t)) click(btn);
+          if (/^find your tools|^new place|^i understand|^continue$/i.test(t)) click(btn);
         }
 
         for (const el of document.querySelectorAll(
@@ -327,6 +328,21 @@ async function readPageDiagnostics(page) {
     tableRows: document.querySelectorAll("table tbody tr").length,
     bodyStart: (document.body?.innerText || "").replace(/\s+/g, " ").slice(0, 350),
   }));
+}
+
+async function warmTikTokSession(page, listUrl) {
+  await page.goto("https://ads.tiktok.com/", {
+    waitUntil: "domcontentloaded",
+    timeout: 45_000,
+  }).catch(() => {});
+  await page.waitForTimeout(800);
+  await page.goto(listUrl, { waitUntil: "domcontentloaded", timeout: 60_000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  if (page.url().includes("/login") || page.url().includes("/passport")) {
+    throw new Error("LOGIN");
+  }
+  await dismissOverlays(page);
+  return readPageDiagnostics(page);
 }
 
 async function prepareCampaignListPage(page, listUrl) {
@@ -1489,22 +1505,27 @@ async function duplicateCampaignsCore({
     });
     if (campaignId) {
       try {
-        const diag = await prepareCampaignListPage(page, listUrl);
+        const diag = await warmTikTokSession(page, listUrl);
         onProgress?.({
           phase: "duplicating",
           done: 0,
           total: names.length,
-          currentStep:
-            diag.rowKeys > 0
-              ? `List loaded (${diag.rowKeys} campaigns) — duplicating…`
-              : "List empty — trying API + editor duplicate…",
+          currentStep: `Fast mode (Campaign ID ${campaignId}) — API duplicate…`,
         });
+        if (diag.rowKeys > 0) {
+          onProgress?.({
+            phase: "duplicating",
+            done: 0,
+            total: names.length,
+            currentStep: `Session OK (${diag.rowKeys} campaigns visible) — duplicating…`,
+          });
+        }
       } catch (e) {
         if (String(e.message) === "LOGIN") {
           const shot = await savePageScreenshot(page, "login");
           return {
             ok: false,
-            error: "TikTok session expired — re-export Cookie-Editor JSON",
+            error: "TikTok session expired — reconnect TikTok in adsalim Settings",
             screenshot: shot,
             results: [],
           };
@@ -1754,6 +1775,22 @@ app.get("/screenshots/:id", (req, res) => {
 
 const REQUIRED_COOKIE_NAMES = ["sessionid_ads", "csrftoken", "sid_tt_ads"];
 const MIN_COOKIE_COUNT = 12;
+const MIN_COOKIE_COUNT_WITH_REQUIRED = 6;
+
+function normalizeCookiesInput(raw) {
+  if (raw == null) return "";
+  if (typeof raw === "string") return raw.trim();
+  if (Array.isArray(raw)) return JSON.stringify(raw);
+  if (typeof raw === "object") {
+    if (Array.isArray(raw.cookies)) return JSON.stringify(raw.cookies);
+    if (typeof raw.cookies === "string") return raw.cookies.trim();
+    if (Array.isArray(raw.tiktokCookies)) return JSON.stringify(raw.tiktokCookies);
+    if (typeof raw.tiktokCookies === "string") return raw.tiktokCookies.trim();
+    if (Array.isArray(raw.data)) return JSON.stringify(raw.data);
+    if (typeof raw.value === "string" && /sessionid_ads/i.test(raw.value)) return raw.value.trim();
+  }
+  return "";
+}
 
 function diagnoseCookies(raw) {
   const parsed = parseCookies(raw);
@@ -1769,7 +1806,8 @@ function diagnoseCookies(raw) {
   };
 }
 function validateDuplicateBody(body) {
-  const { advertiserId, campaignId, campaignName, names, cookies } = body || {};
+  const { advertiserId, campaignId, campaignName, names } = body || {};
+  const cookies = normalizeCookiesInput(body?.cookies ?? body?.tiktokCookies ?? body?.session);
   if (!advertiserId || !Array.isArray(names) || names.length === 0 || !cookies) {
     return { error: "advertiserId, names[], cookies required" };
   }
@@ -1795,8 +1833,10 @@ function validateCookies(raw) {
   if (diag.missingRequired.length) {
     return `Missing cookies: ${diag.missingRequired.join(", ")} — export ALL with Cookie-Editor, or use adsalim.com`;
   }
-  if (diag.count < MIN_COOKIE_COUNT) {
-    return `Only ${diag.count} cookies — need ${MIN_COOKIE_COUNT}+. adsalim.com sends full session automatically.`;
+  const minCount =
+    diag.missingRequired.length === 0 ? MIN_COOKIE_COUNT_WITH_REQUIRED : MIN_COOKIE_COUNT;
+  if (diag.count < minCount) {
+    return `Only ${diag.count} cookies — need ${minCount}+ (sessionid_ads, csrftoken, sid_tt_ads). Reconnect TikTok in adsalim Settings.`;
   }
   return null;
 }
