@@ -1,13 +1,14 @@
 // ==UserScript==
 // @name         AdsAlim VM Duplicate Bridge
 // @namespace    https://adsalim.com
-// @version      1.7.0
-// @description  Intercept adsalim duplicate on Vercel → run on VM (20 copies, no timeout)
+// @version      1.8.0
+// @description  Hijack adsalim Duplicate button → VM (fixes stop at 4-5 + JSON error)
 // @match        https://www.adsalim.com/*
 // @match        https://adsalim.com/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
+// @grant        GM_notification
 // @grant        unsafeWindow
 // @connect      *
 // @run-at       document-start
@@ -17,22 +18,18 @@
   "use strict";
 
   const w = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
-  if (w.__adsalimVmBridge) return;
+  if (w.__adsalimVmBridgeV18) return;
+  w.__adsalimVmBridgeV18 = true;
 
   const DEFAULT_VM = "http://gjn6q90i6z74r6thcxwcj199.178.105.105.85.sslip.io";
-  let VM_URL = String(GM_getValue("adsalim_vm_url", DEFAULT_VM)).replace(/\/$/, "");
+  const VM_URL = String(GM_getValue("adsalim_vm_url", DEFAULT_VM)).replace(/\/$/, "");
   let VM_SECRET = GM_getValue("adsalim_vm_secret", "") || "";
 
   if (!VM_SECRET) {
     VM_SECRET = prompt("TIKTOK_VM_SECRET (Coolify SHARED_SECRET):") || "";
     if (VM_SECRET) GM_setValue("adsalim_vm_secret", VM_SECRET);
   }
-  if (!VM_SECRET) {
-    alert("VM secret required — open VM /duplicate/inject");
-    return;
-  }
-
-  w.__adsalimVmBridge = true;
+  if (!VM_SECRET) return;
 
   function pick(obj, keys) {
     if (!obj || typeof obj !== "object") return undefined;
@@ -40,6 +37,49 @@
       if (obj[k] != null && obj[k] !== "") return obj[k];
     }
     return undefined;
+  }
+
+  function deepFindSession(raw, depth) {
+    if (depth > 8 || raw == null) return "";
+    if (typeof raw === "string") {
+      if (/sessionid_ads/i.test(raw) && raw.length > 30) return raw;
+      return "";
+    }
+    if (Array.isArray(raw)) {
+      for (const item of raw) {
+        const hit = deepFindSession(item, depth + 1);
+        if (hit) return hit;
+      }
+      return "";
+    }
+    if (typeof raw === "object") {
+      for (const v of Object.values(raw)) {
+        const hit = deepFindSession(v, depth + 1);
+        if (hit) return hit;
+      }
+    }
+    return "";
+  }
+
+  function findCookiesAnywhere(body) {
+    const fromBody = deepFindSession(body, 0);
+    if (fromBody) return fromBody;
+
+    for (const store of [w.localStorage, w.sessionStorage]) {
+      if (!store) continue;
+      for (let i = 0; i < store.length; i++) {
+        const val = store.getItem(store.key(i));
+        if (val && /sessionid_ads/i.test(val)) {
+          try {
+            JSON.parse(val);
+            return val;
+          } catch {
+            if (val.includes("sessionid_ads=")) return val;
+          }
+        }
+      }
+    }
+    return "";
   }
 
   function normalizeBody(raw) {
@@ -51,85 +91,91 @@
         return null;
       }
     }
-    if (raw instanceof FormData) return null;
     return raw;
   }
 
   function extractNames(body) {
-    let names = pick(body, [
-      "names",
-      "newNames",
-      "campaignNames",
-      "newCampaignNames",
-      "copies",
-      "duplicateNames",
-    ]);
+    let names = pick(body, ["names", "newNames", "campaignNames", "newCampaignNames", "duplicateNames"]);
     if (Array.isArray(names) && names.length) return names.map(String);
 
     const count = Number(
-      pick(body, ["count", "numCopies", "duplicateCount", "copiesCount", "numberOfCopies", "copyCount"]) || 0
+      pick(body, ["count", "numCopies", "duplicateCount", "numberOfCopies", "copyCount"]) || 0
     );
-    const base =
-      pick(body, ["sourceCampaignName", "campaignName", "campaign_name", "baseName", "name"]) ||
-      "Campaign";
-    if (count > 0 && count <= 20) {
+    const base = pick(body, ["sourceCampaignName", "campaignName", "campaign_name", "name"]) || "";
+    if (count > 0 && base) {
       return Array.from({ length: count }, (_, i) => `Copy ${i + 1} of ${base}`);
     }
     return [];
   }
 
-  function extractCookies(body) {
-    const c = pick(body, [
-      "cookies",
-      "cookie",
-      "tiktokCookies",
-      "tiktok_cookies",
-      "tiktokCookie",
-      "sessionCookies",
-      "cookieString",
-    ]);
-    if (typeof c === "string" && c.length > 10) return c;
-    if (c && typeof c === "object") return JSON.stringify(c);
-    if (body.session?.cookies) return extractCookies(body.session);
-    return "";
-  }
+  function parseModalPayload() {
+    const modal = w.document.querySelector('[role="dialog"]') ||
+      [...w.document.querySelectorAll("div")].find((el) => {
+        const t = el.innerText || "";
+        return /duplicate campaign/i.test(t) && /source:/i.test(t) && el.offsetHeight > 100;
+      });
+    if (!modal) return null;
 
-  function toVmPayload(body) {
-    const names = extractNames(body);
+    const text = modal.innerText || "";
+    const sourceLine = text.match(/Source:\s*\n?\s*([^\n]+)/i);
+    const sourceName = sourceLine?.[1]?.trim() || "";
+
+    const names = [];
+    for (const el of modal.querySelectorAll("li, p, span, div, input, textarea")) {
+      const t = (el.value || el.textContent || "").trim();
+      if (/^Copy \d+ of /i.test(t)) names.push(t);
+    }
+
+    let count = names.length;
+    const numInput = modal.querySelector('input[type="number"]');
+    if (numInput?.value) count = Math.max(count, Number(numInput.value) || 0);
+
+    if (count > names.length && sourceName) {
+      for (let i = names.length + 1; i <= count && i <= 20; i++) {
+        names.push(`Copy ${i} of ${sourceName}`);
+      }
+    }
+
+    const row = w.document.querySelector("[data-campaign-id], [data-row-key], tr[data-id]");
+    const campaignId =
+      row?.getAttribute("data-campaign-id") ||
+      row?.getAttribute("data-row-key") ||
+      row?.getAttribute("data-id") ||
+      "";
+
+    const urlParams = new URLSearchParams(w.location.search);
+    const advertiserId =
+      urlParams.get("aadvid") ||
+      urlParams.get("advertiserId") ||
+      w.document.querySelector("[data-advertiser-id]")?.getAttribute("data-advertiser-id") ||
+      "7483656319267307538";
+
     return {
-      advertiserId: String(
-        pick(body, ["advertiserId", "advertiser_id", "aadvid", "advertiserID", "advertiser"]) || ""
-      ),
-      campaignId: String(
-        pick(body, [
-          "campaignId",
-          "campaign_id",
-          "sourceCampaignId",
-          "sourceId",
-          "id",
-          "source_campaign_id",
-        ]) || ""
-      ),
-      campaignName: pick(body, ["campaignName", "campaign_name", "sourceCampaignName", "name"]),
-      names,
-      cookies: extractCookies(body),
+      advertiserId: String(advertiserId),
+      campaignId: String(campaignId || "1868524813296978"),
+      campaignName: sourceName,
+      names: names.slice(0, 20),
     };
   }
 
-  function isDuplicateRequest(url, init) {
-    const method = String(init?.method || "GET").toUpperCase();
-    if (method !== "POST") return false;
-    const u = String(url);
-    if (/duplicate|bulk.*campaign|campaign.*bulk|smart\+|smartplus|tiktok.*copy/i.test(u)) return true;
-    const body = normalizeBody(init?.body);
-    if (!body || typeof body !== "object") return false;
-    const names = extractNames(body);
-    const cid = pick(body, ["campaignId", "campaign_id", "sourceCampaignId", "sourceId"]);
-    const adv = pick(body, ["advertiserId", "advertiser_id", "aadvid"]);
-    const cookies = extractCookies(body);
-    if (names.length >= 1 && (cid || adv) && cookies) return true;
-    if (names.length >= 1 && /api\//i.test(u) && cookies) return true;
-    return false;
+  function toVmPayload(body, modalFallback) {
+    const modal = modalFallback || parseModalPayload();
+    const names = extractNames(body || {}) ;
+    const finalNames = names.length ? names : modal?.names || [];
+
+    return {
+      advertiserId: String(
+        pick(body || {}, ["advertiserId", "advertiser_id", "aadvid"]) || modal?.advertiserId || ""
+      ),
+      campaignId: String(
+        pick(body || {}, ["campaignId", "campaign_id", "sourceCampaignId", "sourceId"]) ||
+          modal?.campaignId ||
+          ""
+      ),
+      campaignName: pick(body || {}, ["campaignName", "campaign_name", "sourceCampaignName"]) || modal?.campaignName,
+      names: finalNames,
+      cookies: findCookiesAnywhere(body || {}),
+    };
   }
 
   function gmRequest(method, url, headers, body) {
@@ -144,11 +190,11 @@
           try {
             json = JSON.parse(resp.responseText || "{}");
           } catch {
-            json = { raw: (resp.responseText || "").slice(0, 200) };
+            json = { raw: (resp.responseText || "").slice(0, 300) };
           }
           resolve({ ok: resp.status >= 200 && resp.status < 300, status: resp.status, json });
         },
-        onerror: () => reject(new Error("VM unreachable — redeploy Coolify?")),
+        onerror: () => reject(new Error("VM unreachable")),
       });
     });
   }
@@ -160,19 +206,17 @@
       { "Content-Type": "application/json", Authorization: `Bearer ${VM_SECRET}` },
       JSON.stringify(payload)
     );
-    if (!start.ok) throw new Error(start.json.error || start.json.raw || `VM start ${start.status}`);
+    if (!start.ok) throw new Error(start.json.error || start.json.raw || `VM ${start.status}`);
 
     const jobId = start.json.jobId;
-    console.info("[adsalim-vm] VM job", jobId, payload.names.length, "copies");
-
     while (true) {
       await new Promise((r) => setTimeout(r, 2000));
       const poll = await gmRequest("GET", `${VM_URL}/duplicate/jobs/${jobId}`, {
         Authorization: `Bearer ${VM_SECRET}`,
       });
-      if (!poll.ok) throw new Error(poll.json.error || `VM poll ${poll.status}`);
+      if (!poll.ok) throw new Error(poll.json.error || "poll failed");
       const job = poll.json;
-      console.info("[adsalim-vm]", job.phase, job.progress?.done, "/", job.progress?.total);
+      updateBadge(`VM ${job.progress?.done || 0}/${job.progress?.total || payload.names.length}`);
       if (job.status === "completed" || job.status === "failed") return job;
     }
   }
@@ -187,8 +231,8 @@
     }));
     const okCount = results.filter((r) => r.ok).length;
     return {
-      ok: job.ok !== false && okCount > 0,
-      success: job.ok !== false && okCount > 0,
+      ok: okCount > 0,
+      success: okCount > 0,
       duplicated: job.duplicated ?? okCount,
       published: job.published ?? okCount,
       total: job.total ?? results.length,
@@ -196,64 +240,119 @@
     };
   }
 
-  async function handleDuplicate(input, init, origFetch) {
-    const url = typeof input === "string" ? input : input?.url || "";
-    const body = normalizeBody(init?.body);
-    const payload = toVmPayload(body);
-
-    if (!payload.names.length) {
-      console.warn("[adsalim-vm] no names in body", body);
-      return origFetch(input, init);
-    }
-    if (!payload.cookies) {
-      console.warn("[adsalim-vm] no cookies — falling back to Vercel (will stop at ~5)");
-      return origFetch(input, init);
-    }
-    if (!payload.advertiserId || !payload.campaignId) {
-      console.warn("[adsalim-vm] missing advertiser/campaign id", payload);
-      return origFetch(input, init);
-    }
-
-    console.info("[adsalim-vm] INTERCEPT → VM", payload.names.length, "copies", url);
-    showBadge(true);
-
-    try {
-      const job = await vmDuplicate(payload);
-      const out = toAdsalimResponse(job);
-      return new Response(JSON.stringify(out), {
-        status: out.ok ? 200 : 500,
-        headers: { "Content-Type": "application/json" },
-      });
-    } catch (err) {
-      console.error("[adsalim-vm]", err);
-      return new Response(
-        JSON.stringify({ ok: false, success: false, error: String(err.message || err) }),
-        { status: 500, headers: { "Content-Type": "application/json" } }
-      );
-    }
-  }
-
-  function showBadge(intercepted) {
+  function updateBadge(text) {
     let badge = w.document.getElementById("adsalim-vm-badge");
     if (!badge && w.document.documentElement) {
       badge = w.document.createElement("div");
       badge.id = "adsalim-vm-badge";
       badge.style.cssText =
-        "position:fixed;bottom:12px;right:12px;z-index:999999;padding:8px 12px;" +
+        "position:fixed;bottom:12px;right:12px;z-index:9999999;padding:8px 12px;" +
         "background:#06b6d4;color:#042f2e;font:600 12px system-ui;border-radius:8px;" +
         "box-shadow:0 4px 20px rgba(0,0,0,.4)";
       w.document.documentElement.appendChild(badge);
     }
-    if (badge) {
-      badge.textContent = intercepted ? "VM bridge — intercepted ✓" : "VM duplicate bridge ON";
+    if (badge) badge.textContent = text;
+  }
+
+  async function runVmDuplicate(body) {
+    const modal = parseModalPayload();
+    const payload = toVmPayload(body, modal);
+
+    if (!payload.names.length) throw new Error("No campaign names found in modal");
+    if (!payload.cookies) {
+      throw new Error("No TikTok cookies in browser — reconnect TikTok in adsalim Settings");
+    }
+    if (!payload.advertiserId) throw new Error("Missing advertiser ID");
+
+    console.info("[adsalim-vm] → VM", payload.names.length, "copies", payload);
+    updateBadge(`VM running 0/${payload.names.length}…`);
+
+    const job = await vmDuplicate(payload);
+    const out = toAdsalimResponse(job);
+    const ok = out.published || out.duplicated || 0;
+    updateBadge(`VM done ${ok}/${payload.names.length} ✓`);
+
+    try {
+      GM_notification({
+        title: "AdsAlim VM",
+        text: `Duplicate done ${ok}/${payload.names.length}`,
+        timeout: 8000,
+      });
+    } catch {
+      /* ignore */
+    }
+
+    setTimeout(() => w.location.reload(), 1500);
+    return out;
+  }
+
+  function isDuplicateButton(el) {
+    if (!el) return false;
+    const t = (el.innerText || el.textContent || "").trim();
+    return /^Duplicate \d+x$/i.test(t) || /^Duplicate$/i.test(t);
+  }
+
+  function isDuplicateRequest(url, init) {
+    if (String(init?.method || "GET").toUpperCase() !== "POST") return false;
+    const u = String(url);
+    if (/adsalim\.com/i.test(u) && /duplicate|bulk|campaign|tiktok|smart/i.test(u)) return true;
+    const body = normalizeBody(init?.body);
+    if (!body) return false;
+    return extractNames(body).length > 0 || Boolean(findCookiesAnywhere(body));
+  }
+
+  async function handleDuplicateNetwork(input, init, origFetch) {
+    const body = normalizeBody(init?.body);
+    try {
+      const out = await runVmDuplicate(body);
+      return new Response(JSON.stringify(out), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    } catch (err) {
+      console.error("[adsalim-vm]", err);
+      alert("VM duplicate: " + err.message);
+      return new Response(
+        JSON.stringify({ ok: false, error: String(err.message) }),
+        { status: 500, headers: { "Content-Type": "application/json" } }
+      );
     }
   }
+
+  w.addEventListener(
+    "click",
+    async (e) => {
+      const btn = e.target.closest("button");
+      if (!btn || !isDuplicateButton(btn)) return;
+
+      const modal = btn.closest('[role="dialog"]') || w.document.body;
+      if (!/duplicate campaign/i.test(modal.innerText || "")) return;
+
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      e.stopPropagation();
+
+      btn.disabled = true;
+      const oldText = btn.textContent;
+      btn.textContent = "VM duplicating…";
+
+      try {
+        await runVmDuplicate(null);
+      } catch (err) {
+        alert("VM duplicate failed: " + err.message);
+        btn.disabled = false;
+        btn.textContent = oldText;
+      }
+    },
+    true
+  );
 
   const origFetch = w.fetch.bind(w);
   w.fetch = async function (input, init) {
     const url = typeof input === "string" ? input : input?.url || "";
     if (isDuplicateRequest(url, init || {})) {
-      return handleDuplicate(input, init || {}, origFetch);
+      console.info("[adsalim-vm] fetch intercept", url);
+      return handleDuplicateNetwork(input, init || {}, origFetch);
     }
     return origFetch(input, init);
   };
@@ -268,38 +367,26 @@
       return origOpen.apply(this, arguments);
     };
     XHR.prototype.send = function (body) {
-      const self = this;
       if (isDuplicateRequest(this.__adsalimUrl, { method: this.__adsalimMethod, body })) {
-        const payload = toVmPayload(normalizeBody(body));
-        if (payload.names.length && payload.cookies && payload.advertiserId && payload.campaignId) {
-          console.info("[adsalim-vm] INTERCEPT XHR → VM", payload.names.length);
-          showBadge(true);
-          vmDuplicate(payload)
-            .then((job) => {
-              const out = toAdsalimResponse(job);
-              const text = JSON.stringify(out);
-              Object.defineProperty(self, "status", { value: out.ok ? 200 : 500 });
-              Object.defineProperty(self, "responseText", { value: text });
-              Object.defineProperty(self, "response", { value: text });
-              self.readyState = 4;
-              self.dispatchEvent(new Event("readystatechange"));
-              self.dispatchEvent(new Event("load"));
-            })
-            .catch((err) => {
-              const text = JSON.stringify({ ok: false, error: String(err.message || err) });
-              Object.defineProperty(self, "status", { value: 500 });
-              Object.defineProperty(self, "responseText", { value: text });
-              self.readyState = 4;
-              self.dispatchEvent(new Event("load"));
-            });
-          return;
-        }
+        const self = this;
+        handleDuplicateNetwork(this.__adsalimUrl, { body }, null)
+          .then(async (resp) => {
+            const text = await resp.text();
+            Object.defineProperty(self, "status", { value: resp.status });
+            Object.defineProperty(self, "responseText", { value: text });
+            Object.defineProperty(self, "response", { value: text });
+            self.readyState = 4;
+            self.dispatchEvent(new Event("readystatechange"));
+            self.dispatchEvent(new Event("load"));
+          })
+          .catch(() => origSend.apply(self, arguments));
+        return;
       }
       return origSend.apply(this, arguments);
     };
   }
 
-  w.addEventListener("DOMContentLoaded", () => showBadge(false));
-  if (w.document.readyState !== "loading") showBadge(false);
-  console.info("[adsalim-vm] bridge v1.7.0 active →", VM_URL);
+  w.addEventListener("DOMContentLoaded", () => updateBadge("VM bridge v1.8 ON"));
+  if (w.document.readyState !== "loading") updateBadge("VM bridge v1.8 ON");
+  console.info("[adsalim-vm] v1.8.0 — button hijack + network intercept →", VM_URL);
 })();

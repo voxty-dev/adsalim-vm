@@ -20,7 +20,7 @@ const { chromium } = require("playwright");
 const PORT = process.env.PORT || 3000;
 const SHARED_SECRET = process.env.SHARED_SECRET || "";
 const MAX_CONCURRENT_PUBLISH = Number(process.env.MAX_CONCURRENT_PUBLISH || 8);
-const SERVICE_VERSION = "1.7.0";
+const SERVICE_VERSION = "1.8.0";
 const HEADLESS = process.env.HEADLESS !== "false";
 
 function detectTikTokBlocker(bodyText) {
