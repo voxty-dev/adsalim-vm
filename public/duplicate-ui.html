@@ -9,25 +9,40 @@
     body { margin: 0; background: #0b1220; color: #e5e7eb; }
     main { max-width: 760px; margin: 0 auto; padding: 24px; }
     h1 { font-size: 1.25rem; margin-bottom: 4px; }
+    h2 { font-size: 1rem; margin: 24px 0 8px; color: #e2e8f0; }
     p { color: #94a3b8; line-height: 1.5; }
+    .warn { background: #422006; border: 1px solid #a16207; color: #fde68a; padding: 12px; border-radius: 8px; margin-bottom: 16px; }
     label { display: block; font-size: 0.85rem; margin: 14px 0 6px; color: #cbd5e1; }
     input, textarea { width: 100%; box-sizing: border-box; padding: 10px 12px; border-radius: 8px; border: 1px solid #334155; background: #111827; color: #f8fafc; }
-    textarea { min-height: 120px; resize: vertical; font-family: ui-monospace, monospace; font-size: 12px; }
+    textarea { min-height: 100px; resize: vertical; font-family: ui-monospace, monospace; font-size: 12px; }
     .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-    button { margin-top: 16px; padding: 12px 18px; border: 0; border-radius: 8px; background: #06b6d4; color: #042f2e; font-weight: 700; cursor: pointer; }
+    button { margin-top: 12px; padding: 12px 18px; border: 0; border-radius: 8px; background: #06b6d4; color: #042f2e; font-weight: 700; cursor: pointer; margin-right: 8px; }
+    button.secondary { background: #334155; color: #e2e8f0; }
     button:disabled { opacity: 0.5; cursor: not-allowed; }
-    #log { margin-top: 20px; padding: 14px; border-radius: 8px; background: #111827; border: 1px solid #334155; white-space: pre-wrap; font-family: ui-monospace, monospace; font-size: 12px; min-height: 120px; }
+    #log { margin-top: 20px; padding: 14px; border-radius: 8px; background: #111827; border: 1px solid #334155; white-space: pre-wrap; font-family: ui-monospace, monospace; font-size: 12px; min-height: 80px; }
     .ok { color: #4ade80; }
     .err { color: #f87171; }
+    #bridgeSnippet { min-height: 70px; }
   </style>
 </head>
 <body>
   <main>
-    <h1>Bulk Duplicate (VM direct)</h1>
-    <p>Bypasses adsalim.com / Vercel timeout. Runs up to 20 Smart+ copies on the VM with live progress.</p>
+    <div class="warn" id="versionWarn">Checking VM version…</div>
+
+    <h1>AdsAlim VM — Duplicate 20x</h1>
+    <p>adsalim.com stops at ~4–5 copies (Vercel timeout). Use this page or the browser bridge below.</p>
+
+    <h2>A) Fix adsalim.com UI (paste once in Console)</h2>
+    <p>1. Open <strong>www.adsalim.com</strong> (logged in) → F12 → Console<br>
+       2. Copy script below → paste → Enter<br>
+       3. Cyan badge <strong>VM duplicate bridge ON</strong> → duplicate 10x/20x as normal</p>
+    <textarea id="bridgeSnippet" readonly></textarea>
+    <button id="copyBridge" class="secondary">Copy bridge script</button>
+
+    <h2>B) Manual duplicate (this page)</h2>
 
     <label>VM secret (Bearer token)</label>
-    <input id="secret" type="password" placeholder="Same as TIKTOK_VM_SECRET / SHARED_SECRET" />
+    <input id="secret" type="password" placeholder="TIKTOK_VM_SECRET / SHARED_SECRET" />
 
     <div class="row">
       <div>
@@ -43,13 +58,38 @@
     <label>Names (one per line, max 20)</label>
     <textarea id="names" placeholder="Copy 6 of PRST TR G1&#10;Copy 7 of PRST TR G1"></textarea>
 
-    <label>TikTok cookies (string or JSON array)</label>
+    <label>TikTok cookies</label>
     <textarea id="cookies" placeholder="sessionid_ads=...; csrftoken=..."></textarea>
 
     <button id="run">Start duplicate</button>
     <div id="log">Ready.</div>
   </main>
   <script>
+    const VM = location.origin.replace(/\/$/, "");
+    const bridgeLoader =
+      `(function(){var s=document.createElement('script');s.src='${VM}/adsalim-bridge.js?v=1.4.2';document.head.appendChild(s);})();`;
+    document.getElementById("bridgeSnippet").value = bridgeLoader;
+
+    fetch("/").then(r => r.json()).then(j => {
+      const el = document.getElementById("versionWarn");
+      if (j.version >= "1.4.2") {
+        el.textContent = "VM v" + j.version + " OK — bridge + /duplicate/inject available.";
+        el.style.background = "#052e16";
+        el.style.borderColor = "#166534";
+        el.style.color = "#86efac";
+      } else {
+        el.innerHTML =
+          "<strong>Redeploy Coolify required.</strong> Live version is v" + j.version +
+          " — /duplicate/inject and browser bridge need v1.4.2+. " +
+          "Coolify → Redeploy from main branch. Manual duplicate (section B) works now.";
+      }
+    }).catch(() => {});
+
+    document.getElementById("copyBridge").onclick = () => {
+      navigator.clipboard.writeText(bridgeLoader);
+      document.getElementById("copyBridge").textContent = "Copied!";
+    };
+
     const $ = (id) => document.getElementById(id);
     const log = (msg, cls) => {
       const el = $("log");

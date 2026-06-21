@@ -762,6 +762,11 @@ app.get("/duplicate/inject", (_req, res) => {
   res.sendFile(path.join(__dirname, "public", "duplicate-inject.html"));
 });
 
+// Alias — static hosting may 404 nested paths on older deploys
+app.get("/inject", (_req, res) => {
+  res.sendFile(path.join(__dirname, "public", "duplicate-inject.html"));
+});
+
 app.get("/duplicate/ui", (_req, res) => {
   res.sendFile(path.join(__dirname, "public", "duplicate-ui.html"));
 });
