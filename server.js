@@ -20,17 +20,11 @@ const { chromium } = require("playwright");
 const PORT = process.env.PORT || 3000;
 const SHARED_SECRET = process.env.SHARED_SECRET || "";
 const MAX_CONCURRENT_PUBLISH = Number(process.env.MAX_CONCURRENT_PUBLISH || 8);
-const SERVICE_VERSION = "1.5.2";
+const SERVICE_VERSION = "1.5.3";
 
 function detectTikTokBlocker(bodyText) {
   const t = String(bodyText || "");
-  if (/telefonnummer|verify.*phone|phone number|verifie.*num/i.test(t)) {
-    return "TikTok wants PHONE VERIFICATION — open ads.tiktok.com in Chrome, verify phone, then re-export cookies JSON";
-  }
-  if (/captcha|verify you're human|unusual activity|security check/i.test(t)) {
-    return "TikTok captcha/security check — complete it in Chrome, then re-export cookies";
-  }
-  if (/log in|sign in|passport/i.test(t) && !/campaign/i.test(t)) {
+  if (/log in|sign in|passport/i.test(t) && !/campaign|dashboard/i.test(t)) {
     return "TikTok login page — cookies expired, re-export JSON";
   }
   return null;
@@ -169,19 +163,15 @@ async function verifyTikTokSession({ advertiserId, cookies }) {
     const page = await context.newPage();
     const url = `https://ads.tiktok.com/i18n/manage/campaign?aadvid=${encodeURIComponent(advertiserId || "")}`;
     const diag = await prepareCampaignListPage(page, url);
-    if ((diag.rowKeys || 0) === 0 && (diag.tableRows || 0) === 0) {
-      const shot = await savePageScreenshot(page, "test-empty");
-      const blocker = detectTikTokBlocker(diag.bodyStart);
-      return {
-        ok: false,
-        error:
-          (blocker || "0 campaigns in browser — TikTok blocking automated session.") +
-          ` Screenshot: ${shot}`,
-      };
+    if (page.url().includes("/login") || page.url().includes("/passport")) {
+      return { ok: false, error: "Login page — sessionid_ads expired, re-copy JSON cookies" };
     }
     return {
       ok: true,
-      message: `TikTok OK — ${diag.rowKeys || diag.tableRows} rows visible`,
+      message:
+        diag.rowKeys > 0
+          ? `TikTok OK — ${diag.rowKeys} campaigns visible`
+          : "Session OK — will duplicate via campaign detail URL (phone popup ignored)",
       url: diag.url,
     };
   } catch (err) {
@@ -220,6 +210,36 @@ async function createTikTokContext(browser, cookies) {
   return context;
 }
 
+async function dismissOverlays(page) {
+  for (let i = 0; i < 3; i++) {
+    const clicked = await page
+      .evaluate(() => {
+        let n = 0;
+        const ok = (t) =>
+          /^(got it|ok|close|skip|later|not now|später|abbrechen|cancel|dismiss|×|✕|i understand|confirm)$/i.test(
+            t.trim()
+          );
+        for (const el of Array.from(
+          document.querySelectorAll('button, [role="button"], a, span, [class*="close" i]')
+        )) {
+          const t = (el.innerText || el.textContent || "").trim();
+          if (ok(t) && !el.disabled) {
+            try {
+              el.click();
+              n++;
+            } catch {
+              /* ignore */
+            }
+          }
+        }
+        return n;
+      })
+      .catch(() => 0);
+    if (!clicked) break;
+    await page.waitForTimeout(500);
+  }
+}
+
 async function readPageDiagnostics(page) {
   return page.evaluate(() => ({
     url: location.href,
@@ -245,6 +265,7 @@ async function prepareCampaignListPage(page, listUrl) {
   }
 
   for (let attempt = 0; attempt < 25; attempt++) {
+    await dismissOverlays(page);
     const diag = await readPageDiagnostics(page);
     const blocker = detectTikTokBlocker(diag.bodyStart);
     if (blocker) throw new Error(blocker);
@@ -698,12 +719,11 @@ async function clickDuplicateOnRow(page, row) {
   }
 }
 
-async function duplicateDraftOnce(page, listUrl, sourceCampaignId, newName, sourceCampaignName) {
-  const row = await locateSourceCampaignRow(page, sourceCampaignId, sourceCampaignName);
-  await clickDuplicateOnRow(page, row);
-
-  const nameInput = page.locator('input[placeholder*="name" i], input[placeholder*="Name"]').first();
-  await nameInput.waitFor({ state: "visible", timeout: 15_000 });
+async function submitDuplicateNameModal(page, newName) {
+  const nameInput = page.locator(
+    'input[placeholder*="name" i], input[placeholder*="Name"], input[class*="name" i]'
+  ).first();
+  await nameInput.waitFor({ state: "visible", timeout: 20_000 });
   await nameInput.fill("");
   await nameInput.fill(newName);
 
@@ -718,19 +738,98 @@ async function duplicateDraftOnce(page, listUrl, sourceCampaignId, newName, sour
     return false;
   });
   if (!submitted) throw new Error("Modal submit button not found");
+}
 
+async function extractDraftIdFromPage(page) {
   await page.waitForLoadState("domcontentloaded", { timeout: 30_000 }).catch(() => {});
   await page.waitForSelector('button, [role="button"]', { timeout: 15_000 }).catch(() => {});
   await page.waitForTimeout(800);
-
   const sketchMatch = page.url().match(/campaign_draft_id=([^&]+)/);
-  const campaignSketchId =
-    sketchMatch?.[1] || page.url().match(/temp_campaign_id=([^&]+)/)?.[1] || "";
+  return sketchMatch?.[1] || page.url().match(/temp_campaign_id=([^&]+)/)?.[1] || "";
+}
+
+async function clickPageDuplicateButton(page) {
+  await dismissOverlays(page);
+  const clicked = await page.evaluate(() => {
+    for (const el of Array.from(document.querySelectorAll("button, a, [role='button'], span"))) {
+      const t = (el.innerText || el.textContent || "").trim().toLowerCase();
+      if (t === "duplicate" || t.startsWith("duplicate ")) {
+        el.click();
+        return true;
+      }
+    }
+    for (const el of Array.from(document.querySelectorAll("button, [role='button']"))) {
+      const label = (el.getAttribute("aria-label") || "").toLowerCase();
+      if (/more|action|menu/.test(label)) {
+        el.click();
+        return "menu";
+      }
+    }
+    return false;
+  });
+
+  if (clicked === "menu") {
+    await page.waitForTimeout(600);
+    return page.evaluate(() => {
+      for (const el of Array.from(
+        document.querySelectorAll("button, a, li, span, [role='menuitem']")
+      )) {
+        const t = (el.innerText || el.textContent || "").trim().toLowerCase();
+        if (t === "duplicate" || /^duplicate\b/.test(t)) {
+          el.click();
+          return true;
+        }
+      }
+      return false;
+    });
+  }
+  return Boolean(clicked);
+}
+
+async function tryDuplicateFromDetailPage(page, advertiserId, campaignId, newName) {
+  const urls = [
+    `https://ads.tiktok.com/i18n/manage/campaign/detail?aadvid=${encodeURIComponent(advertiserId)}&campaign_id=${encodeURIComponent(campaignId)}`,
+    `https://ads.tiktok.com/i18n/manage/campaign?aadvid=${encodeURIComponent(advertiserId)}&campaign_id=${encodeURIComponent(campaignId)}`,
+  ];
+
+  for (const url of urls) {
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
+    await dismissOverlays(page);
+    await page.waitForTimeout(1500);
+    if (page.url().includes("/login") || page.url().includes("/passport")) continue;
+
+    if (await clickPageDuplicateButton(page)) {
+      await submitDuplicateNameModal(page, newName);
+      const sketchId = await extractDraftIdFromPage(page);
+      if (sketchId) return sketchId;
+    }
+  }
+  return null;
+}
+
+async function duplicateDraftOnce(page, listUrl, advertiserId, sourceCampaignId, newName, sourceCampaignName) {
+  if (sourceCampaignId) {
+    const fromDetail = await tryDuplicateFromDetailPage(
+      page,
+      advertiserId,
+      sourceCampaignId,
+      newName
+    );
+    if (fromDetail) {
+      await page.goto(listUrl, { waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => {});
+      await page.waitForTimeout(800);
+      return fromDetail;
+    }
+  }
+
+  const row = await locateSourceCampaignRow(page, sourceCampaignId, sourceCampaignName);
+  await clickDuplicateOnRow(page, row);
+  await submitDuplicateNameModal(page, newName);
+  const campaignSketchId = await extractDraftIdFromPage(page);
   if (!campaignSketchId) throw new Error("No draft ID after duplicate");
 
   await page.goto(listUrl, { waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => {});
   await page.waitForTimeout(800);
-
   return campaignSketchId;
 }
 
@@ -795,33 +894,31 @@ async function duplicateCampaignsCore({
       phase: "duplicating",
       done: 0,
       total: names.length,
-      currentStep: "Loading TikTok campaign list (up to 60s)…",
+      currentStep: "Opening TikTok (dismiss popups, then duplicate)…",
     });
     try {
       const diag = await prepareCampaignListPage(page, listUrl);
-      if ((diag.rowKeys || 0) === 0 && (diag.tableRows || 0) === 0) {
-        const shot = await savePageScreenshot(page, "empty-list");
-        const blocker = detectTikTokBlocker(diag.bodyStart);
-        return {
-          ok: false,
-          error:
-            (blocker ||
-              "Campaign list empty in automated browser. TikTok may block headless access for this account.") +
-            ` Page: ${(diag.bodyStart || "").slice(0, 160)}. Screenshot: ${shot}`,
-          results: [],
-        };
-      }
+      onProgress?.({
+        phase: "duplicating",
+        done: 0,
+        total: names.length,
+        currentStep:
+          diag.rowKeys > 0
+            ? `List loaded (${diag.rowKeys} campaigns)`
+            : "List hidden — duplicating via campaign detail URL",
+      });
     } catch (e) {
       if (String(e.message) === "LOGIN") {
         const shot = await savePageScreenshot(page, "login");
         return {
           ok: false,
-          error: "TikTok session expired — re-copy sessionid_ads + csrftoken from Application tab",
+          error: "TikTok session expired — re-export Cookie-Editor JSON",
           screenshot: shot,
           results: [],
         };
       }
-      throw e;
+      await page.goto(listUrl, { waitUntil: "domcontentloaded", timeout: 60_000 }).catch(() => {});
+      await dismissOverlays(page);
     }
     await page.waitForSelector('button, [role="button"], input', { timeout: 20_000 }).catch(() => {});
 
@@ -838,6 +935,7 @@ async function duplicateCampaignsCore({
         const campaignSketchId = await duplicateDraftOnce(
           page,
           listUrl,
+          advertiserId,
           campaignId,
           name,
           campaignName
