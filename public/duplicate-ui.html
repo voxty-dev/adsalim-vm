@@ -30,35 +30,15 @@
   <main>
     <div class="warn" id="versionWarn">Checking VM…</div>
 
-    <div class="bad">
-      <strong>Phone popup?</strong> VM now clicks through it (Got it / Later) like before.<br>
-      Duplicate goes direct to campaign detail URL — list can be empty.<br>
-      Fill <strong>Campaign ID</strong>: <code>1868524813296978</code> + name <code>PRST TR G1</code>
+    <div class="good">
+      <strong>3 steps — ma kayn search/list</strong><br>
+      ① Cookie-Editor JSON &nbsp; ② Campaign ID <code>1868524813296978</code> &nbsp; ③ Start duplicate<br>
+      Copy 1 = TikTok API capture → copies 2–20 = fast replay (~10 min for 20)
     </div>
 
-    <h2>① Cookies — 3la ads.tiktok.com</h2>
-    <ol>
-      <li>7ll <strong>ads.tiktok.com/i18n/manage/campaign</strong> (logged in)</li>
-      <li><strong>F12</strong> → tab <strong>Application</strong> (Chrome) / Storage (Firefox)</li>
-      <li>Left: <strong>Cookies</strong> → <strong>https://ads.tiktok.com</strong></li>
-      <li>Find row <code>sessionid_ads</code> → copy <strong>Value</strong></li>
-      <li>Find <code>csrftoken</code> → copy Value</li>
-    </ol>
-
-    <div class="row">
-      <div>
-        <label>sessionid_ads (Value from Application tab)</label>
-        <input id="sid" placeholder="paste sessionid_ads value only" />
-      </div>
-      <div>
-        <label>csrftoken</label>
-        <input id="csrf" placeholder="paste csrftoken value" />
-      </div>
-    </div>
-    <button type="button" class="secondary" id="buildCookies">Build cookie string</button>
-
-    <label>OR paste full cookies / JSON export</label>
-    <textarea id="cookies" placeholder='sessionid_ads=...; csrftoken=...  OR  [{"name":"sessionid_ads","value":"..."}]'></textarea>
+    <h2>① Cookies (Cookie-Editor JSON)</h2>
+    <p>On <strong>ads.tiktok.com</strong> → install Cookie-Editor → Export → paste below (need ~10+ cookies incl. <code>sessionid_ads</code>)</p>
+    <textarea id="cookies" placeholder='[{"name":"sessionid_ads","value":"..."}, ...]'></textarea>
     <div id="cookieStatus" class="bad" style="display:none"></div>
 
     <h2>② Duplicate</h2>
@@ -66,13 +46,13 @@
     <input id="secret" type="password" />
 
     <div class="row">
-      <div><label>Advertiser ID (aadvid in URL)</label><input id="advertiserId" /></div>
-      <div><label>Campaign ID (optional — data-row-key)</label><input id="campaignId" placeholder="leave empty if using name" /></div>
+      <div><label>Advertiser ID</label><input id="advertiserId" value="7483656319267307538" /></div>
+      <div><label>Campaign ID (required — fast path)</label><input id="campaignId" value="1868524813296978" /></div>
     </div>
-    <label>Campaign name — exact smiya f TikTok (required if no ID)</label>
-    <input id="campaignName" placeholder="PRST TR G1" />
+    <label>Campaign name (optional backup)</label>
+    <input id="campaignName" value="PRST TR G1" />
     <label>Names (1 per line)</label>
-    <textarea id="names" rows="4"></textarea>
+    <textarea id="names" rows="4" placeholder="tr 1&#10;tr 2&#10;tr 3"></textarea>
 
     <button type="button" class="secondary" id="testCookies">Test cookies</button>
     <button type="button" id="run">Start duplicate</button>
@@ -81,15 +61,6 @@
   <script>
     const $ = (id) => document.getElementById(id);
     const setLog = (t, c) => { $("log").textContent = t; $("log").className = c || ""; };
-
-    function parseCookieNames(raw) {
-      const s = raw.trim();
-      if (!s) return [];
-      if (s.startsWith("[")) {
-        try { return JSON.parse(s).map(c => c.name).filter(Boolean); } catch { return []; }
-      }
-      return s.split(";").map(p => p.trim().split("=")[0]).filter(Boolean);
-    }
 
     function checkCookies(raw) {
       const s = raw.trim();
@@ -102,9 +73,9 @@
           return null;
         } catch { return "Invalid JSON"; }
       }
-      const names = parseCookieNames(s);
-      if (!names.some(n => /sessionid/i.test(n))) return "Missing sessionid_ads";
-      if (names.length < 4) return `Only ${names.length} cookies — use Cookie-Editor JSON export (need 10+)`;
+      const names = s.split(";").map(p => p.trim().split("=")[0]).filter(Boolean);
+      if (!names.some(n => /sessionid/i.test(n))) return "Missing sessionid_ads — use Cookie-Editor JSON export";
+      if (names.length < 4) return `Only ${names.length} cookies — use Cookie-Editor JSON (need 10+)`;
       return null;
     }
 
@@ -116,22 +87,15 @@
       else { el.className = "good"; el.textContent = "✓ sessionid_ads found"; }
     }
 
-    $("buildCookies").onclick = () => {
-      const sid = $("sid").value.trim();
-      const csrf = $("csrf").value.trim();
-      if (!sid) { setLog("Paste sessionid_ads value first", "err"); return; }
-      let str = `sessionid_ads=${sid}`;
-      if (csrf) str += `; csrftoken=${csrf}`;
-      $("cookies").value = str;
-      updateStatus();
-      setLog("Cookie string built ✓ — click Test cookies", "ok");
-    };
-
     $("cookies").addEventListener("input", updateStatus);
 
     fetch("/").then(r => r.json()).then(j => {
-      $("versionWarn").textContent = "VM v" + j.version;
-      $("versionWarn").className = "good";
+      const v = j.version || "?";
+      const ok = parseFloat(v) >= 1.6;
+      $("versionWarn").textContent = ok
+        ? `VM v${v} ✓ — redeployed`
+        : `VM v${v} — REDEPLOY Coolify from main (need v1.6+)`;
+      $("versionWarn").className = ok ? "good" : "warn";
     }).catch(() => {});
 
     async function api(path, body) {
@@ -168,14 +132,11 @@
       const campaignId = $("campaignId").value.trim();
       const campaignName = $("campaignName").value.trim();
       const names = $("names").value.split("\n").map(s => s.trim()).filter(Boolean);
-      if (!secret || !advertiserId || !names.length) {
-        setLog("Fill secret, advertiser ID, names", "err"); return;
-      }
-      if (!campaignId && !campaignName) {
-        setLog("Fill campaign name OR campaign ID", "err"); return;
+      if (!secret || !advertiserId || !campaignId || !names.length) {
+        setLog("Fill secret, advertiser ID, campaign ID, names", "err"); return;
       }
       $("run").disabled = true;
-      setLog(`Starting ${names.length} copies…`);
+      setLog(`Starting ${names.length} copies (fast mode)…`);
       try {
         const start = await api("/duplicate/async", { advertiserId, campaignId, campaignName: campaignName || undefined, names, cookies });
         const jobId = start.jobId;
