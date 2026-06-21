@@ -34,55 +34,33 @@
     </div>
 
     <div class="good">
-      <strong>Option A — simplest (no bridge):</strong>
-      <a href="/duplicate/ui">Open /duplicate/ui</a> → paste cookies + Campaign ID → Start duplicate (20 copies OK).
+      <strong>7al b7al adsalim qbel (recommended)</strong><br>
+      Adsalim 3andou cookies kamlin dyalek. VM kay duplicate 20 copies bla Vercel timeout.
     </div>
 
     <div class="step">
-      <strong>Option B — Tampermonkey (works with HTTP VM on adsalim.com)</strong>
-      <ol>
-        <li>Install <a href="https://www.tampermonkey.net/" target="_blank">Tampermonkey</a> extension</li>
-        <li>Click button below → Tampermonkey opens → <strong>Install</strong></li>
-        <li>Enter VM secret when prompted on adsalim.com</li>
-        <li>Cyan badge <code>VM duplicate bridge ON</code> bottom-right → duplicate as normal</li>
-      </ol>
-      <label>VM URL (optional — default is this server)</label>
-      <input id="vmUrl" />
-      <label>VM secret (saved in Tampermonkey, not in page)</label>
-      <input id="vmSecret" type="password" />
+      <strong>Step 1</strong> — Install <a href="https://www.tampermonkey.net/" target="_blank">Tampermonkey</a>
+    </div>
+
+    <div class="step">
+      <strong>Step 2</strong> — Click below → Tampermonkey → Install → enter VM secret once
+      <br><br>
       <button id="installTm">Install Tampermonkey bridge</button>
-      <button class="secondary" id="copyTm">Copy userscript URL</button>
     </div>
 
     <div class="step">
-      <strong>Option C — HTTPS on VM (then console paste works)</strong>
-      <p>In Coolify: add domain + Let's Encrypt SSL. Then use:</p>
-      <pre id="httpsSnippet"></pre>
-      <button class="secondary" id="copyHttps">Copy HTTPS snippet</button>
+      <strong>Step 3</strong> — Open <a href="https://www.adsalim.com" target="_blank">adsalim.com</a> → Duplicate b7al dima (10x/20x)<br>
+      Badge cyan bottom-right = <code>VM duplicate bridge ON</code>
+    </div>
+
+    <div class="bad">
+      <strong>Ma tst3melch /duplicate/ui</strong> b cookies paste — adsalim kan khdam 7it cookies f app. Manual paste = API sees 0 campaigns.
     </div>
   </main>
   <script>
     const vmOrigin = location.origin;
-    const isHttps = location.protocol === "https:";
-    document.getElementById("vmUrl").value = vmOrigin;
-
-    document.getElementById("httpsSnippet").textContent = isHttps
-      ? `(function(){var s=document.createElement('script');s.src='${vmOrigin}/adsalim-bridge.js?v=1.6.1';document.head.appendChild(s);})();`
-      : `# Enable HTTPS on Coolify first, then snippet becomes:\n(function(){var s=document.createElement('script');s.src='https://YOUR-DOMAIN/adsalim-bridge.js?v=1.6.1';document.head.appendChild(s);})();`;
-
     document.getElementById("installTm").onclick = () => {
-      const url = document.getElementById("vmUrl").value.trim() || vmOrigin;
-      window.open(`${vmOrigin}/adsalim-bridge.user.js?vm=${encodeURIComponent(url)}`, "_blank");
-    };
-
-    document.getElementById("copyTm").onclick = () => {
-      navigator.clipboard.writeText(`${vmOrigin}/adsalim-bridge.user.js`);
-      document.getElementById("copyTm").textContent = "Copied!";
-    };
-
-    document.getElementById("copyHttps").onclick = () => {
-      navigator.clipboard.writeText(document.getElementById("httpsSnippet").textContent);
-      document.getElementById("copyHttps").textContent = "Copied!";
+      window.open(`${vmOrigin}/adsalim-bridge.user.js`, "_blank");
     };
   </script>
 </body>

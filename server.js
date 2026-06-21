@@ -20,7 +20,7 @@ const { chromium } = require("playwright");
 const PORT = process.env.PORT || 3000;
 const SHARED_SECRET = process.env.SHARED_SECRET || "";
 const MAX_CONCURRENT_PUBLISH = Number(process.env.MAX_CONCURRENT_PUBLISH || 8);
-const SERVICE_VERSION = "1.6.4";
+const SERVICE_VERSION = "1.6.5";
 const HEADLESS = process.env.HEADLESS !== "false";
 
 function detectTikTokBlocker(bodyText) {
@@ -170,28 +170,31 @@ async function verifyTikTokSession({ advertiserId, cookies }) {
     }
     const hint = await readAccountHint(page);
     const apiList = await fetchCampaignListViaApi(page, advertiserId || "");
+    const cookieDiag = diagnoseCookies(cookies);
     const zeroCampaigns =
       apiList.count === 0 && (hint.totalCampaigns === 0 || (diag.rowKeys === 0 && diag.tableRows <= 1));
-    const found =
-      apiList.campaigns.length > 0
-        ? findCampaignInApiList(apiList.campaigns, null, "PRST")
-        : null;
     return {
-      ok: true,
+      ok: !zeroCampaigns || diag.rowKeys > 0,
       message:
         apiList.count > 0
-          ? `TikTok OK — API sees ${apiList.count} campaigns${found ? " (incl. PRST TR G1 area)" : ""}`
+          ? `TikTok OK — API sees ${apiList.count} campaigns`
           : diag.rowKeys > 0
             ? `TikTok OK — ${diag.rowKeys} campaigns visible`
-            : zeroCampaigns
-              ? "Session OK but API sees 0 campaigns — re-export Cookie-Editor JSON from campaign list page"
-              : "Session OK — duplicate via Campaign ID",
+            : `Session OK but API sees 0 campaigns (${cookieDiag.count} cookies pasted)`,
       url: diag.url,
       rowKeys: diag.rowKeys,
       apiCampaignCount: apiList.count,
       totalCampaigns: hint.totalCampaigns,
+      cookieCount: cookieDiag.count,
+      missingCookies: cookieDiag.missingRequired,
+      apiError: apiList.lastApiError || null,
+      recommendation: zeroCampaigns
+        ? "Use adsalim.com b7al qbel — Tampermonkey bridge at /duplicate/inject (adsalim sends full cookies automatically)"
+        : null,
       warning: zeroCampaigns
-        ? "Export cookies while on ads.tiktok.com/i18n/manage/campaign?aadvid=YOUR_ID with PRST TR G1 visible"
+        ? cookieDiag.missingRequired.length
+          ? `Missing cookies: ${cookieDiag.missingRequired.join(", ")}. Or use adsalim.com instead of manual paste.`
+          : `Only ${cookieDiag.count} cookies — need 12+. adsalim.com has full session.`
         : null,
     };
   } catch (err) {
@@ -816,6 +819,7 @@ function extractCampaignList(json) {
 }
 
 async function fetchCampaignListViaApi(page, advertiserId) {
+  let lastApiError = null;
   const attempts = [
     {
       url: `https://ads.tiktok.com/api/v2/i18n/manage/campaign/list/?aadvid=${encodeURIComponent(advertiserId)}`,
@@ -841,14 +845,16 @@ async function fetchCampaignListViaApi(page, advertiserId) {
   for (const attempt of attempts) {
     const result = await tiktokApiCall(page, attempt.url, "POST", attempt.body);
     const code = result?.json?.code ?? result?.json?.status_code;
+    const msg = result?.json?.msg ?? result?.json?.message ?? result?.text ?? result?.error;
     if (code === 0 || code === "0" || code === 200) {
       const campaigns = extractCampaignList(result.json);
       if (campaigns.length > 0) {
         return { ok: true, campaigns, count: campaigns.length, source: attempt.url };
       }
     }
+    if (msg) lastApiError = String(msg).slice(0, 200);
   }
-  return { ok: false, campaigns: [], count: 0 };
+  return { ok: false, campaigns: [], count: 0, lastApiError };
 }
 
 function findCampaignInApiList(campaigns, campaignId, campaignName) {
@@ -1746,6 +1752,22 @@ app.get("/screenshots/:id", (req, res) => {
   res.send(buf);
 });
 
+const REQUIRED_COOKIE_NAMES = ["sessionid_ads", "csrftoken", "sid_tt_ads"];
+const MIN_COOKIE_COUNT = 12;
+
+function diagnoseCookies(raw) {
+  const parsed = parseCookies(raw);
+  const names = parsed.map((c) => c.name);
+  const missingRequired = REQUIRED_COOKIE_NAMES.filter(
+    (n) => !names.some((x) => x.toLowerCase() === n.toLowerCase())
+  );
+  return {
+    count: parsed.length,
+    names,
+    missingRequired,
+    ok: parsed.length >= MIN_COOKIE_COUNT && missingRequired.length === 0,
+  };
+}
 function validateDuplicateBody(body) {
   const { advertiserId, campaignId, campaignName, names, cookies } = body || {};
   if (!advertiserId || !Array.isArray(names) || names.length === 0 || !cookies) {
@@ -1767,18 +1789,14 @@ function validateCookies(raw) {
   if (!trimmed) return "Cookies empty";
   const parsed = parseCookies(trimmed);
   if (parsed.length === 0) {
-    return "Cookies not parsed. On ads.tiktok.com → F12 → Console → copy(document.cookie)";
+    return "Cookies not parsed — use Cookie-Editor JSON export from ads.tiktok.com";
   }
-  const names = parsed.map((c) => c.name);
-  const hasSessionAds = names.some((n) => n === "sessionid_ads" || n === "sessionid");
-  if (!hasSessionAds) {
-    if (names.includes("msToken") && names.length <= 5) {
-      return "WRONG: copy(document.cookie) misses sessionid_ads (HttpOnly). F12 → Application → Cookies → ads.tiktok.com → copy sessionid_ads Value";
-    }
-    return "Missing sessionid_ads. F12 → Application → Cookies → https://ads.tiktok.com → copy sessionid_ads + csrftoken";
+  const diag = diagnoseCookies(trimmed);
+  if (diag.missingRequired.length) {
+    return `Missing cookies: ${diag.missingRequired.join(", ")} — export ALL with Cookie-Editor, or use adsalim.com`;
   }
-  if (parsed.length < 4) {
-    return `Only ${parsed.length} cookie(s) — export ALL cookies as JSON (Cookie-Editor extension on ads.tiktok.com)`;
+  if (diag.count < MIN_COOKIE_COUNT) {
+    return `Only ${diag.count} cookies — need ${MIN_COOKIE_COUNT}+. adsalim.com sends full session automatically.`;
   }
   return null;
 }

@@ -17,13 +17,15 @@
     input, textarea { width: 100%; box-sizing: border-box; padding: 10px 12px; border-radius: 8px; border: 1px solid #334155; background: #111827; color: #f8fafc; }
     textarea { min-height: 90px; resize: vertical; font-family: ui-monospace, monospace; font-size: 11px; }
     .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-    button { margin-top: 10px; padding: 11px 16px; border: 0; border-radius: 8px; background: #06b6d4; color: #042f2e; font-weight: 700; cursor: pointer; margin-right: 8px; }
+    button, .btn { display: inline-block; margin-top: 10px; padding: 11px 16px; border: 0; border-radius: 8px; background: #06b6d4; color: #042f2e; font-weight: 700; cursor: pointer; margin-right: 8px; text-decoration: none; }
     button.secondary { background: #334155; color: #e2e8f0; }
     button:disabled { opacity: 0.5; cursor: not-allowed; }
     #log { margin-top: 16px; padding: 14px; border-radius: 8px; background: #111827; border: 1px solid #334155; white-space: pre-wrap; font-family: ui-monospace, monospace; font-size: 12px; min-height: 60px; }
     .ok { color: #4ade80; } .err { color: #f87171; }
     code { background: #1e293b; padding: 2px 6px; border-radius: 4px; }
     ol { padding-left: 20px; }
+    details { margin-top: 20px; border: 1px solid #334155; border-radius: 8px; padding: 12px; background: #111827; }
+    summary { cursor: pointer; color: #cbd5e1; font-weight: 600; }
   </style>
 </head>
 <body>
@@ -31,37 +33,46 @@
     <div class="warn" id="versionWarn">Checking VM…</div>
 
     <div class="good">
-      <strong>3 steps — b7al adsalim qbel</strong><br>
-      ① Cookies mn <strong>nfs account</strong> li fih campaign (chouf aadvid= f URL)<br>
-      ② Campaign ID <code>1868524813296978</code> &nbsp; ③ Start duplicate
+      <strong>Rja3 l adsalim.com — b7al qbel</strong><br>
+      Adsalim kan khdam 7it <strong>cookies kamlin</strong> kaynin f app dyalek. Manual paste hna ghaleban ma ykhdemch.
     </div>
 
-    <div class="warn">
-      <strong>Important:</strong> 7ll campaign list f Chrome (b7al screenshot dyalek — PRST TR G1 visible) → Cookie-Editor → Export → paste.<br>
-      Test cookies khass ygoul: <code>API sees 4 campaigns</code> (wla ch7al 3andek). Ila 0 → export mn dik page bess.
-    </div>
+    <h2>① Install bridge (1x)</h2>
+    <ol>
+      <li>Install <a href="https://www.tampermonkey.net/" target="_blank">Tampermonkey</a></li>
+      <li>Open <a href="/duplicate/inject">/duplicate/inject</a> → Install Tampermonkey bridge</li>
+      <li>Enter VM secret when prompted</li>
+    </ol>
 
-    <h2>① Cookies (Cookie-Editor JSON)</h2>
-    <p>On <strong>ads.tiktok.com</strong> → install Cookie-Editor → Export → paste below (need ~10+ cookies incl. <code>sessionid_ads</code>)</p>
-    <textarea id="cookies" placeholder='[{"name":"sessionid_ads","value":"..."}, ...]'></textarea>
-    <div id="cookieStatus" class="bad" style="display:none"></div>
+    <h2>② Duplicate b7al qbel</h2>
+    <ol>
+      <li>7ll <a href="https://www.adsalim.com" target="_blank">adsalim.com</a></li>
+      <li>Badge cyan: <code>VM duplicate bridge ON</code></li>
+      <li>Duplicate Smart+ b7al dima — 10x / 20x</li>
+    </ol>
+    <a class="btn" href="https://www.adsalim.com" target="_blank">Open adsalim.com</a>
+    <a class="btn secondary" href="/duplicate/inject">Setup bridge</a>
 
-    <h2>② Duplicate</h2>
-    <label>VM secret</label>
-    <input id="secret" type="password" />
+    <details>
+      <summary>Manual VM duplicate (backup — ila ma bghiti adsalim)</summary>
+      <p>Need 12+ cookies JSON (sessionid_ads + csrftoken + sid_tt_ads + …). Test must show campaigns &gt; 0.</p>
+      <textarea id="cookies" placeholder='Cookie-Editor export — 12+ cookies'></textarea>
+      <div id="cookieStatus" class="bad" style="display:none"></div>
+      <label>VM secret</label>
+      <input id="secret" type="password" />
+      <div class="row">
+        <div><label>Advertiser ID</label><input id="advertiserId" value="7483656319267307538" /></div>
+        <div><label>Campaign ID</label><input id="campaignId" value="1868524813296978" /></div>
+      </div>
+      <label>Campaign name</label>
+      <input id="campaignName" value="PRST TR G1" />
+      <label>Names (1 per line)</label>
+      <textarea id="names" rows="3" placeholder="tr 1&#10;tr 2"></textarea>
+      <button type="button" class="secondary" id="testCookies">Test cookies</button>
+      <button type="button" id="run">Start duplicate</button>
+    </details>
 
-    <div class="row">
-      <div><label>Advertiser ID</label><input id="advertiserId" value="7483656319267307538" /></div>
-      <div><label>Campaign ID (required — fast path)</label><input id="campaignId" value="1868524813296978" /></div>
-    </div>
-    <label>Campaign name (optional backup)</label>
-    <input id="campaignName" value="PRST TR G1" />
-    <label>Names (1 per line)</label>
-    <textarea id="names" rows="4" placeholder="tr 1&#10;tr 2&#10;tr 3"></textarea>
-
-    <button type="button" class="secondary" id="testCookies">Test cookies</button>
-    <button type="button" id="run">Start duplicate</button>
-    <div id="log">Ready.</div>
+    <div id="log">Use adsalim.com ↑ — ma t7tajch cookies hna.</div>
   </main>
   <script>
     const $ = (id) => document.getElementById(id);
@@ -70,37 +81,32 @@
     function checkCookies(raw) {
       const s = raw.trim();
       if (!s) return "Cookies empty";
-      if (s.startsWith("[")) {
-        try {
-          const arr = JSON.parse(s);
-          if (!arr.some(c => /sessionid/i.test(c.name || ""))) return "JSON missing sessionid_ads";
-          if (arr.length < 6) return `JSON has ${arr.length} cookies — need ~10+ from Cookie-Editor export`;
-          return null;
-        } catch { return "Invalid JSON"; }
-      }
-      const names = s.split(";").map(p => p.trim().split("=")[0]).filter(Boolean);
-      if (!names.some(n => /sessionid/i.test(n))) return "Missing sessionid_ads — use Cookie-Editor JSON export";
-      if (names.length < 4) return `Only ${names.length} cookies — use Cookie-Editor JSON (need 10+)`;
-      return null;
+      if (!s.startsWith("[")) return "Use Cookie-Editor JSON export (not copy document.cookie)";
+      try {
+        const arr = JSON.parse(s);
+        const names = arr.map(c => c.name).filter(Boolean);
+        if (!names.some(n => /sessionid/i.test(n))) return "Missing sessionid_ads";
+        const missing = ["sessionid_ads","csrftoken","sid_tt_ads"].filter(n => !names.includes(n));
+        if (missing.length) return "Missing: " + missing.join(", ");
+        if (arr.length < 12) return `Only ${arr.length} cookies — need 12+. Use adsalim.com instead.`;
+        return null;
+      } catch { return "Invalid JSON"; }
     }
 
     function updateStatus() {
       const err = checkCookies($("cookies").value);
       const el = $("cookieStatus");
+      if (!el) return;
       el.style.display = "block";
       if (err) { el.className = "bad"; el.textContent = "✗ " + err; }
-      else { el.className = "good"; el.textContent = "✓ sessionid_ads found"; }
+      else { el.className = "good"; el.textContent = "✓ cookie count OK — still test on server"; }
     }
 
-    $("cookies").addEventListener("input", updateStatus);
+    $("cookies")?.addEventListener("input", updateStatus);
 
     fetch("/").then(r => r.json()).then(j => {
-      const v = j.version || "?";
-      const ok = parseFloat(v) >= 1.6;
-      $("versionWarn").textContent = ok
-        ? `VM v${v} ✓ — redeployed`
-        : `VM v${v} — REDEPLOY Coolify from main (need v1.6+)`;
-      $("versionWarn").className = ok ? "good" : "warn";
+      $("versionWarn").textContent = "VM v" + (j.version || "?");
+      $("versionWarn").className = "good";
     }).catch(() => {});
 
     async function api(path, body) {
@@ -115,35 +121,36 @@
       return data;
     }
 
-    $("testCookies").onclick = async () => {
+    $("testCookies")?.addEventListener("click", async () => {
       const err = checkCookies($("cookies").value);
       if (err) { setLog(err, "err"); return; }
       if (!$("secret").value.trim()) { setLog("Enter VM secret", "err"); return; }
       $("testCookies").disabled = true;
-      setLog("Testing session (30s)…");
+      setLog("Testing…");
       try {
         const r = await api("/test-cookies", { advertiserId: $("advertiserId").value.trim(), cookies: $("cookies").value.trim() });
-        let msg = "✓ " + (r.message || "TikTok session OK");
+        let msg = (r.ok ? "✓ " : "✗ ") + (r.message || "");
+        if (r.recommendation) msg += "\n→ " + r.recommendation;
         if (r.warning) msg += "\n⚠ " + r.warning;
-        setLog(msg, r.warning ? "err" : "ok");
+        if (r.apiError) msg += "\nAPI: " + r.apiError;
+        setLog(msg, r.ok ? "ok" : "err");
       } catch (e) { setLog("✗ " + e.message, "err"); }
       finally { $("testCookies").disabled = false; }
-    };
+    });
 
-    $("run").onclick = async () => {
+    $("run")?.addEventListener("click", async () => {
       const cookies = $("cookies").value.trim();
       const err = checkCookies(cookies);
-      if (err) { setLog(err, "err"); return; }
+      if (err) { setLog(err + "\n\n→ Use adsalim.com instead", "err"); return; }
       const secret = $("secret").value.trim();
       const advertiserId = $("advertiserId").value.trim();
       const campaignId = $("campaignId").value.trim();
       const campaignName = $("campaignName").value.trim();
       const names = $("names").value.split("\n").map(s => s.trim()).filter(Boolean);
       if (!secret || !advertiserId || !campaignId || !names.length) {
-        setLog("Fill secret, advertiser ID, campaign ID, names", "err"); return;
+        setLog("Fill all fields", "err"); return;
       }
       $("run").disabled = true;
-      setLog(`Starting ${names.length} copies (fast mode)…`);
       try {
         const start = await api("/duplicate/async", { advertiserId, campaignId, campaignName: campaignName || undefined, names, cookies });
         const jobId = start.jobId;
@@ -152,19 +159,18 @@
           const r = await fetch(`/duplicate/jobs/${jobId}`, { headers: { Authorization: `Bearer ${secret}` } });
           const job = await r.json();
           if (!r.ok) throw new Error(job.error);
-          setLog(`Job ${jobId}\n[${job.phase}] ${job.progress?.done ?? 0}/${job.progress?.total ?? names.length}\n→ ${job.currentStep || "…"}`);
+          setLog(`[${job.phase}] ${job.progress?.done ?? 0}/${job.progress?.total ?? names.length}\n→ ${job.currentStep || "…"}`);
           if (job.status === "completed" || job.status === "failed") {
             const ok = (job.results || []).filter(x => x.ok).length;
             let out = `Done ${ok}/${job.total || names.length}\n`;
-            if (job.error) out += job.error + "\n";
             for (const x of job.results || []) out += `${x.ok ? "✓" : "✗"} ${x.name}${x.error ? " — " + x.error : ""}\n`;
             setLog(out.trim(), ok ? "ok" : "err");
             break;
           }
         }
-      } catch (e) { setLog(String(e.message || e), "err"); }
+      } catch (e) { setLog(String(e.message || e) + "\n\n→ Use adsalim.com + Tampermonkey bridge", "err"); }
       finally { $("run").disabled = false; }
-    };
+    });
 
     updateStatus();
   </script>
