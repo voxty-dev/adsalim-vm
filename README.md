@@ -65,12 +65,30 @@ Body:
 Response:
 ```json
 {
+  "ok": true,
+  "duplicated": 20,
+  "published": 18,
+  "total": 20,
   "results": [
     { "name": "Copy 1 of PRST TR G6", "ok": true, "newCampaignId": "1866..." },
     { "name": "Copy 2 of PRST TR G6", "ok": false, "error": "..." }
   ]
 }
 ```
+
+Flow: duplicate all drafts in one browser session, then publish in parallel (up to 8 at once).
+
+### `POST /duplicate/async` (recommended for 20 copies)
+
+Same body as `/duplicate`. Returns immediately with a job id so Vercel/adsalim does not time out:
+
+```json
+{ "jobId": "dup-171...", "status": "running", "pollUrl": "/duplicate/jobs/dup-171..." }
+```
+
+Poll `GET /duplicate/jobs/:jobId` until `status` is `completed` or `failed`. Progress fields: `phase` (`duplicating` | `publishing`), `progress.done`, `progress.total`.
+
+**adsalim Browser (Smart+) mode should call this instead of replaying duplicate on Vercel.**
 
 ## When selectors break
 

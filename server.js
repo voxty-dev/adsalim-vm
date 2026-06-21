@@ -1,12 +1,15 @@
 /**
  * adsalim-vm-service
  *
- * Publishes TikTok Smart+ campaign drafts via Playwright.
- * Duplicate happens in adsalim (Vercel) via cURL replay.
+ * Duplicates and publishes TikTok Smart+ campaigns via Playwright.
+ * adsalim should call POST /duplicate/async (not Vercel cURL) for 20 copies.
  *
  * Endpoints:
- *   POST /publish-draft   — single draft
- *   POST /publish-batch   — up to 20 drafts in parallel (fast path)
+ *   POST /duplicate         — sync duplicate + publish (slow for 20; may timeout proxies)
+ *   POST /duplicate/async   — start job, returns jobId immediately
+ *   GET  /duplicate/jobs/:id — poll job progress/results
+ *   POST /publish-draft     — single draft
+ *   POST /publish-batch     — up to 20 drafts in parallel
  *   GET  /screenshots/:id
  */
 
@@ -16,7 +19,8 @@ const { chromium } = require("playwright");
 const PORT = process.env.PORT || 3000;
 const SHARED_SECRET = process.env.SHARED_SECRET || "";
 const MAX_CONCURRENT_PUBLISH = Number(process.env.MAX_CONCURRENT_PUBLISH || 8);
-const SERVICE_VERSION = "1.3.0";
+const SERVICE_VERSION = "1.4.0";
+const MAX_DUPLICATE_JOBS = 30;
 
 const BROWSER_ARGS = [
   "--no-sandbox",
@@ -37,7 +41,14 @@ app.get("/", (_req, res) => {
     status: "ok",
     version: SERVICE_VERSION,
     maxConcurrentPublish: MAX_CONCURRENT_PUBLISH,
-    endpoints: ["/duplicate", "/publish-draft", "/publish-batch", "/screenshots/:id"],
+    endpoints: [
+      "/duplicate",
+      "/duplicate/async",
+      "/duplicate/jobs/:id",
+      "/publish-draft",
+      "/publish-batch",
+      "/screenshots/:id",
+    ],
   });
 });
 
@@ -53,6 +64,7 @@ function buildEditorUrl(advertiserId, campaignSketchId) {
 }
 
 const screenshots = new Map();
+const duplicateJobs = new Map();
 let screenshotCounter = 0;
 let activePublishJobs = 0;
 const publishWaiters = [];
@@ -363,54 +375,7 @@ async function clickConfirmDialog(page) {
   }).catch(() => false);
 }
 
-async function publishOnCurrentEditor(page, advertiserId, campaignSketchId) {
-  const prep = await prepareEditorForPublish(page);
-  if (!prep.ready) {
-    return { ok: false, error: `Editor not ready (${prep.lastAction})` };
-  }
-
-  let apiResult = null;
-  let uiResult = null;
-  let draftCheck = null;
-
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    const publishApiPromise = waitForPublishApi(page, 30_000);
-    const publishClicked = await clickPublishAll(page);
-    if (!publishClicked) {
-      return { ok: false, error: "Publish button not found" };
-    }
-
-    await clickConfirmDialog(page);
-    [apiResult, uiResult] = await Promise.all([
-      publishApiPromise,
-      waitForUiPublishSuccess(page, 8_000),
-    ]);
-    draftCheck = await resolveDraftCheck(page, advertiserId, campaignSketchId, apiResult, uiResult);
-
-    if (publishSucceeded(apiResult, uiResult, draftCheck)) {
-      return {
-        ok: true,
-        verifiedBy: isPublishApiSuccess(apiResult?.detail) ? "publish_api" : "ui",
-      };
-    }
-    if (attempt === 1) {
-      const retryPrep = await prepareEditorForPublish(page, 15_000);
-      if (!retryPrep.ready) break;
-    }
-  }
-
-  return {
-    ok: false,
-    error: [
-      draftCheck?.published ? null : `draft=${draftCheck?.reason || "still_draft"}`,
-      apiResult?.ok ? null : "publish_api_failed",
-    ]
-      .filter(Boolean)
-      .join(" | "),
-  };
-}
-
-async function duplicateAndPublishOnce(page, listUrl, sourceCampaignId, newName, advertiserId) {
+async function duplicateDraftOnce(page, listUrl, sourceCampaignId, newName) {
   const searchInput = page.locator('input[placeholder*="Search" i]').first();
   await searchInput.waitFor({ state: "visible", timeout: 15_000 }).catch(() => {});
   await searchInput.fill("").catch(() => {});
@@ -460,33 +425,58 @@ async function duplicateAndPublishOnce(page, listUrl, sourceCampaignId, newName,
   await page.waitForTimeout(800);
 
   const sketchMatch = page.url().match(/campaign_draft_id=([^&]+)/);
-  const campaignSketchId = sketchMatch?.[1] || page.url().match(/temp_campaign_id=([^&]+)/)?.[1] || "";
-
-  const published = await publishOnCurrentEditor(page, advertiserId, campaignSketchId);
-  if (!published.ok) throw new Error(published.error || "Publish failed");
+  const campaignSketchId =
+    sketchMatch?.[1] || page.url().match(/temp_campaign_id=([^&]+)/)?.[1] || "";
+  if (!campaignSketchId) throw new Error("No draft ID after duplicate");
 
   await page.goto(listUrl, { waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => {});
-  await page.waitForTimeout(1000);
+  await page.waitForTimeout(800);
 
-  const newId = await page.evaluate((name) => {
-    for (const r of Array.from(document.querySelectorAll("[data-row-key], [data-id]"))) {
-      const t = r.innerText || r.textContent || "";
-      if (t.includes(name)) {
-        return r.getAttribute("data-row-key") || r.getAttribute("data-id");
-      }
-    }
-    return null;
-  }, newName);
-
-  return newId || campaignSketchId || null;
+  return campaignSketchId;
 }
 
-async function duplicateCampaignsCore({ advertiserId, campaignId, names, cookies }) {
+async function publishDraftsParallel({ advertiserId, cookies, drafts, onProgress }) {
+  const results = await Promise.all(
+    drafts.map(async (draft, index) => {
+      await acquirePublishSlot();
+      try {
+        const result = await publishDraftCore({
+          advertiserId,
+          campaignSketchId: draft.campaignSketchId,
+          cookies,
+          skipAccountWarmup: index > 0,
+        });
+        onProgress?.({ phase: "publishing", done: index + 1, total: drafts.length });
+        return {
+          name: draft.name,
+          campaignSketchId: draft.campaignSketchId,
+          ...result,
+        };
+      } catch (err) {
+        onProgress?.({ phase: "publishing", done: index + 1, total: drafts.length });
+        return {
+          name: draft.name,
+          campaignSketchId: draft.campaignSketchId,
+          ok: false,
+          error: err instanceof Error ? err.message : "Internal error",
+        };
+      } finally {
+        releasePublishSlot();
+      }
+    })
+  );
+
+  const okCount = results.filter((r) => r.ok).length;
+  return { ok: okCount > 0, published: okCount, total: results.length, results };
+}
+
+async function duplicateCampaignsCore({ advertiserId, campaignId, names, cookies, onProgress }) {
   const browser = await getSharedBrowser();
   const context = await createTikTokContext(browser, cookies);
   const page = await context.newPage();
   const listUrl = `https://ads.tiktok.com/i18n/manage/campaign?aadvid=${encodeURIComponent(advertiserId)}`;
 
+  const draftResults = [];
   try {
     await page.goto(listUrl, { waitUntil: "domcontentloaded", timeout: 45_000 });
     if (page.url().includes("/login") || page.url().includes("/passport")) {
@@ -494,19 +484,13 @@ async function duplicateCampaignsCore({ advertiserId, campaignId, names, cookies
     }
     await page.waitForSelector('button, [role="button"], input', { timeout: 15_000 }).catch(() => {});
 
-    const results = [];
-    for (const name of names) {
+    for (let i = 0; i < names.length; i++) {
+      const name = names[i];
       try {
-        const newCampaignId = await duplicateAndPublishOnce(
-          page,
-          listUrl,
-          campaignId,
-          name,
-          advertiserId
-        );
-        results.push({ name, ok: true, newCampaignId });
+        const campaignSketchId = await duplicateDraftOnce(page, listUrl, campaignId, name);
+        draftResults.push({ name, ok: true, campaignSketchId });
       } catch (e) {
-        results.push({
+        draftResults.push({
           name,
           ok: false,
           error: e instanceof Error ? e.message : "unknown error",
@@ -514,13 +498,65 @@ async function duplicateCampaignsCore({ advertiserId, campaignId, names, cookies
         await page.goto(listUrl, { waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => {});
         await page.waitForTimeout(800);
       }
+      onProgress?.({ phase: "duplicating", done: i + 1, total: names.length, draftResults });
     }
-
-    const okCount = results.filter((r) => r.ok).length;
-    return { ok: okCount > 0, published: okCount, total: results.length, results };
   } finally {
     await context.close().catch(() => {});
   }
+
+  const draftsToPublish = draftResults
+    .filter((r) => r.ok && r.campaignSketchId)
+    .map((r) => ({ name: r.name, campaignSketchId: r.campaignSketchId }));
+
+  if (draftsToPublish.length === 0) {
+    return {
+      ok: false,
+      error: "No drafts created",
+      duplicated: 0,
+      published: 0,
+      total: names.length,
+      results: draftResults.map((r) => ({
+        name: r.name,
+        ok: false,
+        error: r.error || "duplicate_failed",
+      })),
+    };
+  }
+
+  onProgress?.({ phase: "publishing", done: 0, total: draftsToPublish.length });
+  const publishOut = await publishDraftsParallel({
+    advertiserId,
+    cookies,
+    drafts: draftsToPublish,
+    onProgress,
+  });
+
+  const publishByName = new Map(publishOut.results.map((r) => [r.name, r]));
+  const results = draftResults.map((draft) => {
+    const pub = publishByName.get(draft.name);
+    if (!draft.ok) {
+      return { name: draft.name, ok: false, error: draft.error || "duplicate_failed" };
+    }
+    if (!pub) {
+      return { name: draft.name, ok: false, error: "publish_not_attempted" };
+    }
+    return {
+      name: draft.name,
+      ok: pub.ok,
+      newCampaignId: pub.newCampaignId || draft.campaignSketchId,
+      verifiedBy: pub.verifiedBy,
+      error: pub.error,
+    };
+  });
+
+  const okCount = results.filter((r) => r.ok).length;
+  return {
+    ok: okCount > 0,
+    duplicated: draftResults.filter((r) => r.ok).length,
+    published: okCount,
+    total: results.length,
+    results,
+  };
 }
 
 function saveScreenshot(buf) {
@@ -632,23 +668,106 @@ app.get("/screenshots/:id", (req, res) => {
   res.send(buf);
 });
 
+function validateDuplicateBody(body) {
+  const { advertiserId, campaignId, names, cookies } = body || {};
+  if (!advertiserId || !campaignId || !Array.isArray(names) || names.length === 0 || !cookies) {
+    return { error: "advertiserId, campaignId, names[], cookies required" };
+  }
+  if (names.length > 20) {
+    return { error: "Max 20 copies per request" };
+  }
+  return { advertiserId, campaignId, names, cookies };
+}
+
+function newDuplicateJobId() {
+  return `dup-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+}
+
+function trimDuplicateJobs() {
+  while (duplicateJobs.size > MAX_DUPLICATE_JOBS) {
+    duplicateJobs.delete(duplicateJobs.keys().next().value);
+  }
+}
+
+function startDuplicateJob(params) {
+  const jobId = newDuplicateJobId();
+  const job = {
+    jobId,
+    status: "running",
+    phase: "duplicating",
+    progress: { done: 0, total: params.names.length },
+    results: [],
+    startedAt: Date.now(),
+  };
+  duplicateJobs.set(jobId, job);
+  trimDuplicateJobs();
+
+  duplicateCampaignsCore({
+    ...params,
+    onProgress: (progress) => {
+      const current = duplicateJobs.get(jobId);
+      if (!current || current.status !== "running") return;
+      duplicateJobs.set(jobId, {
+        ...current,
+        phase: progress.phase,
+        progress: { done: progress.done, total: progress.total },
+        results: progress.draftResults || current.results,
+      });
+    },
+  })
+    .then((out) => {
+      duplicateJobs.set(jobId, {
+        ...duplicateJobs.get(jobId),
+        ...out,
+        status: out.ok ? "completed" : "failed",
+        finishedAt: Date.now(),
+        elapsedMs: Date.now() - job.startedAt,
+      });
+    })
+    .catch((err) => {
+      duplicateJobs.set(jobId, {
+        ...duplicateJobs.get(jobId),
+        status: "failed",
+        error: err instanceof Error ? err.message : "Internal error",
+        finishedAt: Date.now(),
+        elapsedMs: Date.now() - job.startedAt,
+      });
+    });
+
+  return jobId;
+}
+
+app.post("/duplicate/async", (req, res) => {
+  if (!checkAuth(req, res)) return;
+
+  const parsed = validateDuplicateBody(req.body);
+  if (parsed.error) return res.status(400).json({ error: parsed.error });
+
+  const jobId = startDuplicateJob(parsed);
+  return res.status(202).json({
+    jobId,
+    status: "running",
+    pollUrl: `/duplicate/jobs/${jobId}`,
+  });
+});
+
+app.get("/duplicate/jobs/:id", (req, res) => {
+  if (!checkAuth(req, res)) return;
+
+  const job = duplicateJobs.get(req.params.id);
+  if (!job) return res.status(404).json({ error: "Job not found" });
+  return res.json(job);
+});
+
 app.post("/duplicate", async (req, res) => {
   if (!checkAuth(req, res)) return;
 
-  const { advertiserId, campaignId, names, cookies } = req.body || {};
-  if (!advertiserId || !campaignId || !Array.isArray(names) || names.length === 0 || !cookies) {
-    return res.status(400).json({
-      error: "advertiserId, campaignId, names[], cookies required",
-    });
-  }
-  if (names.length > 20) {
-    return res.status(400).json({ error: "Max 20 copies per request" });
-  }
+  const parsed = validateDuplicateBody(req.body);
+  if (parsed.error) return res.status(400).json({ error: parsed.error });
 
-  await acquirePublishSlot();
   const started = Date.now();
   try {
-    const out = await duplicateCampaignsCore({ advertiserId, campaignId, names, cookies });
+    const out = await duplicateCampaignsCore(parsed);
     if (out.error?.includes("expired")) {
       return res.status(401).json(out);
     }
@@ -658,8 +777,6 @@ app.post("/duplicate", async (req, res) => {
     });
   } catch (err) {
     return res.status(500).json({ error: err instanceof Error ? err.message : "Internal error" });
-  } finally {
-    releasePublishSlot();
   }
 });
 
@@ -699,43 +816,27 @@ app.post("/publish-batch", async (req, res) => {
   }
 
   const started = Date.now();
-  const results = await Promise.all(
-    drafts.map(async (draft, index) => {
-      const campaignSketchId = String(draft?.campaignSketchId || draft?.sketchId || "");
-      const name = draft?.name ? String(draft.name) : undefined;
-      if (!campaignSketchId) {
-        return { name, campaignSketchId: "", ok: false, error: "campaignSketchId required" };
-      }
+  const normalized = drafts.map((draft) => ({
+    name: draft?.name ? String(draft.name) : undefined,
+    campaignSketchId: String(draft?.campaignSketchId || draft?.sketchId || ""),
+  }));
+  const invalid = normalized.find((d) => !d.campaignSketchId);
+  if (invalid) {
+    return res.status(400).json({ error: "campaignSketchId required for each draft" });
+  }
 
-      await acquirePublishSlot();
-      try {
-        const result = await publishDraftCore({
-          advertiserId,
-          campaignSketchId,
-          cookies,
-          skipAccountWarmup: index > 0,
-        });
-        return { name, campaignSketchId, ...result };
-      } catch (err) {
-        return {
-          name,
-          campaignSketchId,
-          ok: false,
-          error: err instanceof Error ? err.message : "Internal error",
-        };
-      } finally {
-        releasePublishSlot();
-      }
-    })
-  );
+  const publishOut = await publishDraftsParallel({
+    advertiserId,
+    cookies,
+    drafts: normalized,
+  });
 
-  const okCount = results.filter((r) => r.ok).length;
   return res.json({
-    ok: okCount === results.length,
-    published: okCount,
-    total: results.length,
+    ok: publishOut.published === publishOut.total,
+    published: publishOut.published,
+    total: publishOut.total,
     elapsedMs: Date.now() - started,
-    results,
+    results: publishOut.results,
   });
 });
 
