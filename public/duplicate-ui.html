@@ -31,8 +31,13 @@
     <div class="warn" id="versionWarn">Checking VM…</div>
 
     <div class="bad">
-      <strong>sessionid_ads ma kayban f copy(document.cookie)</strong> — HttpOnly cookie.<br>
-      Khassk tjibha mn DevTools <strong>Application → Cookies</strong> wla mn adsalim.
+      <strong>2 cookies (sessionid_ads + csrftoken) = list empty "rows: none"</strong><br>
+      Khassk <strong>ALL cookies</strong> JSON export:
+      <ol style="margin:8px 0;padding-left:18px">
+        <li>Chrome extension: <strong>Cookie-Editor</strong></li>
+        <li>On ads.tiktok.com → extension → Export → JSON</li>
+        <li>Paste full JSON f textarea ltaht</li>
+      </ol>
     </div>
 
     <h2>① Cookies — 3la ads.tiktok.com</h2>
@@ -93,12 +98,18 @@
     function checkCookies(raw) {
       const s = raw.trim();
       if (!s) return "Cookies empty";
-      const names = parseCookieNames(s);
-      if (names.some(n => n === "sessionid_ads" || n === "sessionid")) return null;
-      if (names.includes("msToken") && !names.some(n => /sessionid/i.test(n))) {
-        return "Only msToken — missing sessionid_ads. Use Application tab (see step ①)";
+      if (s.startsWith("[")) {
+        try {
+          const arr = JSON.parse(s);
+          if (!arr.some(c => /sessionid/i.test(c.name || ""))) return "JSON missing sessionid_ads";
+          if (arr.length < 6) return `JSON has ${arr.length} cookies — need ~10+ from Cookie-Editor export`;
+          return null;
+        } catch { return "Invalid JSON"; }
       }
-      return "Missing sessionid_ads — paste from Application → Cookies → ads.tiktok.com";
+      const names = parseCookieNames(s);
+      if (!names.some(n => /sessionid/i.test(n))) return "Missing sessionid_ads";
+      if (names.length < 4) return `Only ${names.length} cookies — use Cookie-Editor JSON export (need 10+)`;
+      return null;
     }
 
     function updateStatus() {

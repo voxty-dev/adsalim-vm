@@ -20,7 +20,7 @@ const { chromium } = require("playwright");
 const PORT = process.env.PORT || 3000;
 const SHARED_SECRET = process.env.SHARED_SECRET || "";
 const MAX_CONCURRENT_PUBLISH = Number(process.env.MAX_CONCURRENT_PUBLISH || 8);
-const SERVICE_VERSION = "1.4.6";
+const SERVICE_VERSION = "1.5.0";
 const CORS_ORIGINS = (process.env.CORS_ORIGINS || "https://www.adsalim.com,https://adsalim.com")
   .split(",")
   .map((s) => s.trim())
@@ -154,19 +154,27 @@ async function verifyTikTokSession({ advertiserId, cookies }) {
     context = await createTikTokContext(browser, cookies);
     const page = await context.newPage();
     const url = `https://ads.tiktok.com/i18n/manage/campaign?aadvid=${encodeURIComponent(advertiserId || "")}`;
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45_000 });
-    const current = page.url();
-    if (current.includes("/login") || current.includes("/passport")) {
-      const shot = await savePageScreenshot(page, "test-login");
+    const diag = await prepareCampaignListPage(page, url);
+    if ((diag.rowKeys || 0) === 0 && (diag.tableRows || 0) === 0) {
+      const shot = await savePageScreenshot(page, "test-empty");
       return {
         ok: false,
-        error: "TikTok login page — cookies expired or wrong. Use copy(document.cookie) on ads.tiktok.com",
-        screenshot: shot,
+        error:
+          `Session opens but 0 campaigns loaded. Need more cookies (not just sessionid_ads+csrftoken). ` +
+          `Install Cookie-Editor extension → Export JSON from ads.tiktok.com → paste here. ` +
+          `Screenshot: ${shot}`,
       };
     }
-    return { ok: true, message: "TikTok session OK", url: current };
+    return {
+      ok: true,
+      message: `TikTok OK — ${diag.rowKeys || diag.tableRows} rows visible`,
+      url: diag.url,
+    };
   } catch (err) {
     await resetSharedBrowser();
+    if (String(err.message) === "LOGIN") {
+      return { ok: false, error: "Login page — sessionid_ads expired, re-copy from Application tab" };
+    }
     return { ok: false, error: err instanceof Error ? err.message : "Session check failed" };
   } finally {
     await context?.close().catch(() => {});
@@ -176,13 +184,78 @@ async function verifyTikTokSession({ advertiserId, cookies }) {
 async function createTikTokContext(browser, cookies) {
   const parsed = parseCookies(cookies);
   if (parsed.length === 0) throw new Error("No usable cookies parsed");
+
+  const expanded = [];
+  for (const c of parsed) {
+    expanded.push({ ...c, domain: ".tiktok.com", path: c.path || "/" });
+    expanded.push({ ...c, domain: "ads.tiktok.com", path: c.path || "/" });
+    expanded.push({ ...c, domain: ".ads.tiktok.com", path: c.path || "/" });
+  }
+
   const context = await browser.newContext({
     userAgent: USER_AGENT,
     viewport: { width: 1440, height: 900 },
     locale: "en-US",
+    timezoneId: "Europe/Madrid",
   });
-  await context.addCookies(parsed);
+  await context.addInitScript(() => {
+    Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+  });
+  await context.addCookies(expanded);
   return context;
+}
+
+async function readPageDiagnostics(page) {
+  return page.evaluate(() => ({
+    url: location.href,
+    title: document.title,
+    rowKeys: document.querySelectorAll("[data-row-key]").length,
+    tableRows: document.querySelectorAll("table tbody tr").length,
+    bodyStart: (document.body?.innerText || "").replace(/\s+/g, " ").slice(0, 350),
+  }));
+}
+
+async function prepareCampaignListPage(page, listUrl) {
+  await page.goto("https://ads.tiktok.com/", {
+    waitUntil: "domcontentloaded",
+    timeout: 45_000,
+  }).catch(() => {});
+  await page.waitForTimeout(1200);
+
+  await page.goto(listUrl, { waitUntil: "domcontentloaded", timeout: 90_000 });
+  await page.waitForTimeout(2000);
+
+  if (page.url().includes("/login") || page.url().includes("/passport")) {
+    throw new Error("LOGIN");
+  }
+
+  for (let attempt = 0; attempt < 25; attempt++) {
+    const diag = await readPageDiagnostics(page);
+    if (/captcha|verify you're human|unusual activity/i.test(diag.bodyStart)) {
+      throw new Error("TikTok verification/captcha — open ads.tiktok.com in Chrome, pass check, re-export cookies");
+    }
+    if (diag.rowKeys > 0 || diag.tableRows > 1) return diag;
+
+    await page.evaluate(() => {
+      window.scrollTo(0, document.body.scrollHeight);
+      window.scrollTo(0, 0);
+    });
+    await page.waitForTimeout(2500);
+
+    const tabClicked = await page.evaluate(() => {
+      for (const el of Array.from(document.querySelectorAll("button, a, [role='tab'], div, span"))) {
+        const t = (el.innerText || el.textContent || "").trim().toLowerCase();
+        if (t === "campaign" || t === "campaigns" || t.startsWith("campaigns ")) {
+          el.click();
+          return true;
+        }
+      }
+      return false;
+    });
+    if (tabClicked) await page.waitForTimeout(2000);
+  }
+
+  return readPageDiagnostics(page);
 }
 
 function publishAllSelector() {
@@ -476,13 +549,30 @@ async function fillCampaignSearch(page, query) {
 async function scanCampaignRows(page) {
   return page.evaluate(() => {
     const rows = [];
-    for (const el of Array.from(document.querySelectorAll("[data-row-key], [data-id], tr"))) {
-      const key = el.getAttribute("data-row-key") || el.getAttribute("data-id") || "";
-      const text = (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
-      if (!text || text.length < 3) continue;
-      if (key || text.length < 200) rows.push({ key, text: text.slice(0, 120) });
+    const seen = new Set();
+    const add = (key, text) => {
+      const t = String(text || "").replace(/\s+/g, " ").trim();
+      if (t.length < 4 || t.length > 400) return;
+      const sig = `${key}|${t.slice(0, 70)}`;
+      if (seen.has(sig)) return;
+      seen.add(sig);
+      rows.push({ key: key || "", text: t.slice(0, 150) });
+    };
+
+    for (const el of document.querySelectorAll("[data-row-key], [data-id]")) {
+      add(el.getAttribute("data-row-key") || el.getAttribute("data-id") || "", el.innerText || el.textContent);
     }
-    return rows.slice(0, 40);
+    for (const tr of document.querySelectorAll("table tbody tr, [role='row'], [class*='TableRow' i]")) {
+      const nested = tr.querySelector("[data-row-key]");
+      const key = nested?.getAttribute("data-row-key") || tr.getAttribute("data-row-key") || "";
+      add(key, tr.innerText || tr.textContent);
+    }
+    for (const a of document.querySelectorAll("a[href*='campaign'], [class*='campaign-name' i]")) {
+      const row = a.closest("[data-row-key], tr, [role='row']");
+      const key = row?.getAttribute("data-row-key") || "";
+      add(key, a.innerText || row?.innerText);
+    }
+    return rows.slice(0, 60);
   });
 }
 
@@ -529,12 +619,14 @@ async function locateSourceCampaignRow(page, sourceCampaignId, sourceCampaignNam
   const meta = await findCampaignRowMeta(page, sourceCampaignId, sourceCampaignName);
   if (!meta.key) {
     const shot = await savePageScreenshot(page, "row-not-found");
+    const diag = await readPageDiagnostics(page).catch(() => ({}));
     const hint = (meta.sample || [])
       .map((r) => `${r.key || "?"} → ${r.text.slice(0, 50)}`)
       .join(" | ");
     throw new Error(
-      `Campaign not found. TikTok rows seen: ${hint || "none"}. ` +
-        `Use Campaign ID from row (data-row-key) or exact name. Screenshot: ${shot || "n/a"}`
+      `Campaign not found (rows=${diag.rowKeys ?? 0}, table=${diag.tableRows ?? 0}). ` +
+        (hint ? `Seen: ${hint}. ` : "TikTok list empty — export ALL cookies (JSON) from Application tab, not just 2. ") +
+        `Screenshot: ${shot || "n/a"}`
     );
   }
 
@@ -689,17 +781,31 @@ async function duplicateCampaignsCore({
       phase: "duplicating",
       done: 0,
       total: names.length,
-      currentStep: "Loading TikTok campaign list…",
+      currentStep: "Loading TikTok campaign list (up to 60s)…",
     });
-    await page.goto(listUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
-    if (page.url().includes("/login") || page.url().includes("/passport")) {
-      const shot = await savePageScreenshot(page, "login");
-      return {
-        ok: false,
-        error: "TikTok session expired. Re-paste cookies from ads.tiktok.com (F12 → copy(document.cookie)).",
-        screenshot: shot,
-        results: [],
-      };
+    try {
+      const diag = await prepareCampaignListPage(page, listUrl);
+      if ((diag.rowKeys || 0) === 0 && (diag.tableRows || 0) === 0) {
+        const shot = await savePageScreenshot(page, "empty-list");
+        return {
+          ok: false,
+          error:
+            "TikTok campaign list empty in browser. Export ALL cookies: Application → Cookies → ads.tiktok.com → use Cookie-Editor extension JSON export (sessionid_ads alone is not enough). " +
+            `Page: ${(diag.bodyStart || "").slice(0, 120)}. Screenshot: ${shot}`,
+          results: [],
+        };
+      }
+    } catch (e) {
+      if (String(e.message) === "LOGIN") {
+        const shot = await savePageScreenshot(page, "login");
+        return {
+          ok: false,
+          error: "TikTok session expired — re-copy sessionid_ads + csrftoken from Application tab",
+          screenshot: shot,
+          results: [],
+        };
+      }
+      throw e;
     }
     await page.waitForSelector('button, [role="button"], input', { timeout: 20_000 }).catch(() => {});
 
@@ -938,6 +1044,9 @@ function validateCookies(raw) {
       return "WRONG: copy(document.cookie) misses sessionid_ads (HttpOnly). F12 → Application → Cookies → ads.tiktok.com → copy sessionid_ads Value";
     }
     return "Missing sessionid_ads. F12 → Application → Cookies → https://ads.tiktok.com → copy sessionid_ads + csrftoken";
+  }
+  if (parsed.length < 4) {
+    return `Only ${parsed.length} cookie(s) — export ALL cookies as JSON (Cookie-Editor extension on ads.tiktok.com)`;
   }
   return null;
 }
