@@ -20,7 +20,7 @@ const { chromium } = require("playwright");
 const PORT = process.env.PORT || 3000;
 const SHARED_SECRET = process.env.SHARED_SECRET || "";
 const MAX_CONCURRENT_PUBLISH = Number(process.env.MAX_CONCURRENT_PUBLISH || 8);
-const SERVICE_VERSION = "1.5.0";
+const SERVICE_VERSION = "1.5.1";
 const CORS_ORIGINS = (process.env.CORS_ORIGINS || "https://www.adsalim.com,https://adsalim.com")
   .split(",")
   .map((s) => s.trim())
@@ -185,12 +185,13 @@ async function createTikTokContext(browser, cookies) {
   const parsed = parseCookies(cookies);
   if (parsed.length === 0) throw new Error("No usable cookies parsed");
 
-  const expanded = [];
-  for (const c of parsed) {
-    expanded.push({ ...c, domain: ".tiktok.com", path: c.path || "/" });
-    expanded.push({ ...c, domain: "ads.tiktok.com", path: c.path || "/" });
-    expanded.push({ ...c, domain: ".ads.tiktok.com", path: c.path || "/" });
-  }
+  const isJsonExport = String(cookies).trim().startsWith("[");
+  const toAdd = isJsonExport
+    ? parsed
+    : parsed.flatMap((c) => [
+        { ...c, domain: ".tiktok.com", path: c.path || "/" },
+        { ...c, domain: "ads.tiktok.com", path: c.path || "/" },
+      ]);
 
   const context = await browser.newContext({
     userAgent: USER_AGENT,
@@ -201,7 +202,7 @@ async function createTikTokContext(browser, cookies) {
   await context.addInitScript(() => {
     Object.defineProperty(navigator, "webdriver", { get: () => undefined });
   });
-  await context.addCookies(expanded);
+  await context.addCookies(toAdd);
   return context;
 }
 
@@ -1260,9 +1261,17 @@ app.post("/publish-batch", async (req, res) => {
   });
 });
 
+function normalizeSameSite(value) {
+  if (value == null || value === "" || value === "unspecified") return "Lax";
+  const v = String(value).toLowerCase();
+  if (v === "no_restriction" || v === "none") return "None";
+  if (v === "strict") return "Strict";
+  if (v === "lax") return "Lax";
+  return "Lax";
+}
+
 function parseCookies(raw) {
   let trimmed = String(raw).trim();
-  // Strip accidental "Cookie:" prefix or quotes
   trimmed = trimmed.replace(/^cookie:\s*/i, "").replace(/^["']|["']$/g, "");
   if (trimmed.startsWith("[")) {
     try {
@@ -1276,7 +1285,7 @@ function parseCookies(raw) {
           expires: typeof c.expirationDate === "number" ? c.expirationDate : -1,
           httpOnly: Boolean(c.httpOnly),
           secure: Boolean(c.secure ?? true),
-          sameSite: c.sameSite || "Lax",
+          sameSite: normalizeSameSite(c.sameSite),
         }))
         .filter((c) => c.name && c.value);
     } catch {
