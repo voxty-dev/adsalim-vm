@@ -20,7 +20,21 @@ const { chromium } = require("playwright");
 const PORT = process.env.PORT || 3000;
 const SHARED_SECRET = process.env.SHARED_SECRET || "";
 const MAX_CONCURRENT_PUBLISH = Number(process.env.MAX_CONCURRENT_PUBLISH || 8);
-const SERVICE_VERSION = "1.5.1";
+const SERVICE_VERSION = "1.5.2";
+
+function detectTikTokBlocker(bodyText) {
+  const t = String(bodyText || "");
+  if (/telefonnummer|verify.*phone|phone number|verifie.*num/i.test(t)) {
+    return "TikTok wants PHONE VERIFICATION — open ads.tiktok.com in Chrome, verify phone, then re-export cookies JSON";
+  }
+  if (/captcha|verify you're human|unusual activity|security check/i.test(t)) {
+    return "TikTok captcha/security check — complete it in Chrome, then re-export cookies";
+  }
+  if (/log in|sign in|passport/i.test(t) && !/campaign/i.test(t)) {
+    return "TikTok login page — cookies expired, re-export JSON";
+  }
+  return null;
+}
 const CORS_ORIGINS = (process.env.CORS_ORIGINS || "https://www.adsalim.com,https://adsalim.com")
   .split(",")
   .map((s) => s.trim())
@@ -157,12 +171,12 @@ async function verifyTikTokSession({ advertiserId, cookies }) {
     const diag = await prepareCampaignListPage(page, url);
     if ((diag.rowKeys || 0) === 0 && (diag.tableRows || 0) === 0) {
       const shot = await savePageScreenshot(page, "test-empty");
+      const blocker = detectTikTokBlocker(diag.bodyStart);
       return {
         ok: false,
         error:
-          `Session opens but 0 campaigns loaded. Need more cookies (not just sessionid_ads+csrftoken). ` +
-          `Install Cookie-Editor extension → Export JSON from ads.tiktok.com → paste here. ` +
-          `Screenshot: ${shot}`,
+          (blocker || "0 campaigns in browser — TikTok blocking automated session.") +
+          ` Screenshot: ${shot}`,
       };
     }
     return {
@@ -232,9 +246,8 @@ async function prepareCampaignListPage(page, listUrl) {
 
   for (let attempt = 0; attempt < 25; attempt++) {
     const diag = await readPageDiagnostics(page);
-    if (/captcha|verify you're human|unusual activity/i.test(diag.bodyStart)) {
-      throw new Error("TikTok verification/captcha — open ads.tiktok.com in Chrome, pass check, re-export cookies");
-    }
+    const blocker = detectTikTokBlocker(diag.bodyStart);
+    if (blocker) throw new Error(blocker);
     if (diag.rowKeys > 0 || diag.tableRows > 1) return diag;
 
     await page.evaluate(() => {
@@ -788,11 +801,13 @@ async function duplicateCampaignsCore({
       const diag = await prepareCampaignListPage(page, listUrl);
       if ((diag.rowKeys || 0) === 0 && (diag.tableRows || 0) === 0) {
         const shot = await savePageScreenshot(page, "empty-list");
+        const blocker = detectTikTokBlocker(diag.bodyStart);
         return {
           ok: false,
           error:
-            "TikTok campaign list empty in browser. Export ALL cookies: Application → Cookies → ads.tiktok.com → use Cookie-Editor extension JSON export (sessionid_ads alone is not enough). " +
-            `Page: ${(diag.bodyStart || "").slice(0, 120)}. Screenshot: ${shot}`,
+            (blocker ||
+              "Campaign list empty in automated browser. TikTok may block headless access for this account.") +
+            ` Page: ${(diag.bodyStart || "").slice(0, 160)}. Screenshot: ${shot}`,
           results: [],
         };
       }
