@@ -20,7 +20,7 @@ const { chromium } = require("playwright");
 const PORT = process.env.PORT || 3000;
 const SHARED_SECRET = process.env.SHARED_SECRET || "";
 const MAX_CONCURRENT_PUBLISH = Number(process.env.MAX_CONCURRENT_PUBLISH || 8);
-const SERVICE_VERSION = "1.4.4";
+const SERVICE_VERSION = "1.4.5";
 const CORS_ORIGINS = (process.env.CORS_ORIGINS || "https://www.adsalim.com,https://adsalim.com")
   .split(",")
   .map((s) => s.trim())
@@ -869,10 +869,10 @@ function validateCookies(raw) {
   const names = parsed.map((c) => c.name);
   const hasSessionAds = names.some((n) => n === "sessionid_ads" || n === "sessionid");
   if (!hasSessionAds) {
-    if (names.includes("msToken") && names.length <= 3) {
-      return "WRONG COOKIES: only msToken pasted. Must include sessionid_ads= from ads.tiktok.com (copy(document.cookie))";
+    if (names.includes("msToken") && names.length <= 5) {
+      return "WRONG: copy(document.cookie) misses sessionid_ads (HttpOnly). F12 → Application → Cookies → ads.tiktok.com → copy sessionid_ads Value";
     }
-    return "Missing sessionid_ads — you must copy document.cookie from ads.tiktok.com while logged in";
+    return "Missing sessionid_ads. F12 → Application → Cookies → https://ads.tiktok.com → copy sessionid_ads + csrftoken";
   }
   return null;
 }
