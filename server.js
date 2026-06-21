@@ -16,7 +16,7 @@ const { chromium } = require("playwright");
 const PORT = process.env.PORT || 3000;
 const SHARED_SECRET = process.env.SHARED_SECRET || "";
 const MAX_CONCURRENT_PUBLISH = Number(process.env.MAX_CONCURRENT_PUBLISH || 8);
-const SERVICE_VERSION = "1.2.0";
+const SERVICE_VERSION = "1.3.0";
 
 const BROWSER_ARGS = [
   "--no-sandbox",
@@ -37,7 +37,7 @@ app.get("/", (_req, res) => {
     status: "ok",
     version: SERVICE_VERSION,
     maxConcurrentPublish: MAX_CONCURRENT_PUBLISH,
-    endpoints: ["/publish-draft", "/publish-batch", "/screenshots/:id"],
+    endpoints: ["/duplicate", "/publish-draft", "/publish-batch", "/screenshots/:id"],
   });
 });
 
@@ -363,6 +363,166 @@ async function clickConfirmDialog(page) {
   }).catch(() => false);
 }
 
+async function publishOnCurrentEditor(page, advertiserId, campaignSketchId) {
+  const prep = await prepareEditorForPublish(page);
+  if (!prep.ready) {
+    return { ok: false, error: `Editor not ready (${prep.lastAction})` };
+  }
+
+  let apiResult = null;
+  let uiResult = null;
+  let draftCheck = null;
+
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const publishApiPromise = waitForPublishApi(page, 30_000);
+    const publishClicked = await clickPublishAll(page);
+    if (!publishClicked) {
+      return { ok: false, error: "Publish button not found" };
+    }
+
+    await clickConfirmDialog(page);
+    [apiResult, uiResult] = await Promise.all([
+      publishApiPromise,
+      waitForUiPublishSuccess(page, 8_000),
+    ]);
+    draftCheck = await resolveDraftCheck(page, advertiserId, campaignSketchId, apiResult, uiResult);
+
+    if (publishSucceeded(apiResult, uiResult, draftCheck)) {
+      return {
+        ok: true,
+        verifiedBy: isPublishApiSuccess(apiResult?.detail) ? "publish_api" : "ui",
+      };
+    }
+    if (attempt === 1) {
+      const retryPrep = await prepareEditorForPublish(page, 15_000);
+      if (!retryPrep.ready) break;
+    }
+  }
+
+  return {
+    ok: false,
+    error: [
+      draftCheck?.published ? null : `draft=${draftCheck?.reason || "still_draft"}`,
+      apiResult?.ok ? null : "publish_api_failed",
+    ]
+      .filter(Boolean)
+      .join(" | "),
+  };
+}
+
+async function duplicateAndPublishOnce(page, listUrl, sourceCampaignId, newName, advertiserId) {
+  const searchInput = page.locator('input[placeholder*="Search" i]').first();
+  await searchInput.waitFor({ state: "visible", timeout: 15_000 }).catch(() => {});
+  await searchInput.fill("").catch(() => {});
+  await searchInput.fill(sourceCampaignId).catch(() => {});
+  await page.keyboard.press("Enter").catch(() => {});
+  await page.waitForTimeout(1500);
+
+  const rowSelector = `[data-row-key="${sourceCampaignId}"], [data-id="${sourceCampaignId}"]`;
+  const row = page.locator(rowSelector).first();
+  await row.waitFor({ state: "visible", timeout: 15_000 });
+  await row.hover().catch(() => {});
+
+  const dupClicked = await page.evaluate((id) => {
+    const sel = `[data-row-key="${id}"], [data-id="${id}"]`;
+    const r = document.querySelector(sel);
+    if (!r) return false;
+    for (const el of Array.from(r.querySelectorAll("button, a, [role='button']"))) {
+      const t = (el.innerText || el.textContent || "").trim().toLowerCase();
+      if (/duplicate|copy/.test(t)) {
+        el.click();
+        return true;
+      }
+    }
+    return false;
+  }, sourceCampaignId);
+  if (!dupClicked) throw new Error("Duplicate button not found on source row");
+
+  const nameInput = page.locator('input[placeholder*="name" i], input[placeholder*="Name"]').first();
+  await nameInput.waitFor({ state: "visible", timeout: 15_000 });
+  await nameInput.fill("");
+  await nameInput.fill(newName);
+
+  const submitted = await page.evaluate(() => {
+    for (const el of Array.from(document.querySelectorAll("button")).reverse()) {
+      const t = (el.innerText || el.textContent || "").trim().toLowerCase();
+      if (/^(duplicate|confirm|submit|ok)$/.test(t) && !el.disabled) {
+        el.click();
+        return true;
+      }
+    }
+    return false;
+  });
+  if (!submitted) throw new Error("Modal submit button not found");
+
+  await page.waitForLoadState("domcontentloaded", { timeout: 30_000 }).catch(() => {});
+  await page.waitForSelector('button, [role="button"]', { timeout: 15_000 }).catch(() => {});
+  await page.waitForTimeout(800);
+
+  const sketchMatch = page.url().match(/campaign_draft_id=([^&]+)/);
+  const campaignSketchId = sketchMatch?.[1] || page.url().match(/temp_campaign_id=([^&]+)/)?.[1] || "";
+
+  const published = await publishOnCurrentEditor(page, advertiserId, campaignSketchId);
+  if (!published.ok) throw new Error(published.error || "Publish failed");
+
+  await page.goto(listUrl, { waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => {});
+  await page.waitForTimeout(1000);
+
+  const newId = await page.evaluate((name) => {
+    for (const r of Array.from(document.querySelectorAll("[data-row-key], [data-id]"))) {
+      const t = r.innerText || r.textContent || "";
+      if (t.includes(name)) {
+        return r.getAttribute("data-row-key") || r.getAttribute("data-id");
+      }
+    }
+    return null;
+  }, newName);
+
+  return newId || campaignSketchId || null;
+}
+
+async function duplicateCampaignsCore({ advertiserId, campaignId, names, cookies }) {
+  const browser = await getSharedBrowser();
+  const context = await createTikTokContext(browser, cookies);
+  const page = await context.newPage();
+  const listUrl = `https://ads.tiktok.com/i18n/manage/campaign?aadvid=${encodeURIComponent(advertiserId)}`;
+
+  try {
+    await page.goto(listUrl, { waitUntil: "domcontentloaded", timeout: 45_000 });
+    if (page.url().includes("/login") || page.url().includes("/passport")) {
+      return { ok: false, error: "TikTok session expired. Re-paste cookies.", results: [] };
+    }
+    await page.waitForSelector('button, [role="button"], input', { timeout: 15_000 }).catch(() => {});
+
+    const results = [];
+    for (const name of names) {
+      try {
+        const newCampaignId = await duplicateAndPublishOnce(
+          page,
+          listUrl,
+          campaignId,
+          name,
+          advertiserId
+        );
+        results.push({ name, ok: true, newCampaignId });
+      } catch (e) {
+        results.push({
+          name,
+          ok: false,
+          error: e instanceof Error ? e.message : "unknown error",
+        });
+        await page.goto(listUrl, { waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => {});
+        await page.waitForTimeout(800);
+      }
+    }
+
+    const okCount = results.filter((r) => r.ok).length;
+    return { ok: okCount > 0, published: okCount, total: results.length, results };
+  } finally {
+    await context.close().catch(() => {});
+  }
+}
+
 function saveScreenshot(buf) {
   const id = `${Date.now()}-${++screenshotCounter}`;
   screenshots.set(id, buf);
@@ -470,6 +630,37 @@ app.get("/screenshots/:id", (req, res) => {
   if (!buf) return res.status(404).send("Not found");
   res.setHeader("Content-Type", "image/png");
   res.send(buf);
+});
+
+app.post("/duplicate", async (req, res) => {
+  if (!checkAuth(req, res)) return;
+
+  const { advertiserId, campaignId, names, cookies } = req.body || {};
+  if (!advertiserId || !campaignId || !Array.isArray(names) || names.length === 0 || !cookies) {
+    return res.status(400).json({
+      error: "advertiserId, campaignId, names[], cookies required",
+    });
+  }
+  if (names.length > 20) {
+    return res.status(400).json({ error: "Max 20 copies per request" });
+  }
+
+  await acquirePublishSlot();
+  const started = Date.now();
+  try {
+    const out = await duplicateCampaignsCore({ advertiserId, campaignId, names, cookies });
+    if (out.error?.includes("expired")) {
+      return res.status(401).json(out);
+    }
+    return res.json({
+      ...out,
+      elapsedMs: Date.now() - started,
+    });
+  } catch (err) {
+    return res.status(500).json({ error: err instanceof Error ? err.message : "Internal error" });
+  } finally {
+    releasePublishSlot();
+  }
 });
 
 app.post("/publish-draft", async (req, res) => {
