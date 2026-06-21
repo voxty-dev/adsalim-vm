@@ -20,7 +20,7 @@ const { chromium } = require("playwright");
 const PORT = process.env.PORT || 3000;
 const SHARED_SECRET = process.env.SHARED_SECRET || "";
 const MAX_CONCURRENT_PUBLISH = Number(process.env.MAX_CONCURRENT_PUBLISH || 8);
-const SERVICE_VERSION = "1.4.3";
+const SERVICE_VERSION = "1.4.4";
 const CORS_ORIGINS = (process.env.CORS_ORIGINS || "https://www.adsalim.com,https://adsalim.com")
   .split(",")
   .map((s) => s.trim())
@@ -61,6 +61,7 @@ app.get("/", (_req, res) => {
     version: SERVICE_VERSION,
     maxConcurrentPublish: MAX_CONCURRENT_PUBLISH,
     endpoints: [
+      "/test-cookies",
       "/duplicate/inject",
       "/duplicate/ui",
       "/duplicate",
@@ -109,16 +110,67 @@ function releasePublishSlot() {
 }
 
 async function getSharedBrowser() {
-  if (!sharedBrowserPromise) {
-    sharedBrowserPromise = chromium.launch({
-      headless: true,
-      args: BROWSER_ARGS,
-    }).catch((err) => {
+  if (sharedBrowserPromise) {
+    try {
+      const browser = await sharedBrowserPromise;
+      if (!browser.isConnected()) {
+        sharedBrowserPromise = null;
+      } else {
+        return browser;
+      }
+    } catch {
       sharedBrowserPromise = null;
-      throw err;
-    });
+    }
   }
+  sharedBrowserPromise = chromium.launch({
+    headless: true,
+    args: BROWSER_ARGS,
+  }).catch((err) => {
+    sharedBrowserPromise = null;
+    throw err;
+  });
   return sharedBrowserPromise;
+}
+
+async function resetSharedBrowser() {
+  if (sharedBrowserPromise) {
+    try {
+      const b = await sharedBrowserPromise;
+      await b.close().catch(() => {});
+    } catch {
+      /* ignore */
+    }
+    sharedBrowserPromise = null;
+  }
+}
+
+async function verifyTikTokSession({ advertiserId, cookies }) {
+  const cookieErr = validateCookies(cookies);
+  if (cookieErr) return { ok: false, error: cookieErr };
+
+  let context;
+  try {
+    const browser = await getSharedBrowser();
+    context = await createTikTokContext(browser, cookies);
+    const page = await context.newPage();
+    const url = `https://ads.tiktok.com/i18n/manage/campaign?aadvid=${encodeURIComponent(advertiserId || "")}`;
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45_000 });
+    const current = page.url();
+    if (current.includes("/login") || current.includes("/passport")) {
+      const shot = await savePageScreenshot(page, "test-login");
+      return {
+        ok: false,
+        error: "TikTok login page — cookies expired or wrong. Use copy(document.cookie) on ads.tiktok.com",
+        screenshot: shot,
+      };
+    }
+    return { ok: true, message: "TikTok session OK", url: current };
+  } catch (err) {
+    await resetSharedBrowser();
+    return { ok: false, error: err instanceof Error ? err.message : "Session check failed" };
+  } finally {
+    await context?.close().catch(() => {});
+  }
 }
 
 async function createTikTokContext(browser, cookies) {
@@ -812,11 +864,15 @@ function validateCookies(raw) {
   if (!trimmed) return "Cookies empty";
   const parsed = parseCookies(trimmed);
   if (parsed.length === 0) {
-    return 'Cookies not parsed. On ads.tiktok.com run: copy(document.cookie) — must include sessionid_ads=';
+    return "Cookies not parsed. On ads.tiktok.com → F12 → Console → copy(document.cookie)";
   }
-  const hasSession = parsed.some((c) => /sessionid/i.test(c.name));
-  if (!hasSession) {
-    return "Missing sessionid_ads — copy cookies from ads.tiktok.com while logged in (not adsalim.com)";
+  const names = parsed.map((c) => c.name);
+  const hasSessionAds = names.some((n) => n === "sessionid_ads" || n === "sessionid");
+  if (!hasSessionAds) {
+    if (names.includes("msToken") && names.length <= 3) {
+      return "WRONG COOKIES: only msToken pasted. Must include sessionid_ads= from ads.tiktok.com (copy(document.cookie))";
+    }
+    return "Missing sessionid_ads — you must copy document.cookie from ads.tiktok.com while logged in";
   }
   return null;
 }
@@ -844,6 +900,18 @@ function startDuplicateJob(params) {
   duplicateJobs.set(jobId, job);
   trimDuplicateJobs();
 
+  const heartbeat = setInterval(() => {
+    const current = duplicateJobs.get(jobId);
+    if (!current || current.status !== "running") {
+      clearInterval(heartbeat);
+      return;
+    }
+    duplicateJobs.set(jobId, {
+      ...current,
+      elapsedMs: Date.now() - job.startedAt,
+    });
+  }, 10_000);
+
   duplicateCampaignsCore({
     ...params,
     onProgress: (progress) => {
@@ -859,6 +927,7 @@ function startDuplicateJob(params) {
     },
   })
     .then((out) => {
+      clearInterval(heartbeat);
       duplicateJobs.set(jobId, {
         ...duplicateJobs.get(jobId),
         ...out,
@@ -868,6 +937,7 @@ function startDuplicateJob(params) {
       });
     })
     .catch((err) => {
+      clearInterval(heartbeat);
       duplicateJobs.set(jobId, {
         ...duplicateJobs.get(jobId),
         status: "failed",
@@ -879,6 +949,14 @@ function startDuplicateJob(params) {
 
   return jobId;
 }
+
+app.post("/test-cookies", async (req, res) => {
+  if (!checkAuth(req, res)) return;
+  const { advertiserId, cookies } = req.body || {};
+  if (!cookies) return res.status(400).json({ error: "cookies required" });
+  const out = await verifyTikTokSession({ advertiserId, cookies });
+  return res.status(out.ok ? 200 : 400).json(out);
+});
 
 app.get("/duplicate/inject", (_req, res) => {
   res.sendFile(path.join(__dirname, "public", "duplicate-inject.html"));

@@ -9,9 +9,10 @@
     body { margin: 0; background: #0b1220; color: #e5e7eb; }
     main { max-width: 760px; margin: 0 auto; padding: 24px; }
     h1 { font-size: 1.25rem; margin-bottom: 4px; }
-    h2 { font-size: 1rem; margin: 24px 0 8px; color: #e2e8f0; }
     p { color: #94a3b8; line-height: 1.5; }
     .warn { background: #422006; border: 1px solid #a16207; color: #fde68a; padding: 12px; border-radius: 8px; margin-bottom: 16px; }
+    .bad { background: #450a0a; border: 1px solid #b91c1c; color: #fecaca; padding: 12px; border-radius: 8px; margin-bottom: 16px; }
+    .good { background: #052e16; border: 1px solid #166534; color: #86efac; padding: 12px; border-radius: 8px; margin-bottom: 16px; }
     label { display: block; font-size: 0.85rem; margin: 14px 0 6px; color: #cbd5e1; }
     input, textarea { width: 100%; box-sizing: border-box; padding: 10px 12px; border-radius: 8px; border: 1px solid #334155; background: #111827; color: #f8fafc; }
     textarea { min-height: 100px; resize: vertical; font-family: ui-monospace, monospace; font-size: 12px; }
@@ -22,151 +23,186 @@
     #log { margin-top: 20px; padding: 14px; border-radius: 8px; background: #111827; border: 1px solid #334155; white-space: pre-wrap; font-family: ui-monospace, monospace; font-size: 12px; min-height: 80px; }
     .ok { color: #4ade80; }
     .err { color: #f87171; }
-    #bridgeSnippet { min-height: 70px; }
+    code { background: #1e293b; padding: 2px 6px; border-radius: 4px; }
   </style>
 </head>
 <body>
   <main>
     <div class="warn" id="versionWarn">Checking VM version…</div>
 
-    <h1>AdsAlim VM — Duplicate 20x</h1>
-    <p>adsalim.com stops at ~4–5 copies (Vercel timeout). Use this page or the browser bridge below.</p>
+    <div class="bad" id="cookieHelp">
+      <strong>⚠ Cookies dyalek ghalat ila ma kayn ghir msToken.</strong><br>
+      1. 7ll <strong>ads.tiktok.com</strong> (logged in, campaigns visible)<br>
+      2. F12 → <strong>Console</strong><br>
+      3. Paste: <code>copy(document.cookie)</code> → Enter<br>
+      4. Ctrl+V hna — khass tshuf <code>sessionid_ads=</code>
+    </div>
 
-    <h2>A) Fix adsalim.com UI (paste once in Console)</h2>
-    <p>1. Open <strong>www.adsalim.com</strong> (logged in) → F12 → Console<br>
-       2. Copy script below → paste → Enter<br>
-       3. Cyan badge <strong>VM duplicate bridge ON</strong> → duplicate 10x/20x as normal</p>
-    <textarea id="bridgeSnippet" readonly></textarea>
-    <button id="copyBridge" class="secondary">Copy bridge script</button>
+    <div id="cookieStatus" class="bad" style="display:none"></div>
 
-    <h2>B) Manual duplicate (this page)</h2>
+    <h1>Bulk Duplicate (VM)</h1>
 
-    <label>VM secret (Bearer token)</label>
-    <input id="secret" type="password" placeholder="TIKTOK_VM_SECRET / SHARED_SECRET" />
+    <label>VM secret</label>
+    <input id="secret" type="password" placeholder="SHARED_SECRET from Coolify" />
 
     <div class="row">
       <div>
-        <label>Advertiser ID (aadvid)</label>
-        <input id="advertiserId" placeholder="7559481394611798032" />
+        <label>Advertiser ID</label>
+        <input id="advertiserId" placeholder="7483656319267307538" />
       </div>
       <div>
-        <label>Source campaign ID</label>
-        <input id="campaignId" placeholder="1863630626273666" />
+        <label>Campaign ID</label>
+        <input id="campaignId" placeholder="1868524813296978" />
       </div>
     </div>
 
-    <label>Source campaign name (optional — helps find row)</label>
+    <label>Campaign name (smiya f TikTok)</label>
     <input id="campaignName" placeholder="PRST TR G1" />
 
-    <label>Names (one per line, max 20)</label>
-    <textarea id="names" placeholder="Copy 6 of PRST TR G1&#10;Copy 7 of PRST TR G1"></textarea>
+    <label>Names (1 per line)</label>
+    <textarea id="names" placeholder="tr 1&#10;tr 2"></textarea>
 
-    <label>TikTok cookies — from <strong>ads.tiktok.com</strong> only</label>
-    <p style="margin:0 0 8px;font-size:13px">ads.tiktok.com → F12 → Console → paste: <code>copy(document.cookie)</code> → Ctrl+V here</p>
-    <textarea id="cookies" placeholder="sessionid_ads=...; csrftoken=...; ttwid=..."></textarea>
+    <label>TikTok cookies</label>
+    <textarea id="cookies" placeholder="sessionid_ads=...; csrftoken=..."></textarea>
 
+    <button id="testCookies" class="secondary">Test cookies first</button>
     <button id="run">Start duplicate</button>
     <div id="log">Ready.</div>
   </main>
   <script>
-    const VM = location.origin.replace(/\/$/, "");
-    const bridgeLoader =
-      `(function(){var s=document.createElement('script');s.src='${VM}/adsalim-bridge.js?v=1.4.2';document.head.appendChild(s);})();`;
-    document.getElementById("bridgeSnippet").value = bridgeLoader;
+    const $ = (id) => document.getElementById(id);
+    const setLog = (text, cls) => {
+      $("log").textContent = text;
+      $("log").className = cls || "";
+    };
+
+    function checkCookiesLocal(raw) {
+      const s = raw.trim();
+      if (!s) return "Cookies empty";
+      if (!/sessionid_ads=|sessionid=/i.test(s)) {
+        if (/msToken=/i.test(s) && !/sessionid/i.test(s)) {
+          return "WRONG: only msToken — use copy(document.cookie) on ads.tiktok.com";
+        }
+        return "Missing sessionid_ads= in cookies string";
+      }
+      return null;
+    }
+
+    function updateCookieStatus() {
+      const err = checkCookiesLocal($("cookies").value);
+      const el = $("cookieStatus");
+      if (err) {
+        el.style.display = "block";
+        el.className = "bad";
+        el.textContent = "✗ " + err;
+      } else {
+        el.style.display = "block";
+        el.className = "good";
+        el.textContent = "✓ sessionid_ads found — click Test cookies to verify login";
+      }
+    }
+
+    $("cookies").addEventListener("input", updateCookieStatus);
 
     fetch("/").then(r => r.json()).then(j => {
-      const el = document.getElementById("versionWarn");
-      if (j.version >= "1.4.2") {
-        el.textContent = "VM v" + j.version + " OK — bridge + /duplicate/inject available.";
-        el.style.background = "#052e16";
-        el.style.borderColor = "#166534";
-        el.style.color = "#86efac";
-      } else {
-        el.innerHTML =
-          "<strong>Redeploy Coolify required.</strong> Live version is v" + j.version +
-          " — /duplicate/inject and browser bridge need v1.4.2+. " +
-          "Coolify → Redeploy from main branch. Manual duplicate (section B) works now.";
-      }
+      const el = $("versionWarn");
+      el.className = parseFloat(j.version) >= 1.4 ? "good" : "warn";
+      el.textContent = "VM v" + j.version + (parseFloat(j.version) < 1.4.4 ? " — Redeploy Coolify for latest fixes" : " OK");
     }).catch(() => {});
 
-    document.getElementById("copyBridge").onclick = () => {
-      navigator.clipboard.writeText(bridgeLoader);
-      document.getElementById("copyBridge").textContent = "Copied!";
+    $("testCookies").onclick = async () => {
+      const secret = $("secret").value.trim();
+      const advertiserId = $("advertiserId").value.trim();
+      const cookies = $("cookies").value.trim();
+      const localErr = checkCookiesLocal(cookies);
+      if (localErr) { setLog(localErr, "err"); return; }
+      if (!secret) { setLog("Enter VM secret first", "err"); return; }
+
+      $("testCookies").disabled = true;
+      setLog("Testing TikTok session (20–40s)…");
+      try {
+        const r = await fetch("/test-cookies", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${secret}` },
+          body: JSON.stringify({ advertiserId, cookies }),
+        });
+        const body = await r.json();
+        if (!r.ok) throw new Error(body.error || r.statusText);
+        setLog("✓ Cookies OK — TikTok session valid. You can Start duplicate.", "ok");
+      } catch (e) {
+        setLog("✗ " + (e.message || e), "err");
+      } finally {
+        $("testCookies").disabled = false;
+      }
     };
 
-    const $ = (id) => document.getElementById(id);
-    const log = (msg, cls) => {
-      const el = $("log");
-      el.textContent += (el.textContent === "Ready." ? "" : "\n") + msg;
-      if (cls) el.className = cls;
-    };
-
-    $("run").addEventListener("click", async () => {
+    $("run").onclick = async () => {
       const secret = $("secret").value.trim();
       const advertiserId = $("advertiserId").value.trim();
       const campaignId = $("campaignId").value.trim();
       const campaignName = $("campaignName").value.trim();
       const cookies = $("cookies").value.trim();
-      const names = $("names").value.split("\n").map((s) => s.trim()).filter(Boolean);
-      $("log").textContent = "";
-      $("run").disabled = true;
+      const names = $("names").value.split("\n").map(s => s.trim()).filter(Boolean);
 
-      if (!secret || !advertiserId || !campaignId || !cookies || !names.length) {
-        log("Fill all fields.", "err");
-        $("run").disabled = false;
+      const localErr = checkCookiesLocal(cookies);
+      if (localErr) { setLog(localErr, "err"); return; }
+      if (!secret || !advertiserId || !campaignId || !names.length) {
+        setLog("Fill secret, IDs, names, cookies", "err");
         return;
       }
-      if (names.length > 20) {
-        log("Max 20 names.", "err");
-        $("run").disabled = false;
-        return;
-      }
+
+      $("run").disabled = true;
+      setLog(`Starting ${names.length} copies…`);
 
       try {
-        log(`Starting ${names.length} copies…`);
         const start = await fetch("/duplicate/async", {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${secret}`,
-          },
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${secret}` },
           body: JSON.stringify({ advertiserId, campaignId, campaignName: campaignName || undefined, names, cookies }),
         });
         const startBody = await start.json();
         if (!start.ok) throw new Error(startBody.error || start.statusText);
+
         const jobId = startBody.jobId;
-        log(`Job ${jobId} running…`);
+        let lastLine = "";
 
         while (true) {
-          await new Promise((r) => setTimeout(r, 2500));
+          await new Promise(r => setTimeout(r, 2500));
           const poll = await fetch(`/duplicate/jobs/${jobId}`, {
             headers: { Authorization: `Bearer ${secret}` },
           });
           const job = await poll.json();
           if (!poll.ok) throw new Error(job.error || poll.statusText);
-          log(
-            `[${job.phase || job.status}] ${job.progress?.done || 0}/${job.progress?.total || names.length}` +
-              (job.currentStep ? `\n  → ${job.currentStep}` : "") +
-              (job.published != null ? ` published=${job.published}` : "")
-          );
-          if (job.error && job.status === "failed") log(job.error, "err");
+
+          const line =
+            `[${job.phase}] ${job.progress?.done ?? 0}/${job.progress?.total ?? names.length}` +
+            (job.currentStep ? `\n→ ${job.currentStep}` : "") +
+            (job.elapsedMs ? `\n⏱ ${Math.round(job.elapsedMs / 1000)}s` : "");
+
+          if (line !== lastLine) {
+            lastLine = line;
+            setLog(`Job ${jobId}\n${line}`);
+          }
+
           if (job.status === "completed" || job.status === "failed") {
-            const ok = (job.results || []).filter((r) => r.ok).length;
-            log(`Done: ${ok}/${job.total || names.length} ok`, ok ? "ok" : "err");
-            if (job.results) {
-              for (const r of job.results) {
-                log(`${r.ok ? "✓" : "✗"} ${r.name}${r.error ? " — " + r.error : ""}`);
-              }
+            const ok = (job.results || []).filter(r => r.ok).length;
+            let out = `Done: ${ok}/${job.total || names.length} ok\n`;
+            if (job.error) out += job.error + "\n";
+            for (const r of job.results || []) {
+              out += `${r.ok ? "✓" : "✗"} ${r.name}${r.error ? " — " + r.error : ""}\n`;
             }
+            setLog(out.trim(), ok ? "ok" : "err");
             break;
           }
         }
       } catch (e) {
-        log(String(e.message || e), "err");
+        setLog(String(e.message || e), "err");
       } finally {
         $("run").disabled = false;
       }
-    });
+    };
+
+    updateCookieStatus();
   </script>
 </body>
 </html>
