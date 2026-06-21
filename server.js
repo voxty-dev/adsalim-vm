@@ -20,7 +20,7 @@ const { chromium } = require("playwright");
 const PORT = process.env.PORT || 3000;
 const SHARED_SECRET = process.env.SHARED_SECRET || "";
 const MAX_CONCURRENT_PUBLISH = Number(process.env.MAX_CONCURRENT_PUBLISH || 8);
-const SERVICE_VERSION = "1.6.2";
+const SERVICE_VERSION = "1.6.3";
 
 function detectTikTokBlocker(bodyText) {
   const t = String(bodyText || "");
@@ -167,13 +167,22 @@ async function verifyTikTokSession({ advertiserId, cookies }) {
     if (page.url().includes("/login") || page.url().includes("/passport")) {
       return { ok: false, error: "Login page — sessionid_ads expired, re-copy JSON cookies" };
     }
+    const hint = await readAccountHint(page);
+    const zeroCampaigns = hint.totalCampaigns === 0 || (diag.rowKeys === 0 && diag.tableRows <= 1);
     return {
       ok: true,
       message:
         diag.rowKeys > 0
           ? `TikTok OK — ${diag.rowKeys} campaigns visible`
-          : "Session OK — will duplicate via campaign detail URL (phone popup ignored)",
+          : zeroCampaigns
+            ? "Session OK but 0 campaigns — export cookies FROM the TikTok account that has PRST TR G1 (check aadvid= in URL)"
+            : "Session OK — will duplicate via Campaign ID",
       url: diag.url,
+      rowKeys: diag.rowKeys,
+      totalCampaigns: hint.totalCampaigns,
+      warning: zeroCampaigns
+        ? "Wrong account or empty list — on ads.tiktok.com verify aadvid matches Advertiser ID before exporting cookies"
+        : null,
     };
   } catch (err) {
     await resetSharedBrowser();
@@ -212,33 +221,64 @@ async function createTikTokContext(browser, cookies) {
 }
 
 async function dismissOverlays(page) {
-  for (let i = 0; i < 3; i++) {
+  for (let round = 0; round < 8; round++) {
     const clicked = await page
       .evaluate(() => {
         let n = 0;
+        const click = (el) => {
+          if (!el || el.disabled) return;
+          try {
+            el.click();
+            n++;
+          } catch {
+            /* ignore */
+          }
+        };
+
+        for (const btn of document.querySelectorAll("button, [role='button']")) {
+          const t = (btn.innerText || btn.textContent || "").trim();
+          if (/^got it$/i.test(t)) click(btn);
+        }
+
+        for (const el of document.querySelectorAll(
+          '[aria-label="Close"], [aria-label="close"], [class*="close" i] button, button[class*="close" i], [class*="modal" i] [class*="close" i]'
+        )) {
+          click(el);
+        }
+
         const ok = (t) =>
-          /^(got it|ok|close|skip|later|not now|später|abbrechen|cancel|dismiss|×|✕|i understand|confirm)$/i.test(
+          /^(ok|close|skip|later|not now|später|abbrechen|cancel|dismiss|×|✕|i understand|confirm|maybe later|no thanks)$/i.test(
             t.trim()
           );
         for (const el of Array.from(
           document.querySelectorAll('button, [role="button"], a, span, [class*="close" i]')
         )) {
           const t = (el.innerText || el.textContent || "").trim();
-          if (ok(t) && !el.disabled) {
-            try {
-              el.click();
-              n++;
-            } catch {
-              /* ignore */
-            }
-          }
+          if (ok(t)) click(el);
         }
         return n;
       })
       .catch(() => 0);
     if (!clicked) break;
-    await page.waitForTimeout(500);
+    await page.waitForTimeout(700);
   }
+}
+
+async function readAccountHint(page) {
+  return page
+    .evaluate(() => {
+      const body = (document.body?.innerText || "").replace(/\s+/g, " ");
+      const totalMatch = body.match(/Total of (\d+) campaigns?/i);
+      const account =
+        document.querySelector('[class*="account" i], [class*="Account" i]')?.innerText?.trim().slice(0, 40) ||
+        "";
+      return {
+        totalCampaigns: totalMatch ? Number(totalMatch[1]) : null,
+        accountHint: account,
+        url: location.href,
+      };
+    })
+    .catch(() => ({}));
 }
 
 async function readPageDiagnostics(page) {
@@ -686,6 +726,110 @@ async function getCsrfToken(page) {
   });
 }
 
+async function tiktokApiCall(page, url, method, body) {
+  const csrf = await getCsrfToken(page);
+  return page.evaluate(
+    async ({ fetchUrl, fetchMethod, fetchBody, csrfToken }) => {
+      try {
+        const headers = { Accept: "application/json" };
+        if (fetchBody != null) headers["Content-Type"] = "application/json";
+        if (csrfToken) {
+          headers["X-CSRFToken"] = csrfToken;
+          headers["x-csrftoken"] = csrfToken;
+        }
+        const resp = await fetch(fetchUrl, {
+          method: fetchMethod,
+          credentials: "include",
+          headers,
+          body: fetchBody != null ? JSON.stringify(fetchBody) : undefined,
+        });
+        const text = await resp.text();
+        let json = null;
+        try {
+          json = JSON.parse(text);
+        } catch {
+          /* ignore */
+        }
+        return { status: resp.status, json, text: text.slice(0, 500), url: fetchUrl };
+      } catch (e) {
+        return { error: String(e), url: fetchUrl };
+      }
+    },
+    { fetchUrl: url, fetchMethod: method, fetchBody: body ?? null, csrfToken: csrf }
+  );
+}
+
+async function waitForCampaignRowKey(page, campaignId, timeoutMs = 45_000) {
+  const id = String(campaignId);
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    await dismissOverlays(page);
+    const found = await page.evaluate((cid) => {
+      if (document.querySelector(`[data-row-key="${cid}"]`)) return true;
+      for (const el of document.querySelectorAll("[data-row-key]")) {
+        const k = el.getAttribute("data-row-key") || "";
+        if (k === cid || k.endsWith(cid) || k.includes(cid)) return true;
+      }
+      return false;
+    }, id);
+    if (found) return true;
+    await page.waitForTimeout(1500);
+  }
+  return false;
+}
+
+async function tryDuplicateFromListRowById(page, listUrl, advertiserId, campaignId, newName) {
+  await page.goto(listUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
+  await dismissOverlays(page);
+  await page.waitForTimeout(1500);
+
+  const hasRow = await waitForCampaignRowKey(page, campaignId, 30_000);
+  if (!hasRow) return null;
+
+  const row = page.locator(`[data-row-key="${campaignId}"]`).first();
+  const rowFallback = page.locator("[data-row-key]").filter({ hasText: campaignId }).first();
+  const target = (await row.count()) > 0 ? row : rowFallback;
+
+  await target.scrollIntoViewIfNeeded().catch(() => {});
+  await target.hover().catch(() => {});
+  await page.waitForTimeout(800);
+
+  const apiWait = waitForDuplicateApiResponse(page, 35_000);
+  await clickDuplicateOnRow(page, target);
+  await submitDuplicateNameModal(page, newName);
+  const apiHit = await apiWait;
+  if (apiHit?.draftId) return apiHit.draftId;
+
+  const sketchId = await extractDraftIdFromPage(page);
+  return sketchId || null;
+}
+
+async function tryDuplicateViaEditorUrls(page, advertiserId, campaignId, newName) {
+  const urls = [
+    `https://ads.tiktok.com/i18n/creation/1nn/create/campaign?aadvid=${encodeURIComponent(advertiserId)}&source=campaign_list&campaign_id=${encodeURIComponent(campaignId)}&creation_type=duplicate&objective_type=3`,
+    `https://ads.tiktok.com/i18n/creation/1nn/create/campaign?aadvid=${encodeURIComponent(advertiserId)}&source=campaign_list&src_campaign_id=${encodeURIComponent(campaignId)}&creation_type=copy&objective_type=3`,
+    `https://ads.tiktok.com/i18n/creation/1nn/create/campaign?aadvid=${encodeURIComponent(advertiserId)}&duplicate_campaign_id=${encodeURIComponent(campaignId)}&objective_type=3`,
+  ];
+
+  for (const url of urls) {
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
+    await dismissOverlays(page);
+    await page.waitForTimeout(1200);
+    if (page.url().includes("/login") || page.url().includes("/passport")) continue;
+
+    let sketchId = await extractDraftIdFromPage(page);
+    if (sketchId) return sketchId;
+
+    const nameInput = page.locator('input[placeholder*="name" i], input[class*="name" i]').first();
+    if (await nameInput.isVisible().catch(() => false)) {
+      await nameInput.fill(newName).catch(() => {});
+    }
+    sketchId = await extractDraftIdFromPage(page);
+    if (sketchId) return sketchId;
+  }
+  return null;
+}
+
 function extractDraftIdFromApiJson(json) {
   if (!json || typeof json !== "object") return null;
   const code = json.code ?? json.status_code ?? json.statusCode;
@@ -1035,14 +1179,32 @@ async function duplicateDraftOnce(
   sourceCampaignName,
   apiTemplateRef
 ) {
-  if (sourceCampaignId) {
-    if (apiTemplateRef?.url) {
-      const replayed = await replayDuplicateRequest(page, apiTemplateRef, newName);
-      if (replayed) return replayed;
-    }
+  const attempts = [];
 
+  if (apiTemplateRef?.url) {
+    const replayed = await replayDuplicateRequest(page, apiTemplateRef, newName);
+    if (replayed) return replayed;
+    attempts.push("api-replay failed");
+  }
+
+  if (sourceCampaignId) {
     const fromHttp = await tryDuplicateViaHttp(page, advertiserId, sourceCampaignId, newName);
     if (fromHttp) return fromHttp;
+    attempts.push("http endpoints failed");
+
+    const fromRow = await tryDuplicateFromListRowById(
+      page,
+      listUrl,
+      advertiserId,
+      sourceCampaignId,
+      newName
+    );
+    if (fromRow) return fromRow;
+    attempts.push("list row not found");
+
+    const fromEditor = await tryDuplicateViaEditorUrls(page, advertiserId, sourceCampaignId, newName);
+    if (fromEditor) return fromEditor;
+    attempts.push("editor URLs failed");
 
     const fromDetail = await tryDuplicateFromDetailPage(
       page,
@@ -1055,20 +1217,39 @@ async function duplicateDraftOnce(
       await page.goto(listUrl, { waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => {});
       return fromDetail;
     }
-
-    const shot = await savePageScreenshot(page, "fast-dup-fail");
-    throw new Error(
-      `Fast duplicate failed. Campaign ID ${sourceCampaignId} — re-export Cookie-Editor JSON. Screenshot: ${shot || "n/a"}`
-    );
+    attempts.push("detail page failed");
   }
 
-  const row = await locateSourceCampaignRow(page, sourceCampaignId, sourceCampaignName);
-  await clickDuplicateOnRow(page, row);
-  await submitDuplicateNameModal(page, newName);
-  const campaignSketchId = await extractDraftIdFromPage(page);
-  if (!campaignSketchId) throw new Error("No draft ID after duplicate");
-  await page.goto(listUrl, { waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => {});
-  return campaignSketchId;
+  if (sourceCampaignName || sourceCampaignId) {
+    try {
+      await page.goto(listUrl, { waitUntil: "domcontentloaded", timeout: 60_000 }).catch(() => {});
+      await dismissOverlays(page);
+      const row = await locateSourceCampaignRow(page, sourceCampaignId, sourceCampaignName);
+      await clickDuplicateOnRow(page, row);
+      await submitDuplicateNameModal(page, newName);
+      const campaignSketchId = await extractDraftIdFromPage(page);
+      if (campaignSketchId) {
+        await page.goto(listUrl, { waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => {});
+        return campaignSketchId;
+      }
+      attempts.push("name search failed");
+    } catch (e) {
+      attempts.push(e instanceof Error ? e.message : "search failed");
+    }
+  }
+
+  const shot = await savePageScreenshot(page, "dup-fail");
+  const hint = await readAccountHint(page);
+  const total = hint.totalCampaigns;
+  let msg = `Duplicate failed (${attempts.join("; ")}).`;
+  if (total === 0) {
+    msg +=
+      " TikTok shows 0 campaigns — cookies may be wrong account. On ads.tiktok.com check aadvid= in URL matches Advertiser ID, then re-export Cookie-Editor JSON from that page.";
+  } else {
+    msg += " Re-export Cookie-Editor JSON from ads.tiktok.com while logged into the correct account.";
+  }
+  msg += ` Screenshot: ${shot || "n/a"}`;
+  throw new Error(msg);
 }
 
 async function publishDraftsParallel({ advertiserId, cookies, drafts, onProgress }) {
@@ -1138,16 +1319,29 @@ async function duplicateCampaignsCore({
         : "Opening TikTok (dismiss popups, then duplicate)…",
     });
     if (campaignId) {
-      await page.goto(listUrl, { waitUntil: "domcontentloaded", timeout: 60_000 }).catch(() => {});
-      await dismissOverlays(page);
-      if (page.url().includes("/login") || page.url().includes("/passport")) {
-        const shot = await savePageScreenshot(page, "login");
-        return {
-          ok: false,
-          error: "TikTok session expired — re-export Cookie-Editor JSON",
-          screenshot: shot,
-          results: [],
-        };
+      try {
+        const diag = await prepareCampaignListPage(page, listUrl);
+        onProgress?.({
+          phase: "duplicating",
+          done: 0,
+          total: names.length,
+          currentStep:
+            diag.rowKeys > 0
+              ? `List loaded (${diag.rowKeys} campaigns) — duplicating…`
+              : "List empty — trying API + editor duplicate…",
+        });
+      } catch (e) {
+        if (String(e.message) === "LOGIN") {
+          const shot = await savePageScreenshot(page, "login");
+          return {
+            ok: false,
+            error: "TikTok session expired — re-export Cookie-Editor JSON",
+            screenshot: shot,
+            results: [],
+          };
+        }
+        await page.goto(listUrl, { waitUntil: "domcontentloaded", timeout: 60_000 }).catch(() => {});
+        await dismissOverlays(page);
       }
     } else {
       try {

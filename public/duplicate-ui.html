@@ -31,9 +31,14 @@
     <div class="warn" id="versionWarn">Checking VM…</div>
 
     <div class="good">
-      <strong>3 steps — ma kayn search/list</strong><br>
-      ① Cookie-Editor JSON &nbsp; ② Campaign ID <code>1868524813296978</code> &nbsp; ③ Start duplicate<br>
-      Copy 1 = TikTok API capture → copies 2–20 = fast replay (~10 min for 20)
+      <strong>3 steps — b7al adsalim qbel</strong><br>
+      ① Cookies mn <strong>nfs account</strong> li fih campaign (chouf aadvid= f URL)<br>
+      ② Campaign ID <code>1868524813296978</code> &nbsp; ③ Start duplicate
+    </div>
+
+    <div class="warn">
+      Ila "Test cookies" kaygoul Session OK walakin <strong>0 campaigns</strong> — cookies mn account khata2.
+      7ll ads.tiktok.com/i18n/manage/campaign?aadvid=<strong>7483656319267307538</strong> w export cookies mn dik page.
     </div>
 
     <h2>① Cookies (Cookie-Editor JSON)</h2>
@@ -117,8 +122,10 @@
       $("testCookies").disabled = true;
       setLog("Testing session (30s)…");
       try {
-        await api("/test-cookies", { advertiserId: $("advertiserId").value.trim(), cookies: $("cookies").value.trim() });
-        setLog("✓ TikTok session OK — Start duplicate", "ok");
+        const r = await api("/test-cookies", { advertiserId: $("advertiserId").value.trim(), cookies: $("cookies").value.trim() });
+        let msg = "✓ " + (r.message || "TikTok session OK");
+        if (r.warning) msg += "\n⚠ " + r.warning;
+        setLog(msg, r.warning ? "err" : "ok");
       } catch (e) { setLog("✗ " + e.message, "err"); }
       finally { $("testCookies").disabled = false; }
     };
