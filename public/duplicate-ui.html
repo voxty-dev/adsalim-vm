@@ -46,7 +46,7 @@
 
     <div class="row">
       <div>
-        <label>Advertiser ID</label>
+        <label>Advertiser ID (aadvid)</label>
         <input id="advertiserId" placeholder="7559481394611798032" />
       </div>
       <div>
@@ -55,11 +55,15 @@
       </div>
     </div>
 
+    <label>Source campaign name (optional — helps find row)</label>
+    <input id="campaignName" placeholder="PRST TR G1" />
+
     <label>Names (one per line, max 20)</label>
     <textarea id="names" placeholder="Copy 6 of PRST TR G1&#10;Copy 7 of PRST TR G1"></textarea>
 
-    <label>TikTok cookies</label>
-    <textarea id="cookies" placeholder="sessionid_ads=...; csrftoken=..."></textarea>
+    <label>TikTok cookies — from <strong>ads.tiktok.com</strong> only</label>
+    <p style="margin:0 0 8px;font-size:13px">ads.tiktok.com → F12 → Console → paste: <code>copy(document.cookie)</code> → Ctrl+V here</p>
+    <textarea id="cookies" placeholder="sessionid_ads=...; csrftoken=...; ttwid=..."></textarea>
 
     <button id="run">Start duplicate</button>
     <div id="log">Ready.</div>
@@ -101,6 +105,7 @@
       const secret = $("secret").value.trim();
       const advertiserId = $("advertiserId").value.trim();
       const campaignId = $("campaignId").value.trim();
+      const campaignName = $("campaignName").value.trim();
       const cookies = $("cookies").value.trim();
       const names = $("names").value.split("\n").map((s) => s.trim()).filter(Boolean);
       $("log").textContent = "";
@@ -125,7 +130,7 @@
             "Content-Type": "application/json",
             Authorization: `Bearer ${secret}`,
           },
-          body: JSON.stringify({ advertiserId, campaignId, names, cookies }),
+          body: JSON.stringify({ advertiserId, campaignId, campaignName: campaignName || undefined, names, cookies }),
         });
         const startBody = await start.json();
         if (!start.ok) throw new Error(startBody.error || start.statusText);
@@ -141,8 +146,10 @@
           if (!poll.ok) throw new Error(job.error || poll.statusText);
           log(
             `[${job.phase || job.status}] ${job.progress?.done || 0}/${job.progress?.total || names.length}` +
+              (job.currentStep ? `\n  → ${job.currentStep}` : "") +
               (job.published != null ? ` published=${job.published}` : "")
           );
+          if (job.error && job.status === "failed") log(job.error, "err");
           if (job.status === "completed" || job.status === "failed") {
             const ok = (job.results || []).filter((r) => r.ok).length;
             log(`Done: ${ok}/${job.total || names.length} ok`, ok ? "ok" : "err");

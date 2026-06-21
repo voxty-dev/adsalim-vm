@@ -20,7 +20,7 @@ const { chromium } = require("playwright");
 const PORT = process.env.PORT || 3000;
 const SHARED_SECRET = process.env.SHARED_SECRET || "";
 const MAX_CONCURRENT_PUBLISH = Number(process.env.MAX_CONCURRENT_PUBLISH || 8);
-const SERVICE_VERSION = "1.4.2";
+const SERVICE_VERSION = "1.4.3";
 const CORS_ORIGINS = (process.env.CORS_ORIGINS || "https://www.adsalim.com,https://adsalim.com")
   .split(",")
   .map((s) => s.trim())
@@ -396,33 +396,91 @@ async function clickConfirmDialog(page) {
   }).catch(() => false);
 }
 
-async function duplicateDraftOnce(page, listUrl, sourceCampaignId, newName) {
-  const searchInput = page.locator('input[placeholder*="Search" i]').first();
-  await searchInput.waitFor({ state: "visible", timeout: 15_000 }).catch(() => {});
-  await searchInput.fill("").catch(() => {});
-  await searchInput.fill(sourceCampaignId).catch(() => {});
-  await page.keyboard.press("Enter").catch(() => {});
-  await page.waitForTimeout(1500);
+async function savePageScreenshot(page, tag) {
+  try {
+    if (!page || page.isClosed()) return null;
+    const buf = await page.screenshot({ fullPage: false });
+    const id = saveScreenshot(buf);
+    return `/screenshots/${id}?tag=${encodeURIComponent(tag)}`;
+  } catch {
+    return null;
+  }
+}
 
-  const rowSelector = `[data-row-key="${sourceCampaignId}"], [data-id="${sourceCampaignId}"]`;
-  const row = page.locator(rowSelector).first();
-  await row.waitFor({ state: "visible", timeout: 15_000 });
+async function fillCampaignSearch(page, query) {
+  const searchInput = page.locator(
+    'input[placeholder*="Search" i], input[aria-label*="Search" i], input[type="search"]'
+  ).first();
+  await searchInput.waitFor({ state: "visible", timeout: 20_000 });
+  await searchInput.fill("");
+  await searchInput.fill(String(query));
+  await page.keyboard.press("Enter").catch(() => {});
+  await page.waitForTimeout(2000);
+}
+
+async function locateSourceCampaignRow(page, sourceCampaignId, sourceCampaignName) {
+  const id = String(sourceCampaignId);
+  const rowSelector = `[data-row-key="${id}"], [data-id="${id}"]`;
+  let row = page.locator(rowSelector).first();
+  if (await row.isVisible().catch(() => false)) return row;
+
+  await fillCampaignSearch(page, id);
+  row = page.locator(rowSelector).first();
+  if (await row.isVisible().catch(() => false)) return row;
+
+  if (sourceCampaignName) {
+    await fillCampaignSearch(page, sourceCampaignName);
+    row = page.locator(rowSelector).first();
+    if (await row.isVisible().catch(() => false)) return row;
+    row = page.locator("tr, [class*='row' i], [role='row']").filter({
+      hasText: String(sourceCampaignName),
+    }).first();
+    if (await row.isVisible().catch(() => false)) return row;
+  }
+
+  throw new Error(
+    `Campaign row not found for id=${id}` +
+      (sourceCampaignName ? ` name="${sourceCampaignName}"` : "") +
+      ". Check campaign ID in TikTok URL (data-row-key)."
+  );
+}
+
+async function duplicateDraftOnce(page, listUrl, sourceCampaignId, newName, sourceCampaignName) {
+  const row = await locateSourceCampaignRow(page, sourceCampaignId, sourceCampaignName);
+  await row.scrollIntoViewIfNeeded().catch(() => {});
   await row.hover().catch(() => {});
 
-  const dupClicked = await page.evaluate((id) => {
-    const sel = `[data-row-key="${id}"], [data-id="${id}"]`;
-    const r = document.querySelector(sel);
-    if (!r) return false;
-    for (const el of Array.from(r.querySelectorAll("button, a, [role='button']"))) {
+  const dupClicked = await row.evaluate((r) => {
+    for (const el of Array.from(r.querySelectorAll("button, a, [role='button'], span"))) {
       const t = (el.innerText || el.textContent || "").trim().toLowerCase();
-      if (/duplicate|copy/.test(t)) {
+      if (/^duplicate$|^copy$|duplicate campaign/.test(t)) {
         el.click();
         return true;
       }
     }
+    const menuBtn = r.querySelector('[class*="more" i], [aria-label*="more" i]');
+    if (menuBtn) {
+      menuBtn.click();
+      return "menu";
+    }
     return false;
-  }, sourceCampaignId);
-  if (!dupClicked) throw new Error("Duplicate button not found on source row");
+  });
+  if (dupClicked === "menu") {
+    await page.waitForTimeout(500);
+    const fromMenu = await page.evaluate(() => {
+      for (const el of Array.from(document.querySelectorAll("button, [role='menuitem'], li, span"))) {
+        const t = (el.innerText || el.textContent || "").trim().toLowerCase();
+        if (/duplicate/.test(t)) {
+          el.click();
+          return true;
+        }
+      }
+      return false;
+    });
+    if (!fromMenu) throw new Error("Duplicate not found in row menu");
+  } else if (!dupClicked) {
+    throw new Error("Duplicate button not found on source row");
+  }
 
   const nameInput = page.locator('input[placeholder*="name" i], input[placeholder*="Name"]').first();
   await nameInput.waitFor({ state: "visible", timeout: 15_000 });
@@ -491,7 +549,21 @@ async function publishDraftsParallel({ advertiserId, cookies, drafts, onProgress
   return { ok: okCount > 0, published: okCount, total: results.length, results };
 }
 
-async function duplicateCampaignsCore({ advertiserId, campaignId, names, cookies, onProgress }) {
+async function duplicateCampaignsCore({
+  advertiserId,
+  campaignId,
+  campaignName,
+  names,
+  cookies,
+  onProgress,
+}) {
+  onProgress?.({
+    phase: "duplicating",
+    done: 0,
+    total: names.length,
+    currentStep: "Launching browser…",
+  });
+
   const browser = await getSharedBrowser();
   const context = await createTikTokContext(browser, cookies);
   const page = await context.newPage();
@@ -499,27 +571,60 @@ async function duplicateCampaignsCore({ advertiserId, campaignId, names, cookies
 
   const draftResults = [];
   try {
-    await page.goto(listUrl, { waitUntil: "domcontentloaded", timeout: 45_000 });
+    onProgress?.({
+      phase: "duplicating",
+      done: 0,
+      total: names.length,
+      currentStep: "Loading TikTok campaign list…",
+    });
+    await page.goto(listUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
     if (page.url().includes("/login") || page.url().includes("/passport")) {
-      return { ok: false, error: "TikTok session expired. Re-paste cookies.", results: [] };
+      const shot = await savePageScreenshot(page, "login");
+      return {
+        ok: false,
+        error: "TikTok session expired. Re-paste cookies from ads.tiktok.com (F12 → copy(document.cookie)).",
+        screenshot: shot,
+        results: [],
+      };
     }
-    await page.waitForSelector('button, [role="button"], input', { timeout: 15_000 }).catch(() => {});
+    await page.waitForSelector('button, [role="button"], input', { timeout: 20_000 }).catch(() => {});
 
     for (let i = 0; i < names.length; i++) {
       const name = names[i];
+      onProgress?.({
+        phase: "duplicating",
+        done: i,
+        total: names.length,
+        currentStep: `Duplicating "${name}" (${i + 1}/${names.length})…`,
+        draftResults,
+      });
       try {
-        const campaignSketchId = await duplicateDraftOnce(page, listUrl, campaignId, name);
+        const campaignSketchId = await duplicateDraftOnce(
+          page,
+          listUrl,
+          campaignId,
+          name,
+          campaignName
+        );
         draftResults.push({ name, ok: true, campaignSketchId });
       } catch (e) {
+        const shot = await savePageScreenshot(page, `dup-fail-${i + 1}`);
         draftResults.push({
           name,
           ok: false,
           error: e instanceof Error ? e.message : "unknown error",
+          screenshot: shot,
         });
         await page.goto(listUrl, { waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => {});
         await page.waitForTimeout(800);
       }
-      onProgress?.({ phase: "duplicating", done: i + 1, total: names.length, draftResults });
+      onProgress?.({
+        phase: "duplicating",
+        done: i + 1,
+        total: names.length,
+        currentStep: draftResults.at(-1)?.ok ? `Created draft for "${name}"` : `Failed "${name}"`,
+        draftResults,
+      });
     }
   } finally {
     await context.close().catch(() => {});
@@ -690,14 +795,30 @@ app.get("/screenshots/:id", (req, res) => {
 });
 
 function validateDuplicateBody(body) {
-  const { advertiserId, campaignId, names, cookies } = body || {};
+  const { advertiserId, campaignId, campaignName, names, cookies } = body || {};
   if (!advertiserId || !campaignId || !Array.isArray(names) || names.length === 0 || !cookies) {
     return { error: "advertiserId, campaignId, names[], cookies required" };
   }
   if (names.length > 20) {
     return { error: "Max 20 copies per request" };
   }
-  return { advertiserId, campaignId, names, cookies };
+  const cookieErr = validateCookies(cookies);
+  if (cookieErr) return { error: cookieErr };
+  return { advertiserId, campaignId, campaignName, names, cookies };
+}
+
+function validateCookies(raw) {
+  const trimmed = String(raw).trim();
+  if (!trimmed) return "Cookies empty";
+  const parsed = parseCookies(trimmed);
+  if (parsed.length === 0) {
+    return 'Cookies not parsed. On ads.tiktok.com run: copy(document.cookie) — must include sessionid_ads=';
+  }
+  const hasSession = parsed.some((c) => /sessionid/i.test(c.name));
+  if (!hasSession) {
+    return "Missing sessionid_ads — copy cookies from ads.tiktok.com while logged in (not adsalim.com)";
+  }
+  return null;
 }
 
 function newDuplicateJobId() {
@@ -732,6 +853,7 @@ function startDuplicateJob(params) {
         ...current,
         phase: progress.phase,
         progress: { done: progress.done, total: progress.total },
+        currentStep: progress.currentStep || current.currentStep,
         results: progress.draftResults || current.results,
       });
     },
@@ -887,7 +1009,9 @@ app.post("/publish-batch", async (req, res) => {
 });
 
 function parseCookies(raw) {
-  const trimmed = String(raw).trim();
+  let trimmed = String(raw).trim();
+  // Strip accidental "Cookie:" prefix or quotes
+  trimmed = trimmed.replace(/^cookie:\s*/i, "").replace(/^["']|["']$/g, "");
   if (trimmed.startsWith("[")) {
     try {
       const arr = JSON.parse(trimmed);
