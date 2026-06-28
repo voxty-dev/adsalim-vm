@@ -421,7 +421,8 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
       for (const c of closes) {
         try { c.click(); } catch {}
       }
-      // 2) "Got It" / "Got it" buttons.
+      // 2) "Got It" / "Got it" buttons (scans every button — covers both
+      //    the announcement modal and inline "Choose your X" tooltips).
       const btns = Array.from(document.querySelectorAll("button"));
       for (const b of btns) {
         const t = (b.innerText || "").trim();
@@ -429,6 +430,45 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
       }
     }).catch(() => {});
     await page.keyboard.press("Escape").catch(() => {});
+  }
+
+  // Find a labelled toggle (e.g. "Catalog campaign") and force it to OFF.
+  // TikTok toggles are <button role="switch" aria-checked="true|false">.
+  async function setToggleOff(page, labelRe) {
+    return await page.evaluate((rs) => {
+      const re = new RegExp(rs);
+      // Find label/text node matching labelRe.
+      const all = Array.from(document.querySelectorAll("label, div, span, p"));
+      let label = null;
+      for (const el of all) {
+        if (el.children.length > 2) continue;
+        const t = (el.innerText || el.textContent || "").trim();
+        if (re.test(t) && t.length < 60) { label = el; break; }
+      }
+      if (!label) return { found: false };
+      // Walk ancestors looking for a sibling toggle.
+      let cursor = label;
+      for (let i = 0; i < 6 && cursor; i++) {
+        const parent = cursor.parentElement;
+        if (!parent) break;
+        const toggle = parent.querySelector(
+          '[role="switch"], button[role="checkbox"], [class*="switch" i]:not([class*="switcher" i])',
+        );
+        if (toggle) {
+          const checked =
+            toggle.getAttribute("aria-checked") === "true" ||
+            /(?:^|\s)(?:checked|active|on|open)(?:\s|$|--)/i.test(toggle.className || "");
+          if (checked) {
+            toggle.scrollIntoView({ block: "center" });
+            toggle.click();
+            return { found: true, wasOn: true };
+          }
+          return { found: true, wasOn: false };
+        }
+        cursor = parent;
+      }
+      return { found: false };
+    }, labelRe.source);
   }
 
   let browser;
@@ -577,15 +617,30 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
     await page.waitForTimeout(500);
     await shot(page, "04-after-name");
 
-    // 7. Click "Continue" at the bottom of the page to advance to the
-    //    ad-group step. The button is sticky-positioned, so a regular
-    //    click should work once it's visible — scroll first just in case.
+    // 7. Force "Catalog campaign" toggle OFF — TikTok turns it on by
+    //    default on some accounts when Sales→Website is selected, but
+    //    a catalog campaign needs a catalog feed configured, which we
+    //    don't have. Continue stays disabled until the toggle is off.
+    const catalogOff = await setToggleOff(page, /^\s*Catalog\s*campaign\s*$/i);
+    await page.waitForTimeout(500);
+
+    // 8. Dismiss any inline tooltip popups (e.g. "Choose your budget
+    //    strategy") that block the Continue button.
+    await dismissModals(page);
+    await page.waitForTimeout(300);
+
+    // 9. Click "Continue" at the bottom of the page to advance to the
+    //    ad-group step. The button is sticky-positioned — scroll first.
     await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
     await page.waitForTimeout(400);
+    await dismissModals(page);
     const continueClicked = await clickByText(page, /^\s*continue\s*$/i, "continue");
-    await page.waitForTimeout(2000);
+    await page.waitForTimeout(2500);
     await dismissModals(page);
     await shot(page, "05-after-continue");
+    // Carry the catalog result forward for the response so we can see
+    // whether the toggle was actually found + turned off.
+    void catalogOff;
 
     // 8. (Next pass: fill ad-group targeting + budget + pixel +
     //    optimization event, then Continue again into the ad step.
@@ -602,6 +657,7 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
       objectiveClicked: objClicked,
       destinationClicked: destClicked,
       nameFilled,
+      catalogOff,
       continueClicked,
       adgroupBudgetUSD,
       bodyExcerpt,
