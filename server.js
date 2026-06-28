@@ -516,20 +516,58 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
     await dismissModals(page);
     await shot(page, "03-after-destination");
 
-    // 6. Fill campaign name if a Campaign-name input is rendered.
+    // 6. Fill campaign name. The input is below the fold and TikTok
+    //    pre-fills it with an auto-generated name ("Sales20260629…"),
+    //    so we scroll into view, clear, then type. The label "Campaign
+    //    name" is a sibling div, not a <label for=…>, so we look at
+    //    nearby text instead of using closest('label').
     const nameFilled = await page.evaluate((name) => {
-      const inputs = Array.from(document.querySelectorAll('input[type="text"], input:not([type])'));
+      const inputs = Array.from(document.querySelectorAll(
+        'input[type="text"], input:not([type])',
+      )).filter(inp => {
+        const r = inp.getBoundingClientRect();
+        const style = window.getComputedStyle(inp);
+        return r.height > 0 && style.display !== "none" && style.visibility !== "hidden";
+      });
+
+      function nearbyText(inp) {
+        // Walk up to 6 ancestors looking at siblings for "Campaign name".
+        let cursor = inp;
+        for (let i = 0; i < 6 && cursor; i++) {
+          const parent = cursor.parentElement;
+          if (!parent) break;
+          for (const sib of parent.children) {
+            if (sib === cursor) continue;
+            const t = (sib.innerText || sib.textContent || "").trim();
+            if (!t || t.length > 60) continue;
+            if (/^campaign\s*name$/i.test(t) || /^name$/i.test(t)) return true;
+          }
+          cursor = parent;
+        }
+        return false;
+      }
+
       for (const inp of inputs) {
         const placeholder = (inp.getAttribute("placeholder") || "").toLowerCase();
         const ariaLabel = (inp.getAttribute("aria-label") || "").toLowerCase();
-        const labelEl = inp.closest("label")?.textContent?.toLowerCase() || "";
-        const hit = /campaign\s*name|^name$/i.test(placeholder + " " + ariaLabel + " " + labelEl);
-        if (hit) {
+        const hitAttr = /campaign\s*name|^name$/.test(placeholder + " " + ariaLabel);
+        // TikTok seeds the input with "Sales20260629…" etc. — recognise that
+        // as the campaign-name input even if no label/aria text is present.
+        const hitSeed = /^Sales\d{6,}|^Conversions?\d{6,}|^Traffic\d{6,}|^Reach\d{6,}/.test(inp.value || "");
+        if (hitAttr || hitSeed || nearbyText(inp)) {
+          inp.scrollIntoView({ block: "center" });
+          inp.focus();
+          // Select-all + clear, then type the new value via the native setter
+          // so React's controlled-input value tracker actually updates.
+          inp.select();
           const proto = window.HTMLInputElement.prototype;
           const setter = Object.getOwnPropertyDescriptor(proto, "value").set;
+          setter.call(inp, "");
+          inp.dispatchEvent(new Event("input", { bubbles: true }));
           setter.call(inp, name);
           inp.dispatchEvent(new Event("input", { bubbles: true }));
           inp.dispatchEvent(new Event("change", { bubbles: true }));
+          inp.dispatchEvent(new Event("blur", { bubbles: true }));
           return true;
         }
       }
@@ -539,10 +577,20 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
     await page.waitForTimeout(500);
     await shot(page, "04-after-name");
 
-    // 7. (Future steps go here: budget, continue → adgroup, targeting,
-    //    pixel, creatives, submit. For this MVP we stop here and let
-    //    the user inspect screenshots so we know which selectors actually
-    //    exist on TikTok's current UI.)
+    // 7. Click "Continue" at the bottom of the page to advance to the
+    //    ad-group step. The button is sticky-positioned, so a regular
+    //    click should work once it's visible — scroll first just in case.
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+    await page.waitForTimeout(400);
+    const continueClicked = await clickByText(page, /^\s*continue\s*$/i, "continue");
+    await page.waitForTimeout(2000);
+    await dismissModals(page);
+    await shot(page, "05-after-continue");
+
+    // 8. (Next pass: fill ad-group targeting + budget + pixel +
+    //    optimization event, then Continue again into the ad step.
+    //    For now we stop here so the next debug round can see what
+    //    the ad-group page looks like.)
 
     const bodyExcerpt = await page.evaluate(() => (document.body.innerText || "").slice(0, 1500));
     const finalUrl = page.url();
@@ -554,6 +602,7 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
       objectiveClicked: objClicked,
       destinationClicked: destClicked,
       nameFilled,
+      continueClicked,
       adgroupBudgetUSD,
       bodyExcerpt,
       screenshots: shots,
