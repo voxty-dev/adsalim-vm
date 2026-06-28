@@ -345,20 +345,26 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
     } catch {}
   }
 
-  // Click any clickable element whose visible text matches `re`.
+  // Click any clickable element whose visible text matches `re`. Casts a
+  // wide net — TikTok renders objectives as radio rows (label + icon),
+  // destinations as cards, and onboarding actions as plain divs, so we
+  // include label/li/div/span etc. instead of just buttons.
   async function clickByText(page, re, label) {
     const clicked = await page.evaluate((rs) => {
       const re = new RegExp(rs);
       const all = Array.from(document.querySelectorAll(
-        'button, [role="button"], a, [class*="btn" i], [class*="button" i], [class*="card" i]',
+        'button, [role="button"], a, label, li, [role="radio"], [class*="btn" i], [class*="button" i], [class*="card" i], [class*="option" i], [class*="row" i], div, span',
       ));
       for (const el of all) {
+        if (el.children.length > 6) continue; // skip large containers
         const text = (el.innerText || el.textContent || "").trim();
-        if (!text || text.length > 80) continue;
+        if (!text || text.length > 120) continue;
         if (!re.test(text)) continue;
         if (el.disabled) continue;
         const style = window.getComputedStyle(el);
-        if (style.display === "none" || style.visibility === "hidden") continue;
+        if (style.display === "none" || style.visibility === "hidden" || style.pointerEvents === "none") continue;
+        const r = el.getBoundingClientRect();
+        if (r.width === 0 || r.height === 0) continue;
         el.scrollIntoView({ block: "center" });
         (el).click();
         return text;
@@ -367,6 +373,28 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
     }, re.source);
     if (!clicked) console.warn(`[create-campaign] could not click "${label}" via ${re}`);
     return clicked;
+  }
+
+  // Dismiss any onboarding / announcement modal blocking the page.
+  // Tries (in order): the modal's top-right close button, "Got It",
+  // "Got it", and falls back to ESC.
+  async function dismissModals(page) {
+    await page.evaluate(() => {
+      // 1) Close icons inside dialogs.
+      const closes = Array.from(document.querySelectorAll(
+        '[role="dialog"] [aria-label*="close" i], [role="dialog"] [class*="close" i], [class*="modal" i] [aria-label*="close" i]',
+      ));
+      for (const c of closes) {
+        try { c.click(); } catch {}
+      }
+      // 2) "Got It" / "Got it" buttons.
+      const btns = Array.from(document.querySelectorAll("button"));
+      for (const b of btns) {
+        const t = (b.innerText || "").trim();
+        if (/^got\s*it$/i.test(t)) { try { b.click(); } catch {} }
+      }
+    }).catch(() => {});
+    await page.keyboard.press("Escape").catch(() => {});
   }
 
   let browser;
@@ -420,14 +448,22 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
 
     await shot(page, "01-initial");
 
-    // 3. Dismiss any "Got it" / coachmarks.
-    await page.evaluate(() => {
-      const gotIt = Array.from(document.querySelectorAll("button"))
-        .filter(b => /^got it$/i.test((b.innerText || "").trim()));
-      for (const b of gotIt) b.click();
-    }).catch(() => {});
+    // 3. Dismiss the "Find your tools in a new place" / coachmark modals.
+    //    They render late, so loop a few times until either no modal
+    //    remains or we run out of attempts.
+    for (let i = 0; i < 4; i++) {
+      await dismissModals(page);
+      await page.waitForTimeout(400);
+      const stillBlocked = await page.evaluate(() =>
+        !!document.querySelector('[role="dialog"]:not([aria-hidden="true"])'),
+      ).catch(() => false);
+      if (!stillBlocked) break;
+    }
+    await shot(page, "01b-after-modal-dismiss");
 
-    // 4. Pick objective (default Sales).
+    // 4. Pick objective (default Sales). The objective rows are radio
+    //    inputs labeled by adjacent text — clickByText now searches
+    //    label/div/span as well as buttons, so the label text is enough.
     const objectiveLabel = objective === "TRAFFIC" ? "Traffic"
       : objective === "REACH" ? "Reach"
       : "Sales";
