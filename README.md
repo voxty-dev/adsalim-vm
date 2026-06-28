@@ -65,48 +65,12 @@ Body:
 Response:
 ```json
 {
-  "ok": true,
-  "duplicated": 20,
-  "published": 18,
-  "total": 20,
   "results": [
     { "name": "Copy 1 of PRST TR G6", "ok": true, "newCampaignId": "1866..." },
     { "name": "Copy 2 of PRST TR G6", "ok": false, "error": "..." }
   ]
 }
 ```
-
-Flow: duplicate all drafts in one browser session, then publish in parallel (up to 8 at once).
-
-### `POST /duplicate/async` (recommended for 20 copies)
-
-Same body as `/duplicate`. Returns immediately with a job id so Vercel/adsalim does not time out:
-
-```json
-{ "jobId": "dup-171...", "status": "running", "pollUrl": "/duplicate/jobs/dup-171..." }
-```
-
-Poll `GET /duplicate/jobs/:jobId` until `status` is `completed` or `failed`. Progress fields: `phase` (`duplicating` | `publishing`), `progress.done`, `progress.total`.
-
-**adsalim Browser (Smart+) mode should call this instead of replaying duplicate on Vercel.**
-
-### `GET /duplicate/inject`
-
-One-time browser fix for adsalim.com (when duplicate stops at ~4–5):
-
-1. Open `https://<your-vm-url>/duplicate/inject`
-2. Copy the script → paste in adsalim.com DevTools console
-3. Duplicate 10x/20x as normal — requests go to VM async, not Vercel
-
-Requires CORS (`CORS_ORIGINS` defaults to `https://www.adsalim.com`).
-
-Browser tool to run 6–20 copies directly on the VM (bypasses adsalim.com timeout). Open:
-
-`https://<your-vm-url>/duplicate/ui`
-
-Paste `SHARED_SECRET`, advertiser/campaign IDs, names, and cookies. Uses `/duplicate/async` with live polling.
-
-**Why adsalim stops at ~5:** Vercel serverless times out after ~5 serial duplicate+publish cycles. The UI error `Unexpected token 'A'` is Vercel returning `"An error occurred..."` instead of JSON.
 
 ## When selectors break
 

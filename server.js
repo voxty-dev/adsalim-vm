@@ -1,1748 +1,61 @@
 /**
  * adsalim-vm-service
  *
- * Duplicates and publishes TikTok Smart+ campaigns via Playwright.
- * adsalim should call POST /duplicate/async (not Vercel cURL) for 20 copies.
+ * HTTP wrapper around Playwright. Exposes one endpoint, /publish-draft,
+ * that takes a TikTok draft (sketch) ID and clicks "Publish all" in
+ * the real campaign editor. We can't do that from a serverless function
+ * because TikTok's anti-bot rejects HTTP replays of the publish call
+ * (X-Bogus signatures must come from a real browser context).
  *
- * Endpoints:
- *   POST /duplicate         — sync duplicate + publish (slow for 20; may timeout proxies)
- *   POST /duplicate/async   — start job, returns jobId immediately
- *   GET  /duplicate/jobs/:id — poll job progress/results
- *   POST /publish-draft     — single draft
- *   POST /publish-batch     — up to 20 drafts in parallel
- *   GET  /screenshots/:id
+ * The DUPLICATE step happens in adsalim itself via cURL replay (works
+ * reliably). The VM is only used for the publish step.
+ *
+ * Endpoint:
+ *   POST /publish-draft
+ *   Auth: Authorization: Bearer <SHARED_SECRET>
+ *   Body: {
+ *     advertiserId: string,
+ *     campaignSketchId: string,  // returned by the duplicate step
+ *     cookies: string,           // TikTok session
+ *   }
+ *   Returns: { ok: boolean, newCampaignId?: string, error?: string }
  */
 
 const express = require("express");
-const path = require("path");
 const { chromium } = require("playwright");
 
 const PORT = process.env.PORT || 3000;
 const SHARED_SECRET = process.env.SHARED_SECRET || "";
-const MAX_CONCURRENT_PUBLISH = Number(process.env.MAX_CONCURRENT_PUBLISH || 8);
-const SERVICE_VERSION = "1.8.0";
-const HEADLESS = process.env.HEADLESS !== "false";
-
-function detectTikTokBlocker(bodyText) {
-  const t = String(bodyText || "");
-  if (/log in|sign in|passport/i.test(t) && !/campaign|dashboard/i.test(t)) {
-    return "TikTok login page — cookies expired, re-export JSON";
-  }
-  return null;
-}
-const CORS_ORIGINS = (process.env.CORS_ORIGINS || "https://www.adsalim.com,https://adsalim.com")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
-const MAX_DUPLICATE_JOBS = 30;
-
-const BROWSER_ARGS = [
-  "--no-sandbox",
-  "--disable-blink-features=AutomationControlled",
-  "--disable-dev-shm-usage",
-];
-
-const USER_AGENT =
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " +
-  "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
 const app = express();
-
-app.use((req, res, next) => {
-  const origin = req.headers.origin;
-  if (origin && CORS_ORIGINS.includes(origin)) {
-    res.setHeader("Access-Control-Allow-Origin", origin);
-    res.setHeader("Vary", "Origin");
-    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  }
-  if (req.method === "OPTIONS") return res.sendStatus(204);
-  next();
-});
-
-app.use(express.json({ limit: "10mb" }));
-app.use(express.static(path.join(__dirname, "public")));
+app.use(express.json({ limit: "5mb" }));
 
 app.get("/", (_req, res) => {
   res.json({
     service: "adsalim-vm-service",
     status: "ok",
-    version: SERVICE_VERSION,
-    maxConcurrentPublish: MAX_CONCURRENT_PUBLISH,
     endpoints: [
-      "/test-cookies",
-      "/duplicate/inject",
-      "/adsalim-bridge.user.js",
-      "/duplicate/ui",
-      "/duplicate",
-      "/duplicate/async",
-      "/duplicate/jobs/:id",
       "/publish-draft",
-      "/publish-batch",
+      "/create-smart-plus-campaign",
       "/screenshots/:id",
     ],
   });
 });
 
-function buildEditorUrl(advertiserId, campaignSketchId) {
-  return (
-    `https://ads.tiktok.com/i18n/creation/1nn/create/campaign?aadvid=${encodeURIComponent(advertiserId)}` +
-    `&source=campaign_list` +
-    `&campaign_draft_id=${encodeURIComponent(campaignSketchId)}` +
-    `&creation_type=create_new` +
-    `&objective_type=3` +
-    `&temp_campaign_id=${encodeURIComponent(campaignSketchId)}`
-  );
-}
-
+// In-memory screenshot store (last 20). Each /publish-draft failure
+// saves a screenshot of the page state and surfaces a URL in the error.
 const screenshots = new Map();
-const duplicateJobs = new Map();
 let screenshotCounter = 0;
-let activePublishJobs = 0;
-const publishWaiters = [];
-let sharedBrowserPromise = null;
-
-function acquirePublishSlot() {
-  if (activePublishJobs < MAX_CONCURRENT_PUBLISH) {
-    activePublishJobs++;
-    return Promise.resolve();
-  }
-  return new Promise((resolve) => publishWaiters.push(resolve));
-}
-
-function releasePublishSlot() {
-  activePublishJobs--;
-  const next = publishWaiters.shift();
-  if (next) {
-    activePublishJobs++;
-    next();
-  }
-}
-
-async function getSharedBrowser() {
-  if (sharedBrowserPromise) {
-    try {
-      const browser = await sharedBrowserPromise;
-      if (!browser.isConnected()) {
-        sharedBrowserPromise = null;
-      } else {
-        return browser;
-      }
-    } catch {
-      sharedBrowserPromise = null;
-    }
-  }
-  sharedBrowserPromise = chromium.launch({
-    headless: HEADLESS,
-    args: BROWSER_ARGS,
-  }).catch((err) => {
-    sharedBrowserPromise = null;
-    throw err;
-  });
-  return sharedBrowserPromise;
-}
-
-async function resetSharedBrowser() {
-  if (sharedBrowserPromise) {
-    try {
-      const b = await sharedBrowserPromise;
-      await b.close().catch(() => {});
-    } catch {
-      /* ignore */
-    }
-    sharedBrowserPromise = null;
-  }
-}
-
-async function verifyTikTokSession({ advertiserId, cookies }) {
-  const cookieErr = validateCookies(cookies);
-  if (cookieErr) return { ok: false, error: cookieErr };
-
-  let context;
-  try {
-    const browser = await getSharedBrowser();
-    context = await createTikTokContext(browser, cookies);
-    const page = await context.newPage();
-    const url = `https://ads.tiktok.com/i18n/manage/campaign?aadvid=${encodeURIComponent(advertiserId || "")}`;
-    const diag = await prepareCampaignListPage(page, url);
-    if (page.url().includes("/login") || page.url().includes("/passport")) {
-      return { ok: false, error: "Login page — sessionid_ads expired, re-copy JSON cookies" };
-    }
-    const hint = await readAccountHint(page);
-    const apiList = await fetchCampaignListViaApi(page, advertiserId || "");
-    const cookieDiag = diagnoseCookies(cookies);
-    const zeroCampaigns =
-      apiList.count === 0 && (hint.totalCampaigns === 0 || (diag.rowKeys === 0 && diag.tableRows <= 1));
-    return {
-      ok: !zeroCampaigns || diag.rowKeys > 0,
-      message:
-        apiList.count > 0
-          ? `TikTok OK — API sees ${apiList.count} campaigns`
-          : diag.rowKeys > 0
-            ? `TikTok OK — ${diag.rowKeys} campaigns visible`
-            : `Session OK but API sees 0 campaigns (${cookieDiag.count} cookies pasted)`,
-      url: diag.url,
-      rowKeys: diag.rowKeys,
-      apiCampaignCount: apiList.count,
-      totalCampaigns: hint.totalCampaigns,
-      cookieCount: cookieDiag.count,
-      missingCookies: cookieDiag.missingRequired,
-      apiError: apiList.lastApiError || null,
-      recommendation: zeroCampaigns
-        ? "Use adsalim.com b7al qbel — Tampermonkey bridge at /duplicate/inject (adsalim sends full cookies automatically)"
-        : null,
-      warning: zeroCampaigns
-        ? cookieDiag.missingRequired.length
-          ? `Missing cookies: ${cookieDiag.missingRequired.join(", ")}. Or use adsalim.com instead of manual paste.`
-          : `Only ${cookieDiag.count} cookies — need 12+. adsalim.com has full session.`
-        : null,
-    };
-  } catch (err) {
-    await resetSharedBrowser();
-    if (String(err.message) === "LOGIN") {
-      return { ok: false, error: "Login page — sessionid_ads expired, re-copy from Application tab" };
-    }
-    return { ok: false, error: err instanceof Error ? err.message : "Session check failed" };
-  } finally {
-    await context?.close().catch(() => {});
-  }
-}
-
-async function createTikTokContext(browser, cookies) {
-  const parsed = parseCookies(cookies);
-  if (parsed.length === 0) throw new Error("No usable cookies parsed");
-
-  const isJsonExport = String(cookies).trim().startsWith("[");
-  let toAdd = isJsonExport ? parsed : parsed;
-  if (!isJsonExport) {
-    toAdd = parsed.flatMap((c) => [
-      { ...c, domain: ".tiktok.com", path: c.path || "/" },
-      { ...c, domain: "ads.tiktok.com", path: c.path || "/" },
-    ]);
-  } else {
-    const expanded = [];
-    const seen = new Set();
-    for (const c of parsed) {
-      const bases = [
-        c.domain || ".tiktok.com",
-        ".tiktok.com",
-        "ads.tiktok.com",
-        "business.tiktok.com",
-      ];
-      for (const domain of bases) {
-        const key = `${c.name}|${domain}|${c.path || "/"}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        expanded.push({ ...c, domain, path: c.path || "/" });
-      }
-    }
-    toAdd = expanded;
-  }
-
-  const context = await browser.newContext({
-    userAgent: USER_AGENT,
-    viewport: { width: 1440, height: 900 },
-    locale: "en-US",
-    timezoneId: "Europe/Madrid",
-    extraHTTPHeaders: {
-      "Accept-Language": "en-US,en;q=0.9",
-    },
-  });
-  await context.addInitScript(() => {
-    Object.defineProperty(navigator, "webdriver", { get: () => undefined });
-    Object.defineProperty(navigator, "plugins", { get: () => [1, 2, 3, 4, 5] });
-    Object.defineProperty(navigator, "languages", { get: () => ["en-US", "en"] });
-    window.chrome = window.chrome || { runtime: {} };
-  });
-  await context.addCookies(toAdd);
-  return context;
-}
-
-async function dismissOverlays(page) {
-  for (let round = 0; round < 8; round++) {
-    const clicked = await page
-      .evaluate(() => {
-        let n = 0;
-        const click = (el) => {
-          if (!el || el.disabled) return;
-          try {
-            el.click();
-            n++;
-          } catch {
-            /* ignore */
-          }
-        };
-
-        for (const btn of document.querySelectorAll("button, [role='button']")) {
-          const t = (btn.innerText || btn.textContent || "").trim();
-          if (/^got it$/i.test(t)) click(btn);
-        }
-
-        for (const el of document.querySelectorAll(
-          '[aria-label="Close"], [aria-label="close"], [class*="close" i] button, button[class*="close" i], [class*="modal" i] [class*="close" i]'
-        )) {
-          click(el);
-        }
-
-        const ok = (t) =>
-          /^(ok|close|skip|later|not now|später|abbrechen|cancel|dismiss|×|✕|i understand|confirm|maybe later|no thanks)$/i.test(
-            t.trim()
-          );
-        for (const el of Array.from(
-          document.querySelectorAll('button, [role="button"], a, span, [class*="close" i]')
-        )) {
-          const t = (el.innerText || el.textContent || "").trim();
-          if (ok(t)) click(el);
-        }
-        return n;
-      })
-      .catch(() => 0);
-    if (!clicked) break;
-    await page.waitForTimeout(700);
-  }
-}
-
-async function readAccountHint(page) {
-  return page
-    .evaluate(() => {
-      const body = (document.body?.innerText || "").replace(/\s+/g, " ");
-      const totalMatch = body.match(/Total of (\d+) campaigns?/i);
-      const account =
-        document.querySelector('[class*="account" i], [class*="Account" i]')?.innerText?.trim().slice(0, 40) ||
-        "";
-      return {
-        totalCampaigns: totalMatch ? Number(totalMatch[1]) : null,
-        accountHint: account,
-        url: location.href,
-      };
-    })
-    .catch(() => ({}));
-}
-
-async function readPageDiagnostics(page) {
-  return page.evaluate(() => ({
-    url: location.href,
-    title: document.title,
-    rowKeys: document.querySelectorAll("[data-row-key]").length,
-    tableRows: document.querySelectorAll("table tbody tr").length,
-    bodyStart: (document.body?.innerText || "").replace(/\s+/g, " ").slice(0, 350),
-  }));
-}
-
-async function prepareCampaignListPage(page, listUrl) {
-  await page.goto("https://ads.tiktok.com/", {
-    waitUntil: "domcontentloaded",
-    timeout: 45_000,
-  }).catch(() => {});
-  await page.waitForTimeout(1200);
-
-  await page.goto(listUrl, { waitUntil: "domcontentloaded", timeout: 90_000 });
-  await page.waitForTimeout(2000);
-
-  if (page.url().includes("/login") || page.url().includes("/passport")) {
-    throw new Error("LOGIN");
-  }
-
-  for (let attempt = 0; attempt < 25; attempt++) {
-    await dismissOverlays(page);
-    const diag = await readPageDiagnostics(page);
-    const blocker = detectTikTokBlocker(diag.bodyStart);
-    if (blocker) throw new Error(blocker);
-    if (diag.rowKeys > 0 || diag.tableRows > 1) return diag;
-
-    await page.evaluate(() => {
-      window.scrollTo(0, document.body.scrollHeight);
-      window.scrollTo(0, 0);
-    });
-    await page.waitForTimeout(2500);
-
-    const tabClicked = await page.evaluate(() => {
-      for (const el of Array.from(document.querySelectorAll("button, a, [role='tab'], div, span"))) {
-        const t = (el.innerText || el.textContent || "").trim().toLowerCase();
-        if (t === "campaign" || t === "campaigns" || t.startsWith("campaigns ")) {
-          el.click();
-          return true;
-        }
-      }
-      return false;
-    });
-    if (tabClicked) await page.waitForTimeout(2000);
-  }
-
-  return readPageDiagnostics(page);
-}
-
-function publishAllSelector() {
-  return 'button, [role="button"], a, div, span, [class*="btn" i], [class*="button" i]';
-}
-
-async function isPublishAllVisible(page) {
-  if (page.isClosed()) return false;
-  return page.evaluate((sel) => {
-    return Array.from(document.querySelectorAll(sel)).some((el) => {
-      if (el.disabled) return false;
-      const style = window.getComputedStyle(el);
-      if (style.display === "none" || style.visibility === "hidden") return false;
-      const text = (el.innerText || el.textContent || "").trim().toLowerCase();
-      return /^publish all(\s*[▾▼⌄↓])?$|^publish$/.test(text);
-    });
-  }, publishAllSelector()).catch(() => false);
-}
-
-async function clickButtonMatching(page, patternSource, patternFlags) {
-  if (page.isClosed()) return null;
-  return page
-    .evaluate(
-      ({ patSource, patFlags }) => {
-        const pat = new RegExp(patSource, patFlags);
-        for (const b of document.querySelectorAll("button, [role='button']")) {
-          const t = (b.innerText || b.textContent || "").trim();
-          if (pat.test(t) && !b.disabled) {
-            b.click();
-            return t;
-          }
-        }
-        return null;
-      },
-      { patSource: patternSource, patFlags: patternFlags }
-    )
-    .catch(() => null);
-}
-
-async function prepareEditorForPublish(page, timeoutMs = 25_000) {
-  const deadline = Date.now() + timeoutMs;
-  let lastAction = "waiting";
-
-  while (Date.now() < deadline) {
-    if (page.isClosed()) return { ready: false, lastAction: "page_closed" };
-    if (await isPublishAllVisible(page)) {
-      return { ready: true, lastAction: "publish_visible" };
-    }
-
-    const gotIt = await clickButtonMatching(page, "^got it$", "i");
-    if (gotIt) {
-      lastAction = "got_it";
-      await page.waitForTimeout(500);
-      continue;
-    }
-
-    const createAnyway = await clickButtonMatching(page, "create anyway", "i");
-    if (createAnyway) {
-      lastAction = "create_anyway";
-      await page.waitForTimeout(1500);
-      continue;
-    }
-
-    const continued = await page.evaluate(() => {
-      const buttons = Array.from(document.querySelectorAll("button"));
-      const cont = buttons.find((b) => {
-        const t = (b.innerText || b.textContent || "").trim().toLowerCase();
-        return t === "continue" && !b.disabled;
-      });
-      if (cont) {
-        cont.click();
-        return true;
-      }
-      return false;
-    }).catch(() => false);
-    if (continued) {
-      lastAction = "continue";
-      await page.waitForTimeout(1000);
-      continue;
-    }
-
-    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight)).catch(() => {});
-    await page.waitForTimeout(400);
-  }
-
-  return { ready: false, lastAction };
-}
-
-function isPublishApiUrl(url) {
-  return /\/publish|publish_all|batch_publish|submit_publish/i.test(String(url));
-}
-
-function isDuplicateApiUrl(url) {
-  const u = String(url);
-  if (!/ads\.tiktok\.com/i.test(u) || !/\/api\//i.test(u)) return false;
-  return /duplicate|\/copy\/|sketch\/copy|campaign\/copy|smart.*copy|\/copy\?/i.test(u);
-}
-
-async function waitForDuplicateApiResponse(page, timeoutMs = 30_000) {
-  try {
-    const resp = await page.waitForResponse(
-      (r) => {
-        if (r.request().method() !== "POST") return false;
-        if (!/ads\.tiktok\.com/i.test(r.url())) return false;
-        return isDuplicateApiUrl(r.url());
-      },
-      { timeout: timeoutMs }
-    );
-    const req = resp.request();
-    let body = null;
-    try {
-      const raw = req.postData();
-      body = raw ? JSON.parse(raw) : null;
-    } catch {
-      /* ignore */
-    }
-    let json = null;
-    try {
-      json = await resp.json();
-    } catch {
-      /* ignore */
-    }
-    const draftId = extractDraftIdFromApiJson(json);
-    const captured =
-      draftId && body
-        ? { url: resp.url().split("?")[0], query: resp.url().includes("?") ? resp.url().split("?")[1] : "", body }
-        : null;
-    return {
-      draftId: draftId ? String(draftId) : null,
-      captured,
-      json,
-      status: resp.status(),
-      url: resp.url(),
-    };
-  } catch {
-    return null;
-  }
-}
-
-async function replayDuplicateRequest(page, template, newName) {
-  if (!template?.url || !template?.body) return null;
-
-  const body = { ...template.body };
-  for (const k of ["campaign_name", "name", "new_name", "copy_name", "dest_campaign_name"]) {
-    if (Object.prototype.hasOwnProperty.call(body, k)) body[k] = newName;
-  }
-
-  const headers = await getTikTokApiHeaders(page);
-  const url = template.query ? `${template.url}?${template.query}` : template.url;
-  const result = await page.evaluate(
-    async ({ fetchUrl, fetchBody, fetchHeaders }) => {
-      try {
-        const resp = await fetch(fetchUrl, {
-          method: "POST",
-          credentials: "include",
-          headers: fetchHeaders,
-          body: JSON.stringify(fetchBody),
-        });
-        const text = await resp.text();
-        let json = null;
-        try {
-          json = JSON.parse(text);
-        } catch {
-          /* ignore */
-        }
-        return { status: resp.status, json, url: fetchUrl };
-      } catch (e) {
-        return { error: String(e), url: fetchUrl };
-      }
-    },
-    { fetchUrl: url, fetchBody: body, fetchHeaders: headers }
-  );
-
-  const draftId = extractDraftIdFromApiJson(result?.json);
-  return draftId ? String(draftId) : null;
-}
-
-function isTikTokApiSuccess(apiDetail) {
-  if (!apiDetail) return false;
-  const code = apiDetail.code;
-  if (code === 0 || code === "0") return true;
-  return /success/i.test(String(apiDetail.msg || ""));
-}
-
-function isPublishApiSuccess(apiDetail) {
-  return isTikTokApiSuccess(apiDetail) && isPublishApiUrl(apiDetail.url);
-}
-
-function waitForPublishApi(page, timeoutMs = 30_000) {
-  return page
-    .waitForResponse(
-      (resp) => {
-        if (!/ads\.tiktok\.com/i.test(resp.url())) return false;
-        if (resp.request().method() !== "POST") return false;
-        return isPublishApiUrl(resp.url());
-      },
-      { timeout: timeoutMs }
-    )
-    .then(async (resp) => {
-      try {
-        const json = await resp.json();
-        const code = json?.code ?? json?.status_code ?? json?.statusCode;
-        const msg = json?.msg ?? json?.message ?? "";
-        const detail = { code, msg, url: resp.url() };
-        return { ok: isTikTokApiSuccess(detail), detail };
-      } catch {
-        return { ok: false, detail: { url: resp.url(), parseError: true } };
-      }
-    })
-    .catch(() => ({ ok: false, detail: { reason: "publish_api_timeout" } }));
-}
-
-async function waitForUiPublishSuccess(page, timeoutMs = 8_000) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (page.isClosed()) return { ok: false, reason: "page_closed" };
-    const state = await readPublishPageState(page);
-    if (state.hasError && !state.hasSuccess) {
-      return { ok: false, reason: "ui_error", state };
-    }
-    if (state.hasSuccess) return { ok: true, reason: "ui_success_toast", state };
-    await page.waitForTimeout(300);
-  }
-  return { ok: false, reason: "ui_timeout" };
-}
-
-async function readDraftCheckOnPage(page) {
-  if (page.isClosed()) {
-    return { publishStillVisible: true, draftStatus: true, bodyText: "page closed" };
-  }
-  return page.evaluate(() => {
-    const bodyText = (document.body.innerText || "").slice(0, 5000);
-    const publishStillVisible = Array.from(
-      document.querySelectorAll(
-        'button, [role="button"], a, div, span, [class*="btn" i], [class*="button" i]'
-      )
-    ).some((el) => {
-      if (el.disabled) return false;
-      const style = window.getComputedStyle(el);
-      if (style.display === "none" || style.visibility === "hidden") return false;
-      const text = (el.innerText || el.textContent || "").trim().toLowerCase();
-      return /^publish all(\s*[▾▼⌄↓])?$|^publish$/.test(text);
-    });
-    const draftStatus = /\bStatus\b[\s\S]{0,40}\bDraft\b/.test(bodyText);
-    return { publishStillVisible, draftStatus, bodyText: bodyText.slice(0, 400) };
-  });
-}
-
-async function resolveDraftCheck(page, advertiserId, campaignSketchId, apiResult, uiResult) {
-  await page.waitForTimeout(600);
-  let check = await readDraftCheckOnPage(page);
-  if (!check.publishStillVisible && !check.draftStatus) {
-    return { published: true, reason: "on_page_left_draft", check };
-  }
-  if (isPublishApiSuccess(apiResult?.detail) && !check.publishStillVisible) {
-    return { published: true, reason: "publish_api+on_page", check };
-  }
-  if (uiResult?.ok && !check.publishStillVisible) {
-    return { published: true, reason: "ui+on_page", check };
-  }
-
-  await page.goto(buildEditorUrl(advertiserId, campaignSketchId), {
-    waitUntil: "domcontentloaded",
-    timeout: 20_000,
-  });
-  await page.waitForTimeout(800);
-  check = await readDraftCheckOnPage(page);
-  if (check.publishStillVisible) {
-    return { published: false, reason: "publish_all_still_visible", check };
-  }
-  if (check.draftStatus) {
-    return { published: false, reason: "draft_status_still_shown", check };
-  }
-  return { published: true, reason: "left_draft_state", check };
-}
-
-function publishSucceeded(apiResult, uiResult, draftCheck) {
-  if (!draftCheck?.published) return false;
-  if (isPublishApiSuccess(apiResult?.detail)) return true;
-  if (uiResult?.ok) return true;
-  return false;
-}
-
-async function readPublishPageState(page) {
-  if (page.isClosed()) {
-    return {
-      hasSuccess: false,
-      hasError: true,
-      publishStillVisible: false,
-      bodyText: "page closed",
-      url: "",
-    };
-  }
-  return page.evaluate(() => {
-    const bodyText = (document.body.innerText || "").slice(0, 8000);
-    const hasSuccess = /publish(ed)?(\s+all)?\s+success|published successfully|create success|submission successful|成功发布|发布成功/i.test(
-      bodyText
-    );
-    const hasError = /publish.*fail|failed to publish|permission denied|insufficient balance|risk control|unable to publish/i.test(
-      bodyText
-    );
-    return {
-      hasSuccess,
-      hasError,
-      bodyText: bodyText.slice(0, 800),
-      url: location.href,
-    };
-  });
-}
-
-async function clickPublishAll(page) {
-  if (page.isClosed()) return false;
-  await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight)).catch(() => {});
-  await page.waitForTimeout(200);
-  return page
-    .evaluate((sel) => {
-      for (const el of Array.from(document.querySelectorAll(sel))) {
-        if (el.disabled) continue;
-        const style = window.getComputedStyle(el);
-        if (style.display === "none" || style.visibility === "hidden") continue;
-        const text = (el.innerText || el.textContent || "").trim().toLowerCase();
-        if (/^publish all(\s*[▾▼⌄↓])?$|^publish$/.test(text)) {
-          el.scrollIntoView({ block: "center" });
-          el.click();
-          return (el.innerText || el.textContent || "").trim();
-        }
-      }
-      return false;
-    }, publishAllSelector())
-    .catch(() => false);
-}
-
-async function clickConfirmDialog(page) {
-  await page.waitForTimeout(400);
-  return page.evaluate(() => {
-    for (const b of Array.from(document.querySelectorAll("button")).reverse()) {
-      const t = (b.innerText || b.textContent || "").trim().toLowerCase();
-      if (/^(confirm|publish|publish all|submit|ok)$/.test(t) && !b.disabled) {
-        const inDialog =
-          b.closest('[role="dialog"], [class*="modal" i], [class*="dialog" i], [class*="popup" i]');
-        if (inDialog) {
-          b.click();
-          return true;
-        }
-      }
-    }
-    return false;
-  }).catch(() => false);
-}
-
-async function savePageScreenshot(page, tag) {
-  try {
-    if (!page || page.isClosed()) return null;
-    const buf = await page.screenshot({ fullPage: false });
-    const id = saveScreenshot(buf);
-    return `/screenshots/${id}?tag=${encodeURIComponent(tag)}`;
-  } catch {
-    return null;
-  }
-}
-
-async function fillCampaignSearch(page, query) {
-  try {
-    const searchInput = page
-      .locator(
-        'input[placeholder*="Search" i], input[aria-label*="Search" i], input[type="search"], input[class*="search" i]'
-      )
-      .first();
-    await searchInput.waitFor({ state: "visible", timeout: 5000 });
-    await searchInput.click({ clickCount: 3 }).catch(() => {});
-    await searchInput.fill("");
-    await searchInput.fill(String(query));
-    await page.keyboard.press("Enter").catch(() => {});
-    await page.waitForTimeout(2500);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function getCsrfToken(page) {
-  return page.evaluate(() => {
-    const m = document.cookie.match(/(?:^|;\s*)csrftoken=([^;]+)/);
-    if (m) return decodeURIComponent(m[1]);
-    const meta = document.querySelector('meta[name="csrf-token"], meta[name="csrf_token"]');
-    return meta?.getAttribute("content") || "";
-  });
-}
-
-async function getTikTokApiHeaders(page) {
-  return page.evaluate(() => {
-    const headers = { Accept: "application/json", "Content-Type": "application/json" };
-    const cookie = document.cookie || "";
-    const pick = (name) => {
-      const m = cookie.match(new RegExp(`(?:^|;\\s*)${name}=([^;]+)`));
-      return m ? decodeURIComponent(m[1]) : "";
-    };
-    const csrf = pick("csrftoken");
-    if (csrf) {
-      headers["X-CSRFToken"] = csrf;
-      headers["x-csrftoken"] = csrf;
-    }
-    const passportCsrf = pick("passport_csrf_token") || pick("passport_csrf_token_default");
-    if (passportCsrf) headers["x-tt-passport-csrf-token"] = passportCsrf;
-    const msToken = pick("msToken");
-    if (msToken) headers["x-secsdk-csrf-token"] = msToken;
-    return headers;
-  });
-}
-
-async function tiktokApiCall(page, url, method, body) {
-  const headers = await getTikTokApiHeaders(page);
-  return page.evaluate(
-    async ({ fetchUrl, fetchMethod, fetchBody, fetchHeaders }) => {
-      try {
-        const resp = await fetch(fetchUrl, {
-          method: fetchMethod,
-          credentials: "include",
-          headers: fetchHeaders,
-          body: fetchBody != null ? JSON.stringify(fetchBody) : undefined,
-        });
-        const text = await resp.text();
-        let json = null;
-        try {
-          json = JSON.parse(text);
-        } catch {
-          /* ignore */
-        }
-        return { status: resp.status, json, text: text.slice(0, 500), url: fetchUrl };
-      } catch (e) {
-        return { error: String(e), url: fetchUrl };
-      }
-    },
-    { fetchUrl: url, fetchMethod: method, fetchBody: body ?? null, fetchHeaders: headers }
-  );
-}
-
-function extractCampaignList(json) {
-  if (!json || typeof json !== "object") return [];
-  const d = json.data ?? json;
-  if (Array.isArray(d)) return d;
-  if (Array.isArray(d.list)) return d.list;
-  if (Array.isArray(d.campaigns)) return d.campaigns;
-  if (Array.isArray(d.data)) return d.data;
-  if (Array.isArray(d.campaign_list)) return d.campaign_list;
-  return [];
-}
-
-async function fetchCampaignListViaApi(page, advertiserId) {
-  let lastApiError = null;
-  const attempts = [
-    {
-      url: `https://ads.tiktok.com/api/v2/i18n/manage/campaign/list/?aadvid=${encodeURIComponent(advertiserId)}`,
-      body: {
-        aadvid: String(advertiserId),
-        page: 1,
-        page_size: 100,
-        query_type: "all",
-        sort_stat: "create_time",
-        sort_order: 1,
-      },
-    },
-    {
-      url: `https://ads.tiktok.com/api/v2/i18n/performance/campaign/list/?aadvid=${encodeURIComponent(advertiserId)}`,
-      body: { aadvid: String(advertiserId), page: 1, page_size: 100 },
-    },
-    {
-      url: `https://ads.tiktok.com/api/v3/i18n/manage/campaign/list/?aadvid=${encodeURIComponent(advertiserId)}`,
-      body: { aadvid: String(advertiserId), page: 1, page_size: 100 },
-    },
-  ];
-
-  for (const attempt of attempts) {
-    const result = await tiktokApiCall(page, attempt.url, "POST", attempt.body);
-    const code = result?.json?.code ?? result?.json?.status_code;
-    const msg = result?.json?.msg ?? result?.json?.message ?? result?.text ?? result?.error;
-    if (code === 0 || code === "0" || code === 200) {
-      const campaigns = extractCampaignList(result.json);
-      if (campaigns.length > 0) {
-        return { ok: true, campaigns, count: campaigns.length, source: attempt.url };
-      }
-    }
-    if (msg) lastApiError = String(msg).slice(0, 200);
-  }
-  return { ok: false, campaigns: [], count: 0, lastApiError };
-}
-
-function findCampaignInApiList(campaigns, campaignId, campaignName) {
-  const id = String(campaignId || "").trim();
-  const name = String(campaignName || "").trim().toLowerCase();
-  return campaigns.find((c) => {
-    const cid = String(c.campaign_id || c.id || c.campaignId || c.campaignIdStr || "");
-    const cname = String(c.campaign_name || c.name || "").toLowerCase();
-    if (id && (cid === id || cid.endsWith(id))) return true;
-    if (name && cname.includes(name)) return true;
-    return false;
-  });
-}
-
-async function waitForCampaignRowKey(page, campaignId, timeoutMs = 45_000) {
-  const id = String(campaignId);
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    await dismissOverlays(page);
-    const found = await page.evaluate((cid) => {
-      if (document.querySelector(`[data-row-key="${cid}"]`)) return true;
-      for (const el of document.querySelectorAll("[data-row-key]")) {
-        const k = el.getAttribute("data-row-key") || "";
-        if (k === cid || k.endsWith(cid) || k.includes(cid)) return true;
-      }
-      return false;
-    }, id);
-    if (found) return true;
-    await page.waitForTimeout(1500);
-  }
-  return false;
-}
-
-async function tryDuplicateFromListRowById(page, listUrl, advertiserId, campaignId, newName) {
-  await page.goto(listUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
-  await dismissOverlays(page);
-  await page.waitForTimeout(1500);
-
-  const hasRow = await waitForCampaignRowKey(page, campaignId, 30_000);
-  if (!hasRow) return null;
-
-  const row = page.locator(`[data-row-key="${campaignId}"]`).first();
-  const rowFallback = page.locator("[data-row-key]").filter({ hasText: campaignId }).first();
-  const target = (await row.count()) > 0 ? row : rowFallback;
-
-  await target.scrollIntoViewIfNeeded().catch(() => {});
-  await target.hover().catch(() => {});
-  await page.waitForTimeout(800);
-
-  const apiWait = waitForDuplicateApiResponse(page, 35_000);
-  await clickDuplicateOnRow(page, target);
-  await submitDuplicateNameModal(page, newName);
-  const apiHit = await apiWait;
-  if (apiHit?.draftId) return apiHit.draftId;
-
-  const sketchId = await extractDraftIdFromPage(page);
-  return sketchId || null;
-}
-
-async function tryDuplicateViaEditorUrls(page, advertiserId, campaignId, newName) {
-  const urls = [
-    `https://ads.tiktok.com/i18n/creation/1nn/create/campaign?aadvid=${encodeURIComponent(advertiserId)}&source=campaign_list&campaign_id=${encodeURIComponent(campaignId)}&creation_type=duplicate&objective_type=3`,
-    `https://ads.tiktok.com/i18n/creation/1nn/create/campaign?aadvid=${encodeURIComponent(advertiserId)}&source=campaign_list&src_campaign_id=${encodeURIComponent(campaignId)}&creation_type=copy&objective_type=3`,
-    `https://ads.tiktok.com/i18n/creation/1nn/create/campaign?aadvid=${encodeURIComponent(advertiserId)}&duplicate_campaign_id=${encodeURIComponent(campaignId)}&objective_type=3`,
-  ];
-
-  for (const url of urls) {
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
-    await dismissOverlays(page);
-    await page.waitForTimeout(1200);
-    if (page.url().includes("/login") || page.url().includes("/passport")) continue;
-
-    let sketchId = await extractDraftIdFromPage(page);
-    if (sketchId) return sketchId;
-
-    const nameInput = page.locator('input[placeholder*="name" i], input[class*="name" i]').first();
-    if (await nameInput.isVisible().catch(() => false)) {
-      await nameInput.fill(newName).catch(() => {});
-    }
-    sketchId = await extractDraftIdFromPage(page);
-    if (sketchId) return sketchId;
-  }
-  return null;
-}
-
-function attachDuplicateApiSniffer(page, apiTemplateRef) {
-  page.on("response", async (resp) => {
-    try {
-      if (resp.request().method() !== "POST") return;
-      if (!isDuplicateApiUrl(resp.url())) return;
-      const req = resp.request();
-      let body = null;
-      try {
-        const raw = req.postData();
-        body = raw ? JSON.parse(raw) : null;
-      } catch {
-        /* ignore */
-      }
-      let json = null;
-      try {
-        json = await resp.json();
-      } catch {
-        /* ignore */
-      }
-      const draftId = extractDraftIdFromApiJson(json);
-      if (draftId && body && apiTemplateRef && !apiTemplateRef.url) {
-        apiTemplateRef.url = resp.url().split("?")[0];
-        apiTemplateRef.query = resp.url().includes("?") ? resp.url().split("?")[1] : "";
-        apiTemplateRef.body = body;
-      }
-    } catch {
-      /* ignore */
-    }
-  });
-}
-
-function extractDraftIdFromApiJson(json) {
-  if (!json || typeof json !== "object") return null;
-  const code = json.code ?? json.status_code ?? json.statusCode;
-  if (code != null && code !== 0 && code !== "0" && code !== 200) return null;
-  const d = json.data ?? json;
-  if (!d || typeof d !== "object") return null;
-  return (
-    d.campaign_draft_id ||
-    d.temp_campaign_id ||
-    d.sketch_id ||
-    d.new_campaign_id ||
-    d.campaign_sketch_id ||
-    d.draft_id ||
-    null
-  );
-}
-
-async function tryDuplicateViaHttp(page, advertiserId, campaignId, newName, campaignName) {
-  if (!campaignId) return null;
-
-  await page
-    .goto(
-      `https://ads.tiktok.com/i18n/manage/campaign?aadvid=${encodeURIComponent(advertiserId)}`,
-      { waitUntil: "domcontentloaded", timeout: 60_000 }
-    )
-    .catch(() => {});
-  await dismissOverlays(page);
-  await page.waitForTimeout(1200);
-
-  const apiList = await fetchCampaignListViaApi(page, advertiserId);
-  const src = findCampaignInApiList(apiList.campaigns, campaignId, campaignName);
-  const srcId = String(src?.campaign_id || src?.id || campaignId);
-  const isSmartPlus = Boolean(src?.spc_flag || src?.smart_plus || src?.campaign_type === "SMART_PLUS");
-
-  const headers = await getTikTokApiHeaders(page);
-  const attempts = [
-    {
-      url: `https://ads.tiktok.com/api/v2/i18n/creation/1nn/campaign/copy/?aadvid=${encodeURIComponent(advertiserId)}`,
-      body: {
-        aadvid: String(advertiserId),
-        src_campaign_id: srcId,
-        campaign_id: srcId,
-        campaign_name: newName,
-        copy_num: 1,
-      },
-    },
-    {
-      url: `https://ads.tiktok.com/api/v2/i18n/creation/1nn/smart_plus/campaign/copy/?aadvid=${encodeURIComponent(advertiserId)}`,
-      body: { aadvid: String(advertiserId), campaign_id: srcId, campaign_name: newName },
-    },
-    {
-      url: `https://ads.tiktok.com/api/v2/i18n/creation/1nn/smart_campaign/copy/?aadvid=${encodeURIComponent(advertiserId)}`,
-      body: { aadvid: String(advertiserId), campaign_id: srcId, campaign_name: newName },
-    },
-    {
-      url: `https://ads.tiktok.com/api/v2/i18n/manage/campaign/duplicate/?aadvid=${encodeURIComponent(advertiserId)}`,
-      body: { aadvid: String(advertiserId), campaign_id: srcId, campaign_name: newName },
-    },
-    {
-      url: `https://ads.tiktok.com/api/v2/i18n/creation/1nn/campaign/duplicate/?aadvid=${encodeURIComponent(advertiserId)}`,
-      body: { aadvid: String(advertiserId), campaign_id: srcId, campaign_name: newName },
-    },
-    {
-      url: `https://ads.tiktok.com/api/v2/i18n/creation/1nn/campaign/sketch/copy/?aadvid=${encodeURIComponent(advertiserId)}`,
-      body: { aadvid: String(advertiserId), campaign_id: srcId, name: newName },
-    },
-    {
-      url: `https://ads.tiktok.com/api/v3/i18n/manage/campaign/duplicate/?aadvid=${encodeURIComponent(advertiserId)}`,
-      body: { aadvid: String(advertiserId), campaign_id: srcId, name: newName },
-    },
-  ];
-
-  if (isSmartPlus) {
-    attempts.unshift({
-      url: `https://ads.tiktok.com/api/v2/i18n/spc/campaign/copy/?aadvid=${encodeURIComponent(advertiserId)}`,
-      body: { aadvid: String(advertiserId), campaign_id: srcId, campaign_name: newName },
-    });
-  }
-
-  let lastErr = "";
-  for (const attempt of attempts) {
-    const result = await page.evaluate(
-      async ({ url, body, fetchHeaders }) => {
-        try {
-          const resp = await fetch(url, {
-            method: "POST",
-            credentials: "include",
-            headers: fetchHeaders,
-            body: JSON.stringify(body),
-          });
-          const text = await resp.text();
-          let json = null;
-          try {
-            json = JSON.parse(text);
-          } catch {
-            /* ignore */
-          }
-          return { status: resp.status, json, text: text.slice(0, 300), url };
-        } catch (e) {
-          return { error: String(e), url };
-        }
-      },
-      { url: attempt.url, body: attempt.body, fetchHeaders: headers }
-    );
-
-    const draftId = extractDraftIdFromApiJson(result?.json);
-    if (draftId) return String(draftId);
-    const code = result?.json?.code ?? result?.json?.status_code;
-    const msg = result?.json?.msg ?? result?.json?.message ?? result?.text ?? result?.error;
-    if (msg) lastErr = `${attempt.url.split("/").slice(-2).join("/")}: ${msg}`;
-  }
-
-  if (apiList.count > 0 && lastErr) {
-    console.warn("[duplicate] HTTP failed but API list OK:", lastErr);
-  }
-  return null;
-}
-
-async function scanCampaignRows(page) {
-  return page.evaluate(() => {
-    const rows = [];
-    const seen = new Set();
-    const add = (key, text) => {
-      const t = String(text || "").replace(/\s+/g, " ").trim();
-      if (t.length < 4 || t.length > 400) return;
-      const sig = `${key}|${t.slice(0, 70)}`;
-      if (seen.has(sig)) return;
-      seen.add(sig);
-      rows.push({ key: key || "", text: t.slice(0, 150) });
-    };
-
-    for (const el of document.querySelectorAll("[data-row-key], [data-id]")) {
-      add(el.getAttribute("data-row-key") || el.getAttribute("data-id") || "", el.innerText || el.textContent);
-    }
-    for (const tr of document.querySelectorAll("table tbody tr, [role='row'], [class*='TableRow' i]")) {
-      const nested = tr.querySelector("[data-row-key]");
-      const key = nested?.getAttribute("data-row-key") || tr.getAttribute("data-row-key") || "";
-      add(key, tr.innerText || tr.textContent);
-    }
-    for (const a of document.querySelectorAll("a[href*='campaign'], [class*='campaign-name' i]")) {
-      const row = a.closest("[data-row-key], tr, [role='row']");
-      const key = row?.getAttribute("data-row-key") || "";
-      add(key, a.innerText || row?.innerText);
-    }
-    return rows.slice(0, 60);
-  });
-}
-
-async function findCampaignRowMeta(page, sourceCampaignId, sourceCampaignName) {
-  const id = String(sourceCampaignId || "").trim();
-  const name = String(sourceCampaignName || "").trim().toLowerCase();
-
-  const matchInRows = (rows) => {
-    if (id) {
-      const byId = rows.find(
-        (r) => r.key === id || r.key.endsWith(id) || r.text.includes(id)
-      );
-      if (byId?.key) return { key: byId.key, method: "id", sample: rows.slice(0, 5) };
-    }
-    if (name) {
-      const byName = rows.find((r) => r.text.toLowerCase().includes(name));
-      if (byName?.key) return { key: byName.key, method: "name", sample: rows.slice(0, 5) };
-    }
-    return null;
-  };
-
-  let rows = await scanCampaignRows(page);
-  let hit = matchInRows(rows);
-  if (hit) return hit;
-
-  if (name) {
-    if (await fillCampaignSearch(page, sourceCampaignName)) {
-      rows = await scanCampaignRows(page);
-      hit = matchInRows(rows);
-      if (hit) return hit;
-    }
-  }
-
-  if (id) {
-    if (await fillCampaignSearch(page, id)) {
-      rows = await scanCampaignRows(page);
-      hit = matchInRows(rows);
-      if (hit) return hit;
-    }
-  }
-
-  return { key: null, sample: rows.slice(0, 8) };
-}
-
-async function locateSourceCampaignRow(page, sourceCampaignId, sourceCampaignName) {
-  const meta = await findCampaignRowMeta(page, sourceCampaignId, sourceCampaignName);
-  if (!meta.key) {
-    const shot = await savePageScreenshot(page, "row-not-found");
-    const diag = await readPageDiagnostics(page).catch(() => ({}));
-    const hint = (meta.sample || [])
-      .map((r) => `${r.key || "?"} → ${r.text.slice(0, 50)}`)
-      .join(" | ");
-    throw new Error(
-      `Campaign not found (rows=${diag.rowKeys ?? 0}, table=${diag.tableRows ?? 0}). ` +
-        (hint ? `Seen: ${hint}. ` : "TikTok list empty — export ALL cookies (JSON) from Application tab, not just 2. ") +
-        `Screenshot: ${shot || "n/a"}`
-    );
-  }
-
-  const row = page.locator(`[data-row-key="${meta.key}"], [data-id="${meta.key}"]`).first();
-  if (await row.isVisible().catch(() => false)) return row;
-
-  return page.locator("*").filter({ hasText: sourceCampaignName || meta.key }).first();
-}
-
-async function clickDuplicateOnRow(page, row) {
-  await row.scrollIntoViewIfNeeded().catch(() => {});
-  await row.hover().catch(() => {});
-  await page.waitForTimeout(700);
-
-  const clicked = await row.evaluate((r) => {
-    for (const el of Array.from(r.querySelectorAll("a, button, span, [role='button']"))) {
-      const t = (el.innerText || el.textContent || "").trim().toLowerCase();
-      if (t === "duplicate" || t.startsWith("duplicate ")) {
-        el.click();
-        return "dup";
-      }
-    }
-    const more = r.querySelector(
-      '[class*="more" i], [aria-label*="more" i], [class*="action" i] button, [class*="Action"]'
-    );
-    if (more) {
-      more.click();
-      return "menu";
-    }
-    return false;
-  });
-
-  if (clicked === "menu") {
-    await page.waitForTimeout(600);
-    const menuDup = await page.evaluate(() => {
-      for (const el of Array.from(
-        document.querySelectorAll("button, a, li, span, [role='menuitem'], [class*='dropdown' i] *")
-      )) {
-        const t = (el.innerText || el.textContent || "").trim().toLowerCase();
-        if (t === "duplicate" || /^duplicate\b/.test(t)) {
-          el.click();
-          return true;
-        }
-      }
-      return false;
-    });
-    if (!menuDup) throw new Error("Duplicate not in row menu — open campaign in TikTok and check UI");
-  } else if (clicked !== "dup") {
-    const globalDup = page.getByText(/^duplicate$/i).first();
-    if (await globalDup.isVisible().catch(() => false)) {
-      await globalDup.click();
-    } else {
-      throw new Error("Duplicate button not found — hover row in TikTok and check Actions menu");
-    }
-  }
-}
-
-async function submitDuplicateNameModal(page, newName) {
-  const nameInput = page.locator(
-    'input[placeholder*="name" i], input[placeholder*="Name"], input[class*="name" i]'
-  ).first();
-  await nameInput.waitFor({ state: "visible", timeout: 20_000 });
-  await nameInput.fill("");
-  await nameInput.fill(newName);
-
-  const submitted = await page.evaluate(() => {
-    for (const el of Array.from(document.querySelectorAll("button")).reverse()) {
-      const t = (el.innerText || el.textContent || "").trim().toLowerCase();
-      if (/^(duplicate|confirm|submit|ok)$/.test(t) && !el.disabled) {
-        el.click();
-        return true;
-      }
-    }
-    return false;
-  });
-  if (!submitted) throw new Error("Modal submit button not found");
-}
-
-async function extractDraftIdFromPage(page) {
-  await page.waitForLoadState("domcontentloaded", { timeout: 30_000 }).catch(() => {});
-  await page.waitForSelector('button, [role="button"]', { timeout: 15_000 }).catch(() => {});
-  await page.waitForTimeout(800);
-  const sketchMatch = page.url().match(/campaign_draft_id=([^&]+)/);
-  return sketchMatch?.[1] || page.url().match(/temp_campaign_id=([^&]+)/)?.[1] || "";
-}
-
-async function clickPageDuplicateButton(page) {
-  await dismissOverlays(page);
-  const clicked = await page.evaluate(() => {
-    for (const el of Array.from(document.querySelectorAll("button, a, [role='button'], span"))) {
-      const t = (el.innerText || el.textContent || "").trim().toLowerCase();
-      if (t === "duplicate" || t.startsWith("duplicate ")) {
-        el.click();
-        return true;
-      }
-    }
-    for (const el of Array.from(document.querySelectorAll("button, [role='button']"))) {
-      const label = (el.getAttribute("aria-label") || "").toLowerCase();
-      if (/more|action|menu/.test(label)) {
-        el.click();
-        return "menu";
-      }
-    }
-    return false;
-  });
-
-  if (clicked === "menu") {
-    await page.waitForTimeout(600);
-    return page.evaluate(() => {
-      for (const el of Array.from(
-        document.querySelectorAll("button, a, li, span, [role='menuitem']")
-      )) {
-        const t = (el.innerText || el.textContent || "").trim().toLowerCase();
-        if (t === "duplicate" || /^duplicate\b/.test(t)) {
-          el.click();
-          return true;
-        }
-      }
-      return false;
-    });
-  }
-  return Boolean(clicked);
-}
-
-async function tryDuplicateFromDetailPage(page, advertiserId, campaignId, newName, apiTemplateRef) {
-  if (apiTemplateRef?.url) {
-    const replayed = await replayDuplicateRequest(page, apiTemplateRef, newName);
-    if (replayed) return replayed;
-  }
-
-  const urls = [
-    `https://ads.tiktok.com/i18n/manage/campaign/detail?aadvid=${encodeURIComponent(advertiserId)}&campaign_id=${encodeURIComponent(campaignId)}`,
-    `https://ads.tiktok.com/i18n/creation/1nn/create/campaign?aadvid=${encodeURIComponent(advertiserId)}&campaign_id=${encodeURIComponent(campaignId)}`,
-    `https://ads.tiktok.com/i18n/manage/campaign?aadvid=${encodeURIComponent(advertiserId)}&campaign_id=${encodeURIComponent(campaignId)}`,
-  ];
-
-  for (const url of urls) {
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
-    await dismissOverlays(page);
-    await page.waitForTimeout(1500);
-    if (page.url().includes("/login") || page.url().includes("/passport")) continue;
-
-    if (await clickPageDuplicateButton(page)) {
-      const apiWait = waitForDuplicateApiResponse(page, 35_000);
-      await submitDuplicateNameModal(page, newName);
-      const apiHit = await apiWait;
-      if (apiHit?.captured && apiTemplateRef && !apiTemplateRef.url) {
-        apiTemplateRef.url = apiHit.captured.url;
-        apiTemplateRef.query = apiHit.captured.query;
-        apiTemplateRef.body = apiHit.captured.body;
-      }
-      if (apiHit?.draftId) return apiHit.draftId;
-
-      const sketchId = await extractDraftIdFromPage(page);
-      if (sketchId) return sketchId;
-    }
-  }
-  return null;
-}
-
-async function duplicateDraftOnce(
-  page,
-  listUrl,
-  advertiserId,
-  sourceCampaignId,
-  newName,
-  sourceCampaignName,
-  apiTemplateRef
-) {
-  const attempts = [];
-
-  if (apiTemplateRef?.url) {
-    const replayed = await replayDuplicateRequest(page, apiTemplateRef, newName);
-    if (replayed) return replayed;
-    attempts.push("api-replay failed");
-  }
-
-  if (sourceCampaignId) {
-    const fromHttp = await tryDuplicateViaHttp(
-      page,
-      advertiserId,
-      sourceCampaignId,
-      newName,
-      sourceCampaignName
-    );
-    if (fromHttp) return fromHttp;
-    attempts.push("http endpoints failed");
-
-    const fromRow = await tryDuplicateFromListRowById(
-      page,
-      listUrl,
-      advertiserId,
-      sourceCampaignId,
-      newName
-    );
-    if (fromRow) return fromRow;
-    attempts.push("list row not found");
-
-    const fromEditor = await tryDuplicateViaEditorUrls(page, advertiserId, sourceCampaignId, newName);
-    if (fromEditor) return fromEditor;
-    attempts.push("editor URLs failed");
-
-    const fromDetail = await tryDuplicateFromDetailPage(
-      page,
-      advertiserId,
-      sourceCampaignId,
-      newName,
-      apiTemplateRef
-    );
-    if (fromDetail) {
-      await page.goto(listUrl, { waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => {});
-      return fromDetail;
-    }
-    attempts.push("detail page failed");
-  }
-
-  if (sourceCampaignName || sourceCampaignId) {
-    try {
-      await page.goto(listUrl, { waitUntil: "domcontentloaded", timeout: 60_000 }).catch(() => {});
-      await dismissOverlays(page);
-      const row = await locateSourceCampaignRow(page, sourceCampaignId, sourceCampaignName);
-      await clickDuplicateOnRow(page, row);
-      await submitDuplicateNameModal(page, newName);
-      const campaignSketchId = await extractDraftIdFromPage(page);
-      if (campaignSketchId) {
-        await page.goto(listUrl, { waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => {});
-        return campaignSketchId;
-      }
-      attempts.push("name search failed");
-    } catch (e) {
-      attempts.push(e instanceof Error ? e.message : "search failed");
-    }
-  }
-
-  const shot = await savePageScreenshot(page, "dup-fail");
-  const hint = await readAccountHint(page);
-  const total = hint.totalCampaigns;
-  let msg = `Duplicate failed (${attempts.join("; ")}).`;
-  if (total === 0) {
-    msg +=
-      " TikTok shows 0 campaigns — cookies may be wrong account. On ads.tiktok.com check aadvid= in URL matches Advertiser ID, then re-export Cookie-Editor JSON from that page.";
-  } else {
-    msg += " Re-export Cookie-Editor JSON from ads.tiktok.com while logged into the correct account.";
-  }
-  msg += ` Screenshot: ${shot || "n/a"}`;
-  throw new Error(msg);
-}
-
-async function publishDraftsParallel({ advertiserId, cookies, drafts, onProgress }) {
-  const results = await Promise.all(
-    drafts.map(async (draft, index) => {
-      await acquirePublishSlot();
-      try {
-        const result = await publishDraftCore({
-          advertiserId,
-          campaignSketchId: draft.campaignSketchId,
-          cookies,
-          skipAccountWarmup: index > 0,
-        });
-        onProgress?.({ phase: "publishing", done: index + 1, total: drafts.length });
-        return {
-          name: draft.name,
-          campaignSketchId: draft.campaignSketchId,
-          ...result,
-        };
-      } catch (err) {
-        onProgress?.({ phase: "publishing", done: index + 1, total: drafts.length });
-        return {
-          name: draft.name,
-          campaignSketchId: draft.campaignSketchId,
-          ok: false,
-          error: err instanceof Error ? err.message : "Internal error",
-        };
-      } finally {
-        releasePublishSlot();
-      }
-    })
-  );
-
-  const okCount = results.filter((r) => r.ok).length;
-  return { ok: okCount > 0, published: okCount, total: results.length, results };
-}
-
-async function duplicateCampaignsCore({
-  advertiserId,
-  campaignId,
-  campaignName,
-  names,
-  cookies,
-  onProgress,
-}) {
-  onProgress?.({
-    phase: "duplicating",
-    done: 0,
-    total: names.length,
-    currentStep: "Launching browser…",
-  });
-
-  const browser = await getSharedBrowser();
-  const context = await createTikTokContext(browser, cookies);
-  const duplicateApiTemplate = {};
-  const page = await context.newPage();
-  attachDuplicateApiSniffer(page, duplicateApiTemplate);
-  const listUrl = `https://ads.tiktok.com/i18n/manage/campaign?aadvid=${encodeURIComponent(advertiserId)}`;
-
-  const draftResults = [];
-  try {
-    onProgress?.({
-      phase: "duplicating",
-      done: 0,
-      total: names.length,
-      currentStep: campaignId
-        ? "Fast mode — Campaign ID (no search/list)…"
-        : "Opening TikTok (dismiss popups, then duplicate)…",
-    });
-    if (campaignId) {
-      try {
-        const diag = await prepareCampaignListPage(page, listUrl);
-        onProgress?.({
-          phase: "duplicating",
-          done: 0,
-          total: names.length,
-          currentStep:
-            diag.rowKeys > 0
-              ? `List loaded (${diag.rowKeys} campaigns) — duplicating…`
-              : "List empty — trying API + editor duplicate…",
-        });
-      } catch (e) {
-        if (String(e.message) === "LOGIN") {
-          const shot = await savePageScreenshot(page, "login");
-          return {
-            ok: false,
-            error: "TikTok session expired — re-export Cookie-Editor JSON",
-            screenshot: shot,
-            results: [],
-          };
-        }
-        await page.goto(listUrl, { waitUntil: "domcontentloaded", timeout: 60_000 }).catch(() => {});
-        await dismissOverlays(page);
-      }
-    } else {
-      try {
-        const diag = await prepareCampaignListPage(page, listUrl);
-        onProgress?.({
-          phase: "duplicating",
-          done: 0,
-          total: names.length,
-          currentStep:
-            diag.rowKeys > 0
-              ? `List loaded (${diag.rowKeys} campaigns)`
-              : "List hidden — trying campaign name search",
-        });
-      } catch (e) {
-        if (String(e.message) === "LOGIN") {
-          const shot = await savePageScreenshot(page, "login");
-          return {
-            ok: false,
-            error: "TikTok session expired — re-export Cookie-Editor JSON",
-            screenshot: shot,
-            results: [],
-          };
-        }
-        await page.goto(listUrl, { waitUntil: "domcontentloaded", timeout: 60_000 }).catch(() => {});
-        await dismissOverlays(page);
-      }
-    }
-    await page.waitForSelector('button, [role="button"], input', { timeout: 20_000 }).catch(() => {});
-
-    for (let i = 0; i < names.length; i++) {
-      const name = names[i];
-      onProgress?.({
-        phase: "duplicating",
-        done: i,
-        total: names.length,
-        currentStep:
-          i === 0
-            ? `Duplicating "${name}" (capturing TikTok API if needed)…`
-            : duplicateApiTemplate.url
-              ? `Fast API copy ${i + 1}/${names.length} — "${name}"…`
-              : `Duplicating "${name}" (${i + 1}/${names.length})…`,
-        draftResults,
-      });
-      try {
-        const campaignSketchId = await duplicateDraftOnce(
-          page,
-          listUrl,
-          advertiserId,
-          campaignId,
-          name,
-          campaignName,
-          duplicateApiTemplate
-        );
-        draftResults.push({ name, ok: true, campaignSketchId });
-      } catch (e) {
-        const shot = await savePageScreenshot(page, `dup-fail-${i + 1}`);
-        draftResults.push({
-          name,
-          ok: false,
-          error: e instanceof Error ? e.message : "unknown error",
-          screenshot: shot,
-        });
-        await page.goto(listUrl, { waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => {});
-        await page.waitForTimeout(800);
-      }
-      onProgress?.({
-        phase: "duplicating",
-        done: i + 1,
-        total: names.length,
-        currentStep: draftResults.at(-1)?.ok ? `Created draft for "${name}"` : `Failed "${name}"`,
-        draftResults,
-      });
-    }
-  } finally {
-    await context.close().catch(() => {});
-  }
-
-  const draftsToPublish = draftResults
-    .filter((r) => r.ok && r.campaignSketchId)
-    .map((r) => ({ name: r.name, campaignSketchId: r.campaignSketchId }));
-
-  if (draftsToPublish.length === 0) {
-    return {
-      ok: false,
-      error: "No drafts created",
-      duplicated: 0,
-      published: 0,
-      total: names.length,
-      results: draftResults.map((r) => ({
-        name: r.name,
-        ok: false,
-        error: r.error || "duplicate_failed",
-      })),
-    };
-  }
-
-  onProgress?.({ phase: "publishing", done: 0, total: draftsToPublish.length });
-  const publishOut = await publishDraftsParallel({
-    advertiserId,
-    cookies,
-    drafts: draftsToPublish,
-    onProgress,
-  });
-
-  const publishByName = new Map(publishOut.results.map((r) => [r.name, r]));
-  const results = draftResults.map((draft) => {
-    const pub = publishByName.get(draft.name);
-    if (!draft.ok) {
-      return { name: draft.name, ok: false, error: draft.error || "duplicate_failed" };
-    }
-    if (!pub) {
-      return { name: draft.name, ok: false, error: "publish_not_attempted" };
-    }
-    return {
-      name: draft.name,
-      ok: pub.ok,
-      newCampaignId: pub.newCampaignId || draft.campaignSketchId,
-      verifiedBy: pub.verifiedBy,
-      error: pub.error,
-    };
-  });
-
-  const okCount = results.filter((r) => r.ok).length;
-  return {
-    ok: okCount > 0,
-    duplicated: draftResults.filter((r) => r.ok).length,
-    published: okCount,
-    total: results.length,
-    results,
-  };
-}
 
 function saveScreenshot(buf) {
   const id = `${Date.now()}-${++screenshotCounter}`;
   screenshots.set(id, buf);
-  if (screenshots.size > 20) screenshots.delete(screenshots.keys().next().value);
+  // Keep only the last 20.
+  if (screenshots.size > 20) {
+    const oldest = screenshots.keys().next().value;
+    screenshots.delete(oldest);
+  }
   return id;
-}
-
-async function publishDraftCore({ advertiserId, campaignSketchId, cookies, skipAccountWarmup }) {
-  const browser = await getSharedBrowser();
-  const context = await createTikTokContext(browser, cookies);
-  const page = await context.newPage();
-
-  try {
-    if (!skipAccountWarmup) {
-      await page.goto(
-        `https://ads.tiktok.com/i18n/manage/campaign?aadvid=${encodeURIComponent(advertiserId)}`,
-        { waitUntil: "domcontentloaded", timeout: 20_000 }
-      ).catch(() => {});
-      await page.waitForTimeout(600);
-    }
-
-    const editorUrl = buildEditorUrl(advertiserId, campaignSketchId);
-
-    async function loadEditorAndPrepare() {
-      await page.goto(editorUrl, { waitUntil: "domcontentloaded", timeout: 45_000 });
-      if (page.url().includes("/login") || page.url().includes("/passport")) {
-        return { loginExpired: true };
-      }
-      await page.waitForSelector('button, [role="button"]', { timeout: 10_000 }).catch(() => {});
-      await page.waitForTimeout(400);
-      const prep = await prepareEditorForPublish(page);
-      return { loginExpired: false, prep };
-    }
-
-    const initial = await loadEditorAndPrepare();
-    if (initial.loginExpired) {
-      return { ok: false, error: "TikTok session expired. Re-paste cookies." };
-    }
-    if (!initial.prep.ready) {
-      return {
-        ok: false,
-        error: `Editor not ready for publish (last=${initial.prep.lastAction})`,
-      };
-    }
-
-    let apiResult = null;
-    let uiResult = null;
-    let draftCheck = null;
-
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      const publishApiPromise = waitForPublishApi(page, 30_000);
-      const publishClicked = await clickPublishAll(page);
-      if (!publishClicked) {
-        return { ok: false, error: "Publish button not found" };
-      }
-
-      await clickConfirmDialog(page);
-      [apiResult, uiResult] = await Promise.all([
-        publishApiPromise,
-        waitForUiPublishSuccess(page, 8_000),
-      ]);
-      draftCheck = await resolveDraftCheck(page, advertiserId, campaignSketchId, apiResult, uiResult);
-
-      if (publishSucceeded(apiResult, uiResult, draftCheck)) break;
-      if (attempt === 1) {
-        const retry = await loadEditorAndPrepare();
-        if (retry.loginExpired || !retry.prep?.ready) break;
-      }
-    }
-
-    if (!publishSucceeded(apiResult, uiResult, draftCheck)) {
-      return {
-        ok: false,
-        error: [
-          draftCheck?.published ? null : `draft=${draftCheck?.reason || "still_draft"}`,
-          apiResult?.ok ? null : `publish_api=${JSON.stringify(apiResult?.detail || { reason: "no_publish_api" })}`,
-          uiResult?.ok ? null : `ui=${uiResult?.reason || "no_ui_success"}`,
-        ]
-          .filter(Boolean)
-          .join(" | "),
-      };
-    }
-
-    const verifiedBy = isPublishApiSuccess(apiResult?.detail)
-      ? "publish_api"
-      : `${uiResult?.reason || "ui"}+${draftCheck?.reason || "left_draft"}`;
-
-    return { ok: true, newCampaignId: campaignSketchId, verifiedBy };
-  } finally {
-    await context.close().catch(() => {});
-  }
-}
-
-function checkAuth(req, res) {
-  const auth = req.headers.authorization || "";
-  if (!SHARED_SECRET || auth !== `Bearer ${SHARED_SECRET}`) {
-    res.status(401).json({ error: "Unauthorized" });
-    return false;
-  }
-  return true;
 }
 
 app.get("/screenshots/:id", (req, res) => {
@@ -1752,211 +65,11 @@ app.get("/screenshots/:id", (req, res) => {
   res.send(buf);
 });
 
-const REQUIRED_COOKIE_NAMES = ["sessionid_ads", "csrftoken", "sid_tt_ads"];
-const MIN_COOKIE_COUNT = 12;
-
-function diagnoseCookies(raw) {
-  const parsed = parseCookies(raw);
-  const names = parsed.map((c) => c.name);
-  const missingRequired = REQUIRED_COOKIE_NAMES.filter(
-    (n) => !names.some((x) => x.toLowerCase() === n.toLowerCase())
-  );
-  return {
-    count: parsed.length,
-    names,
-    missingRequired,
-    ok: parsed.length >= MIN_COOKIE_COUNT && missingRequired.length === 0,
-  };
-}
-function validateDuplicateBody(body) {
-  const { advertiserId, campaignId, campaignName, names, cookies } = body || {};
-  if (!advertiserId || !Array.isArray(names) || names.length === 0 || !cookies) {
-    return { error: "advertiserId, names[], cookies required" };
-  }
-  if (!campaignId && !campaignName) {
-    return { error: "campaignId or campaignName required" };
-  }
-  if (names.length > 20) {
-    return { error: "Max 20 copies per request" };
-  }
-  const cookieErr = validateCookies(cookies);
-  if (cookieErr) return { error: cookieErr };
-  return { advertiserId, campaignId, campaignName, names, cookies };
-}
-
-function validateCookies(raw) {
-  const trimmed = String(raw).trim();
-  if (!trimmed) return "Cookies empty";
-  const parsed = parseCookies(trimmed);
-  if (parsed.length === 0) {
-    return "Cookies not parsed — use Cookie-Editor JSON export from ads.tiktok.com";
-  }
-  const diag = diagnoseCookies(trimmed);
-  if (diag.missingRequired.length) {
-    return `Missing cookies: ${diag.missingRequired.join(", ")} — export ALL with Cookie-Editor, or use adsalim.com`;
-  }
-  if (diag.count < MIN_COOKIE_COUNT) {
-    return `Only ${diag.count} cookies — need ${MIN_COOKIE_COUNT}+. adsalim.com sends full session automatically.`;
-  }
-  return null;
-}
-
-function newDuplicateJobId() {
-  return `dup-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
-}
-
-function trimDuplicateJobs() {
-  while (duplicateJobs.size > MAX_DUPLICATE_JOBS) {
-    duplicateJobs.delete(duplicateJobs.keys().next().value);
-  }
-}
-
-function startDuplicateJob(params) {
-  const jobId = newDuplicateJobId();
-  const job = {
-    jobId,
-    status: "running",
-    phase: "duplicating",
-    progress: { done: 0, total: params.names.length },
-    results: [],
-    startedAt: Date.now(),
-  };
-  duplicateJobs.set(jobId, job);
-  trimDuplicateJobs();
-
-  const heartbeat = setInterval(() => {
-    const current = duplicateJobs.get(jobId);
-    if (!current || current.status !== "running") {
-      clearInterval(heartbeat);
-      return;
-    }
-    duplicateJobs.set(jobId, {
-      ...current,
-      elapsedMs: Date.now() - job.startedAt,
-    });
-  }, 10_000);
-
-  duplicateCampaignsCore({
-    ...params,
-    onProgress: (progress) => {
-      const current = duplicateJobs.get(jobId);
-      if (!current || current.status !== "running") return;
-      duplicateJobs.set(jobId, {
-        ...current,
-        phase: progress.phase,
-        progress: { done: progress.done, total: progress.total },
-        currentStep: progress.currentStep || current.currentStep,
-        results: progress.draftResults || current.results,
-      });
-    },
-  })
-    .then((out) => {
-      clearInterval(heartbeat);
-      duplicateJobs.set(jobId, {
-        ...duplicateJobs.get(jobId),
-        ...out,
-        status: out.ok ? "completed" : "failed",
-        finishedAt: Date.now(),
-        elapsedMs: Date.now() - job.startedAt,
-      });
-    })
-    .catch((err) => {
-      clearInterval(heartbeat);
-      duplicateJobs.set(jobId, {
-        ...duplicateJobs.get(jobId),
-        status: "failed",
-        error: err instanceof Error ? err.message : "Internal error",
-        finishedAt: Date.now(),
-        elapsedMs: Date.now() - job.startedAt,
-      });
-    });
-
-  return jobId;
-}
-
-app.post("/test-cookies", async (req, res) => {
-  if (!checkAuth(req, res)) return;
-  const { advertiserId, cookies } = req.body || {};
-  if (!cookies) return res.status(400).json({ error: "cookies required" });
-  const out = await verifyTikTokSession({ advertiserId, cookies });
-  return res.status(out.ok ? 200 : 400).json(out);
-});
-
-app.get("/duplicate/inject", (_req, res) => {
-  res.sendFile(path.join(__dirname, "public", "duplicate-inject.html"));
-});
-
-app.get("/adsalim-bridge.user.js", (req, res) => {
-  res.setHeader("Content-Type", "text/javascript; charset=utf-8");
-  res.sendFile(path.join(__dirname, "public", "adsalim-bridge.user.js"));
-});
-
-// Alias — static hosting may 404 nested paths on older deploys
-app.get("/inject", (_req, res) => {
-  res.sendFile(path.join(__dirname, "public", "duplicate-inject.html"));
-});
-
-app.get("/duplicate/ui", (_req, res) => {
-  res.sendFile(path.join(__dirname, "public", "duplicate-ui.html"));
-});
-
-app.post("/duplicate/async", (req, res) => {
-  if (!checkAuth(req, res)) return;
-
-  const parsed = validateDuplicateBody(req.body);
-  if (parsed.error) return res.status(400).json({ error: parsed.error });
-
-  const jobId = startDuplicateJob(parsed);
-  return res.status(202).json({
-    jobId,
-    status: "running",
-    pollUrl: `/duplicate/jobs/${jobId}`,
-  });
-});
-
-app.get("/duplicate/jobs/:id", (req, res) => {
-  if (!checkAuth(req, res)) return;
-
-  const job = duplicateJobs.get(req.params.id);
-  if (!job) return res.status(404).json({ error: "Job not found" });
-  return res.json(job);
-});
-
-app.post("/duplicate", async (req, res) => {
-  if (!checkAuth(req, res)) return;
-
-  const parsed = validateDuplicateBody(req.body);
-  if (parsed.error) return res.status(400).json({ error: parsed.error });
-
-  // More than 5 copies usually exceeds Vercel/proxy timeouts — use async.
-  if (parsed.names.length > 5 && req.query.sync !== "1") {
-    const jobId = startDuplicateJob(parsed);
-    return res.status(202).json({
-      jobId,
-      status: "running",
-      async: true,
-      message: "Use GET /duplicate/jobs/:jobId to poll. For sync, add ?sync=1",
-      pollUrl: `/duplicate/jobs/${jobId}`,
-    });
-  }
-
-  const started = Date.now();
-  try {
-    const out = await duplicateCampaignsCore(parsed);
-    if (out.error?.includes("expired")) {
-      return res.status(401).json(out);
-    }
-    return res.json({
-      ...out,
-      elapsedMs: Date.now() - started,
-    });
-  } catch (err) {
-    return res.status(500).json({ error: err instanceof Error ? err.message : "Internal error" });
-  }
-});
-
 app.post("/publish-draft", async (req, res) => {
-  if (!checkAuth(req, res)) return;
+  const auth = req.headers.authorization || "";
+  if (!SHARED_SECRET || auth !== `Bearer ${SHARED_SECRET}`) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
 
   const { advertiserId, campaignSketchId, cookies } = req.body || {};
   if (!advertiserId || !campaignSketchId || !cookies) {
@@ -1965,68 +78,424 @@ app.post("/publish-draft", async (req, res) => {
     });
   }
 
-  await acquirePublishSlot();
+  let browser;
   try {
-    const result = await publishDraftCore({ advertiserId, campaignSketchId, cookies });
-    if (!result.ok) return res.status(result.error?.includes("expired") ? 401 : 500).json(result);
-    return res.json(result);
+    browser = await chromium.launch({
+      headless: true,
+      args: [
+        "--no-sandbox",
+        "--disable-blink-features=AutomationControlled",
+        "--disable-dev-shm-usage",
+      ],
+    });
+    const context = await browser.newContext({
+      userAgent:
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " +
+        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+      viewport: { width: 1440, height: 900 },
+      locale: "en-US",
+    });
+
+    const parsedCookies = parseCookies(cookies);
+    if (parsedCookies.length === 0) {
+      await browser.close();
+      return res.status(400).json({ error: "No usable cookies parsed" });
+    }
+    await context.addCookies(parsedCookies);
+
+    const page = await context.newPage();
+
+    // First, hit the campaign manager for THIS advertiser. The captured
+    // cookies' "last active" advertiser may differ from the one we want
+    // to publish in — this initial navigation tells TikTok to activate
+    // the requested account so subsequent draft-editor calls have the
+    // right context.
+    await page.goto(
+      `https://ads.tiktok.com/i18n/manage/campaign?aadvid=${encodeURIComponent(advertiserId)}`,
+      { waitUntil: "domcontentloaded", timeout: 30_000 }
+    ).catch(() => {});
+    await page.waitForTimeout(1500);
+
+    // Now navigate to the draft editor using TikTok's exact URL shape
+    // from the captured publish-request referer.
+    const editorUrl =
+      `https://ads.tiktok.com/i18n/creation/1nn/create/campaign?aadvid=${encodeURIComponent(advertiserId)}` +
+      `&source=campaign_list` +
+      `&campaign_draft_id=${encodeURIComponent(campaignSketchId)}` +
+      `&creation_type=create_new` +
+      `&objective_type=3` +
+      `&temp_campaign_id=${encodeURIComponent(campaignSketchId)}`;
+    await page.goto(editorUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
+
+    if (page.url().includes("/login") || page.url().includes("/passport")) {
+      await browser.close();
+      return res.status(401).json({ error: "TikTok session expired. Re-paste cookies." });
+    }
+
+    // Wait just for DOM-ready instead of networkidle — TikTok's
+    // analytics pings keep the network busy forever, so networkidle
+    // wastes its full 30s timeout. domcontentloaded fires fast.
+    await page.waitForLoadState("domcontentloaded", { timeout: 15_000 }).catch(() => {});
+
+    // Wait specifically until SOME button is rendered. Most of the
+    // page's UI mounts within a second of DOM-ready.
+    await page.waitForSelector('button, [role="button"]', { timeout: 15_000 }).catch(() => {});
+    await page.waitForTimeout(800);
+
+    // Step A: dismiss any onboarding tooltips ("Got it" buttons) so they
+    // don't block subsequent clicks.
+    await page.evaluate(() => {
+      const gotItButtons = Array.from(document.querySelectorAll("button"))
+        .filter(b => /^got it$/i.test((b.innerText || "").trim()));
+      for (const b of gotItButtons) b.click();
+    }).catch(() => {});
+
+    // Step B: if a validation warning is shown ("Check ad groups" +
+    // "Create anyway"), click "Create anyway" to dismiss and transition
+    // to the real editor. The URL won't change but the DOM will.
+    const dismissedWarning = await page.evaluate(() => {
+      const buttons = Array.from(document.querySelectorAll("button"));
+      const createAnyway = buttons.find(b => {
+        const t = (b.innerText || "").trim().toLowerCase();
+        return /create anyway/.test(t) && !b.disabled;
+      });
+      if (createAnyway) {
+        createAnyway.click();
+        return true;
+      }
+      return false;
+    });
+    if (dismissedWarning) {
+      // Editor transition is fast — 800ms is plenty.
+      await page.waitForTimeout(800);
+    }
+
+    // Step C: scroll to surface the sticky-footer Publish button.
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+    await page.waitForTimeout(400);
+
+    // Step D: click "Publish all". TikTok renders this as a styled <div>
+    // (with a dropdown arrow), not a <button> — so we widen the
+    // selector to any clickable element. Match strictly on visible text
+    // so we don't accidentally click the dropdown arrow's own item.
+    const publishClicked = await page.evaluate(() => {
+      const all = Array.from(document.querySelectorAll(
+        'button, [role="button"], a, [class*="btn" i], [class*="button" i]'
+      ));
+      const patterns = [/^publish all$/, /^publish$/];
+      for (const pat of patterns) {
+        const match = all.find(el => {
+          if (el.disabled) return false;
+          // Skip hidden elements
+          const style = window.getComputedStyle(el);
+          if (style.display === "none" || style.visibility === "hidden") return false;
+          const text = (el.innerText || el.textContent || "").trim().toLowerCase();
+          // Some elements wrap "Publish all" with a dropdown arrow icon
+          // ("Publish all ▾") — match if text starts with publish all.
+          return pat.test(text) || /^publish all\s*[▾▼⌄]/i.test(text);
+        });
+        if (match) {
+          match.scrollIntoView({ block: "center" });
+          match.click();
+          return (match.innerText || match.textContent || "").trim();
+        }
+      }
+      return false;
+    });
+
+    if (!publishClicked) {
+      const diag = await page.evaluate(() => {
+        const all = Array.from(document.querySelectorAll(
+          'button, [role="button"], a, [class*="btn" i], [class*="button" i]'
+        )).map(b => ({
+          tag: b.tagName.toLowerCase(),
+          text: (b.innerText || b.textContent || "").trim().slice(0, 60),
+          disabled: !!b.disabled,
+        })).filter(b => b.text).slice(0, 50);
+        return { url: location.href, all };
+      });
+      const shot = await page.screenshot({ fullPage: true }).catch(() => null);
+      const shotId = shot ? saveScreenshot(shot) : null;
+      const base = req.protocol + "://" + req.get("host");
+      await browser.close();
+      return res.status(500).json({
+        error: `Publish button not found. url=${diag.url} | screenshot=${shotId ? `${base}/screenshots/${shotId}` : "n/a"} | clickables=${JSON.stringify(diag.all).slice(0, 1500)}`,
+      });
+    }
+
+    // After clicking Publish all, TikTok may show a confirm dialog OR
+    // immediately submit. We click any confirm button if present, then
+    // wait briefly for the submit to fire. URL doesn't reliably change
+    // (TikTok often stays on the same page post-publish + shows a
+    // success toast), so we just trust the click — the campaign list
+    // will show the new state.
+    await page.waitForTimeout(800);
+    await page.evaluate(() => {
+      const buttons = Array.from(document.querySelectorAll("button"));
+      for (const b of buttons.reverse()) {
+        const t = (b.innerText || b.textContent || "").trim().toLowerCase();
+        if (/^(confirm|publish|publish all|submit|ok)$/.test(t) && !b.disabled) {
+          const inDialog =
+            b.closest('[role="dialog"], [class*="modal" i], [class*="dialog" i], [class*="popup" i]');
+          if (inDialog) {
+            b.click();
+            return true;
+          }
+        }
+      }
+      return false;
+    }).catch(() => {});
+
+    // Poll for an explicit success/error signal for up to 15s. Previous
+    // version was fail-OPEN (returned ok:true unless an explicit error
+    // was visible) which silently masked publishes that quietly stalled
+    // — the campaigns then showed up as drafts in TikTok while adsalim
+    // reported "published". Now fail-CLOSED: no success toast within
+    // the window = ok:false.
+    let postState = { hasSuccess: false, hasError: false, bodyText: "", url: page.url() };
+    const POLL_MS = 500;
+    const POLL_MAX = 30; // 30 * 500ms = 15s
+    for (let attempt = 0; attempt < POLL_MAX; attempt++) {
+      await page.waitForTimeout(POLL_MS);
+      postState = await page.evaluate(() => {
+        const bodyText = (document.body.innerText || "").slice(0, 5000);
+        const hasSuccess = /publish.*success|published successfully|create success|成功/i.test(bodyText);
+        const hasError = /failed|error|insufficient|permission denied|risk/i.test(bodyText.slice(0, 2000));
+        return { hasSuccess, hasError, bodyText: bodyText.slice(0, 800), url: location.href };
+      });
+      if (postState.hasSuccess || postState.hasError) break;
+    }
+
+    const shot = await page.screenshot({ fullPage: false }).catch(() => null);
+    const shotId = shot ? saveScreenshot(shot) : null;
+    const base = req.protocol + "://" + req.get("host");
+    const shotUrl = shotId ? `${base}/screenshots/${shotId}` : "n/a";
+
+    await browser.close();
+
+    if (postState.hasError && !postState.hasSuccess) {
+      return res.status(500).json({
+        ok: false,
+        error: `Post-publish shows error. screenshot=${shotUrl} | body=${postState.bodyText}`,
+      });
+    }
+
+    if (!postState.hasSuccess) {
+      return res.status(500).json({
+        ok: false,
+        error: `No publish success toast after 15s — draft likely still pending. screenshot=${shotUrl} | url=${postState.url} | body=${postState.bodyText}`,
+      });
+    }
+
+    return res.json({
+      ok: true,
+      newCampaignId: campaignSketchId,
+      screenshot: shotUrl !== "n/a" ? shotUrl : undefined,
+    });
   } catch (err) {
+    if (browser) await browser.close().catch(() => {});
     return res.status(500).json({ error: err instanceof Error ? err.message : "Internal error" });
-  } finally {
-    releasePublishSlot();
   }
 });
 
-app.post("/publish-batch", async (req, res) => {
-  if (!checkAuth(req, res)) return;
-
-  const { advertiserId, cookies, drafts } = req.body || {};
-  if (!advertiserId || !cookies || !Array.isArray(drafts) || drafts.length === 0) {
-    return res.status(400).json({
-      error: "advertiserId, cookies, drafts[] required",
-    });
+// ===========================================================
+//  /create-smart-plus-campaign
+//  MVP — drive TikTok's "Create Campaign" UI via Playwright instead
+//  of guessing the public-API field shape. Body:
+//    {
+//      advertiserId: string,
+//      cookies: string,
+//      objective: "SALES" | "TRAFFIC" | ...,  // default SALES
+//      destination: "WEBSITE" | "APP" | ...,  // default WEBSITE
+//      campaignName: string,
+//      adgroupBudgetUSD: number,              // daily, per adgroup
+//    }
+//  Returns: { ok, screenshots: string[], url, bodyExcerpt, error? }
+//  Each navigation step takes a screenshot so the caller can see
+//  exactly what the VM saw at every stage. This is intentionally
+//  a "navigate + observe" first cut — once selectors are confirmed
+//  via the screenshots we layer in form-filling + submit.
+// ===========================================================
+app.post("/create-smart-plus-campaign", async (req, res) => {
+  const auth = req.headers.authorization || "";
+  if (!SHARED_SECRET || auth !== `Bearer ${SHARED_SECRET}`) {
+    return res.status(401).json({ error: "Unauthorized" });
   }
-  if (drafts.length > 20) {
-    return res.status(400).json({ error: "Max 20 drafts per batch" });
-  }
 
-  const started = Date.now();
-  const normalized = drafts.map((draft) => ({
-    name: draft?.name ? String(draft.name) : undefined,
-    campaignSketchId: String(draft?.campaignSketchId || draft?.sketchId || ""),
-  }));
-  const invalid = normalized.find((d) => !d.campaignSketchId);
-  if (invalid) {
-    return res.status(400).json({ error: "campaignSketchId required for each draft" });
-  }
-
-  const publishOut = await publishDraftsParallel({
+  const {
     advertiserId,
     cookies,
-    drafts: normalized,
-  });
+    objective = "SALES",
+    destination = "WEBSITE",
+    campaignName = "VM-created campaign",
+    adgroupBudgetUSD = 20,
+  } = req.body || {};
+  if (!advertiserId || !cookies) {
+    return res.status(400).json({ error: "advertiserId and cookies required" });
+  }
 
-  return res.json({
-    ok: publishOut.published === publishOut.total,
-    published: publishOut.published,
-    total: publishOut.total,
-    elapsedMs: Date.now() - started,
-    results: publishOut.results,
-  });
+  const base = req.protocol + "://" + req.get("host");
+  const shots = [];
+
+  async function shot(page, label) {
+    try {
+      const buf = await page.screenshot({ fullPage: false });
+      const id = saveScreenshot(buf);
+      shots.push({ label, url: `${base}/screenshots/${id}` });
+    } catch {}
+  }
+
+  // Click any clickable element whose visible text matches `re`.
+  async function clickByText(page, re, label) {
+    const clicked = await page.evaluate((rs) => {
+      const re = new RegExp(rs);
+      const all = Array.from(document.querySelectorAll(
+        'button, [role="button"], a, [class*="btn" i], [class*="button" i], [class*="card" i]',
+      ));
+      for (const el of all) {
+        const text = (el.innerText || el.textContent || "").trim();
+        if (!text || text.length > 80) continue;
+        if (!re.test(text)) continue;
+        if (el.disabled) continue;
+        const style = window.getComputedStyle(el);
+        if (style.display === "none" || style.visibility === "hidden") continue;
+        el.scrollIntoView({ block: "center" });
+        (el).click();
+        return text;
+      }
+      return null;
+    }, re.source);
+    if (!clicked) console.warn(`[create-campaign] could not click "${label}" via ${re}`);
+    return clicked;
+  }
+
+  let browser;
+  try {
+    browser = await chromium.launch({
+      headless: true,
+      args: [
+        "--no-sandbox",
+        "--disable-blink-features=AutomationControlled",
+        "--disable-dev-shm-usage",
+      ],
+    });
+    const context = await browser.newContext({
+      userAgent:
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " +
+        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+      viewport: { width: 1440, height: 900 },
+      locale: "en-US",
+    });
+
+    const parsedCookies = parseCookies(cookies);
+    if (parsedCookies.length === 0) {
+      await browser.close();
+      return res.status(400).json({ error: "No usable cookies parsed" });
+    }
+    await context.addCookies(parsedCookies);
+
+    const page = await context.newPage();
+
+    // 1. Activate the advertiser context.
+    await page.goto(
+      `https://ads.tiktok.com/i18n/manage/campaign?aadvid=${encodeURIComponent(advertiserId)}`,
+      { waitUntil: "domcontentloaded", timeout: 30_000 },
+    ).catch(() => {});
+    await page.waitForTimeout(1500);
+
+    // 2. Open the Create Campaign flow directly.
+    await page.goto(
+      `https://ads.tiktok.com/i18n/creation/1nn/create/campaign?aadvid=${encodeURIComponent(advertiserId)}&creation_type=create_new`,
+      { waitUntil: "domcontentloaded", timeout: 45_000 },
+    );
+
+    if (page.url().includes("/login") || page.url().includes("/passport")) {
+      await browser.close();
+      return res.status(401).json({ error: "TikTok session expired. Re-paste cookies." });
+    }
+
+    await page.waitForLoadState("domcontentloaded", { timeout: 15_000 }).catch(() => {});
+    await page.waitForSelector('button, [role="button"]', { timeout: 15_000 }).catch(() => {});
+    await page.waitForTimeout(1500);
+
+    await shot(page, "01-initial");
+
+    // 3. Dismiss any "Got it" / coachmarks.
+    await page.evaluate(() => {
+      const gotIt = Array.from(document.querySelectorAll("button"))
+        .filter(b => /^got it$/i.test((b.innerText || "").trim()));
+      for (const b of gotIt) b.click();
+    }).catch(() => {});
+
+    // 4. Pick objective (default Sales).
+    const objectiveLabel = objective === "TRAFFIC" ? "Traffic"
+      : objective === "REACH" ? "Reach"
+      : "Sales";
+    const objClicked = await clickByText(page, new RegExp(`^\\s*${objectiveLabel}\\s*$`, "i"), `objective:${objectiveLabel}`);
+    await page.waitForTimeout(900);
+    await shot(page, "02-after-objective");
+
+    // 5. Pick destination (default Website).
+    const destLabel = destination === "APP" ? "App"
+      : destination === "TIKTOK_SHOP" ? "TikTok Shop"
+      : "Website";
+    const destClicked = await clickByText(page, new RegExp(`^\\s*${destLabel}\\s*$`, "i"), `destination:${destLabel}`);
+    await page.waitForTimeout(900);
+    await shot(page, "03-after-destination");
+
+    // 6. Fill campaign name if a Campaign-name input is rendered.
+    const nameFilled = await page.evaluate((name) => {
+      const inputs = Array.from(document.querySelectorAll('input[type="text"], input:not([type])'));
+      for (const inp of inputs) {
+        const placeholder = (inp.getAttribute("placeholder") || "").toLowerCase();
+        const ariaLabel = (inp.getAttribute("aria-label") || "").toLowerCase();
+        const labelEl = inp.closest("label")?.textContent?.toLowerCase() || "";
+        const hit = /campaign\s*name|^name$/i.test(placeholder + " " + ariaLabel + " " + labelEl);
+        if (hit) {
+          const proto = window.HTMLInputElement.prototype;
+          const setter = Object.getOwnPropertyDescriptor(proto, "value").set;
+          setter.call(inp, name);
+          inp.dispatchEvent(new Event("input", { bubbles: true }));
+          inp.dispatchEvent(new Event("change", { bubbles: true }));
+          return true;
+        }
+      }
+      return false;
+    }, campaignName);
+
+    await page.waitForTimeout(500);
+    await shot(page, "04-after-name");
+
+    // 7. (Future steps go here: budget, continue → adgroup, targeting,
+    //    pixel, creatives, submit. For this MVP we stop here and let
+    //    the user inspect screenshots so we know which selectors actually
+    //    exist on TikTok's current UI.)
+
+    const bodyExcerpt = await page.evaluate(() => (document.body.innerText || "").slice(0, 1500));
+    const finalUrl = page.url();
+
+    await browser.close();
+    return res.json({
+      ok: true,
+      url: finalUrl,
+      objectiveClicked: objClicked,
+      destinationClicked: destClicked,
+      nameFilled,
+      adgroupBudgetUSD,
+      bodyExcerpt,
+      screenshots: shots,
+    });
+  } catch (err) {
+    if (browser) await browser.close().catch(() => {});
+    return res.status(500).json({
+      error: err instanceof Error ? err.message : "Internal error",
+      screenshots: shots,
+    });
+  }
 });
 
-function normalizeSameSite(value) {
-  if (value == null || value === "" || value === "unspecified") return "Lax";
-  const v = String(value).toLowerCase();
-  if (v === "no_restriction" || v === "none") return "None";
-  if (v === "strict") return "Strict";
-  if (v === "lax") return "Lax";
-  return "Lax";
-}
-
 function parseCookies(raw) {
-  let trimmed = String(raw).trim();
-  trimmed = trimmed.replace(/^cookie:\s*/i, "").replace(/^["']|["']$/g, "");
+  const trimmed = String(raw).trim();
   if (trimmed.startsWith("[")) {
     try {
       const arr = JSON.parse(trimmed);
@@ -2039,7 +508,7 @@ function parseCookies(raw) {
           expires: typeof c.expirationDate === "number" ? c.expirationDate : -1,
           httpOnly: Boolean(c.httpOnly),
           secure: Boolean(c.secure ?? true),
-          sameSite: normalizeSameSite(c.sameSite),
+          sameSite: c.sameSite || "Lax",
         }))
         .filter((c) => c.name && c.value);
     } catch {
@@ -2070,5 +539,5 @@ function parseCookies(raw) {
 }
 
 app.listen(PORT, () => {
-  console.log(`adsalim-vm-service v${SERVICE_VERSION} listening on :${PORT} (concurrency=${MAX_CONCURRENT_PUBLISH})`);
+  console.log(`adsalim-vm-service listening on :${PORT}`);
 });
