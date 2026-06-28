@@ -345,28 +345,62 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
     } catch {}
   }
 
-  // Click any clickable element whose visible text matches `re`. Casts a
-  // wide net — TikTok renders objectives as radio rows (label + icon),
-  // destinations as cards, and onboarding actions as plain divs, so we
-  // include label/li/div/span etc. instead of just buttons.
+  // Click any clickable element whose visible text matches `re`.
+  // Strategy: try radio/label/row-style containers FIRST (TikTok renders
+  // objectives as <label> wrapping a radio input — clicking a random span
+  // inside doesn't toggle the radio). Fall back to broader pool only if
+  // the first pass finds nothing.
   async function clickByText(page, re, label) {
     const clicked = await page.evaluate((rs) => {
       const re = new RegExp(rs);
+      function visible(el) {
+        const style = window.getComputedStyle(el);
+        if (style.display === "none" || style.visibility === "hidden") return false;
+        if (style.pointerEvents === "none") return false;
+        const r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+      }
+      function clickFor(el) {
+        el.scrollIntoView({ block: "center" });
+        // Trigger a real-looking click sequence — some React forms ignore
+        // a bare .click() and only respond to pointerdown/mouseup chains.
+        el.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+        el.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+        el.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+        el.click();
+        // If the matched element contains a radio input, also click it
+        // directly so its state actually toggles.
+        const radio = el.querySelector?.('input[type="radio"], [role="radio"]');
+        if (radio) {
+          radio.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+          radio.click();
+        }
+      }
+
+      // Pass 1: prefer radio-like rows / labels / option cards.
+      const radioRows = Array.from(document.querySelectorAll(
+        'label, [role="radio"], [role="option"], [class*="radio" i], [class*="option-item" i], [class*="objective" i], [class*="card" i], [class*="row" i]',
+      ));
+      for (const el of radioRows) {
+        if (el.disabled || !visible(el)) continue;
+        const text = (el.innerText || "").trim();
+        if (!text || text.length > 120) continue;
+        if (!re.test(text)) continue;
+        clickFor(el);
+        return text;
+      }
+
+      // Pass 2: broader pool (any clickable-ish element).
       const all = Array.from(document.querySelectorAll(
-        'button, [role="button"], a, label, li, [role="radio"], [class*="btn" i], [class*="button" i], [class*="card" i], [class*="option" i], [class*="row" i], div, span',
+        'button, [role="button"], a, li, div, span',
       ));
       for (const el of all) {
-        if (el.children.length > 6) continue; // skip large containers
+        if (el.children.length > 6) continue;
+        if (el.disabled || !visible(el)) continue;
         const text = (el.innerText || el.textContent || "").trim();
         if (!text || text.length > 120) continue;
         if (!re.test(text)) continue;
-        if (el.disabled) continue;
-        const style = window.getComputedStyle(el);
-        if (style.display === "none" || style.visibility === "hidden" || style.pointerEvents === "none") continue;
-        const r = el.getBoundingClientRect();
-        if (r.width === 0 || r.height === 0) continue;
-        el.scrollIntoView({ block: "center" });
-        (el).click();
+        clickFor(el);
         return text;
       }
       return null;
@@ -462,21 +496,24 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
     await shot(page, "01b-after-modal-dismiss");
 
     // 4. Pick objective (default Sales). The objective rows are radio
-    //    inputs labeled by adjacent text — clickByText now searches
-    //    label/div/span as well as buttons, so the label text is enough.
+    //    inputs labeled by adjacent text — clickByText now prefers
+    //    radio/label/row-style containers.
     const objectiveLabel = objective === "TRAFFIC" ? "Traffic"
       : objective === "REACH" ? "Reach"
       : "Sales";
     const objClicked = await clickByText(page, new RegExp(`^\\s*${objectiveLabel}\\s*$`, "i"), `objective:${objectiveLabel}`);
-    await page.waitForTimeout(900);
+    await page.waitForTimeout(1500);
+    await dismissModals(page); // TikTok re-renders the announcement after objective change
     await shot(page, "02-after-objective");
 
-    // 5. Pick destination (default Website).
+    // 5. Pick destination (default Website). Same announcement modal
+    //    sometimes pops back during this transition.
     const destLabel = destination === "APP" ? "App"
       : destination === "TIKTOK_SHOP" ? "TikTok Shop"
       : "Website";
     const destClicked = await clickByText(page, new RegExp(`^\\s*${destLabel}\\s*$`, "i"), `destination:${destLabel}`);
-    await page.waitForTimeout(900);
+    await page.waitForTimeout(1200);
+    await dismissModals(page);
     await shot(page, "03-after-destination");
 
     // 6. Fill campaign name if a Campaign-name input is rendered.
