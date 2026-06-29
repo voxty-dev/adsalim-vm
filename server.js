@@ -329,6 +329,14 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
     destination = "WEBSITE",
     campaignName = "VM-created campaign",
     adgroupBudgetUSD = 20,
+    // Ad-group settings applied on step 2.
+    pixelId = null,
+    optimizationEvent = null,   // e.g. "SHOPPING", "PURCHASE", "ADD_TO_CART"
+    countryIds = [],            // TikTok numeric location IDs
+    ageGroupIds = [],           // ["AGE_18_24", ...]
+    gender = null,              // "GENDER_UNLIMITED" | "GENDER_MALE" | "GENDER_FEMALE"
+    targetCPA = null,           // number or null
+    bidStrategy = null,         // "BID_TYPE_NO_BID" or "BID_TYPE_CUSTOM"
   } = req.body || {};
   if (!advertiserId || !cookies) {
     return res.status(400).json({ error: "advertiserId and cookies required" });
@@ -797,6 +805,161 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
     // whether the toggle was actually found + turned off.
     void catalogOff;
 
+    // ============================================================
+    // STEP 2: AD GROUP page (Optimization + Targeting + Budget)
+    // ============================================================
+    // We're (hopefully) on the ad-group editor now. Fill the fields
+    // the user configured on Launch v2 form, then click Continue
+    // again to reach the Ad step.
+
+    // 10. Set the data-connection (Pixel) dropdown by visible label
+    //     match. Stored as { found, picked } in adGroupReport.
+    const adGroupReport = {};
+
+    async function openLabeledDropdown(page, labelRe) {
+      return await page.evaluate((rs) => {
+        const re = new RegExp(rs);
+        const all = Array.from(document.querySelectorAll("label, div, span, p"));
+        let label = null;
+        for (const el of all) {
+          if (el.children.length > 1) continue;
+          const t = (el.innerText || "").trim();
+          if (re.test(t) && t.length < 80) { label = el; break; }
+        }
+        if (!label) return false;
+        let cursor = label;
+        for (let i = 0; i < 6 && cursor; i++) {
+          const parent = cursor.parentElement;
+          if (!parent) break;
+          // Find a select-like trigger below/next to the label.
+          const trigger = parent.querySelector(
+            '[role="combobox"], [class*="select" i]:not([class*="selected" i]), [class*="dropdown" i] [class*="trigger" i], [class*="picker" i]',
+          );
+          if (trigger) {
+            const r = trigger.getBoundingClientRect();
+            if (r.width > 0 && r.height > 0) {
+              trigger.scrollIntoView({ block: "center" });
+              trigger.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+              trigger.click();
+              return true;
+            }
+          }
+          cursor = parent;
+        }
+        return false;
+      }, labelRe.source);
+    }
+
+    async function pickDropdownOption(page, optionRe) {
+      // Wait briefly for options to render.
+      await page.waitForTimeout(400);
+      return await page.evaluate((rs) => {
+        const re = new RegExp(rs);
+        const options = Array.from(document.querySelectorAll(
+          '[role="option"], [class*="option" i]:not([class*="options" i]), li, [class*="dropdown-item" i]',
+        ));
+        for (const o of options) {
+          const t = (o.innerText || "").trim();
+          if (!t || t.length > 200) continue;
+          if (!re.test(t)) continue;
+          const r = o.getBoundingClientRect();
+          if (r.width === 0 || r.height === 0) continue;
+          const cs = window.getComputedStyle(o);
+          if (cs.display === "none" || cs.visibility === "hidden") continue;
+          o.scrollIntoView({ block: "center" });
+          o.click();
+          return t;
+        }
+        return null;
+      }, optionRe.source);
+    }
+
+    // 10a. Data connection (Pixel)
+    if (pixelId) {
+      const opened = await openLabeledDropdown(page, /^\s*Data\s*connection\s*$/i);
+      if (opened) {
+        const picked = await pickDropdownOption(page, new RegExp(pixelId, "i"));
+        adGroupReport.pixelPick = picked ? `picked:${picked}` : "no-match";
+        await page.waitForTimeout(400);
+        // Close any lingering dropdown.
+        await page.keyboard.press("Escape").catch(() => {});
+      } else {
+        adGroupReport.pixelPick = "no-dropdown";
+      }
+    }
+
+    // 10b. Optimization event
+    if (optimizationEvent) {
+      const opened = await openLabeledDropdown(page, /^\s*Optimization\s*event\s*$/i);
+      if (opened) {
+        const picked = await pickDropdownOption(page, new RegExp(optimizationEvent, "i"));
+        adGroupReport.eventPick = picked ? `picked:${picked}` : "no-match";
+        await page.waitForTimeout(400);
+        await page.keyboard.press("Escape").catch(() => {});
+      } else {
+        adGroupReport.eventPick = "no-dropdown";
+      }
+    }
+
+    // 11. Scroll down so the rest of the ad-group form (audience,
+    //     placements, budget, schedule) is in view for screenshots.
+    await page.evaluate(() => window.scrollBy(0, window.innerHeight));
+    await page.waitForTimeout(600);
+    await dismissModals(page);
+    await shot(page, "06-adgroup-mid");
+
+    // 12. (Future) Set country / age / gender / budget / bid strategy.
+    //     We surface what we did via adGroupReport and let the next
+    //     iteration wire each form-fill.
+
+    // 13. Click Continue at the bottom to advance to the Ad step.
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+    await page.waitForTimeout(500);
+    await dismissModals(page);
+    const adgroupContinueClicked = await page.evaluate(() => {
+      function visible(el) {
+        const r = el.getBoundingClientRect();
+        const cs = window.getComputedStyle(el);
+        return r.width > 0 && r.height > 0 && cs.display !== "none" && cs.visibility !== "hidden" && cs.pointerEvents !== "none";
+      }
+      function isDisabled(el) {
+        if (el.disabled) return true;
+        if (el.getAttribute("aria-disabled") === "true") return true;
+        const cls = (typeof el.className === "string") ? el.className : "";
+        return /disabled/i.test(cls);
+      }
+      function clickIt(el) {
+        el.scrollIntoView({ block: "center" });
+        try { el.focus(); } catch {}
+        el.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+        el.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+        el.click();
+      }
+      const all = Array.from(document.querySelectorAll("*"));
+      for (const el of all) {
+        if (el.children.length > 0) continue;
+        const text = (el.innerText || el.textContent || "").trim();
+        if (!/^continue$/i.test(text)) continue;
+        let cursor = el;
+        for (let i = 0; i < 8 && cursor; i++) {
+          if (cursor.matches?.('button, [role="button"], a, [class*="btn" i], [class*="button" i]')) {
+            if (visible(cursor) && !isDisabled(cursor)) {
+              clickIt(cursor);
+              return "walk-up:" + cursor.tagName.toLowerCase();
+            }
+          }
+          cursor = cursor.parentElement;
+        }
+      }
+      return null;
+    });
+    await page.waitForTimeout(4000);
+    await dismissModals(page);
+    await shot(page, "07-after-adgroup-continue");
+    adGroupReport.continueClicked = adgroupContinueClicked;
+    void pixelId; void optimizationEvent; void countryIds; void ageGroupIds;
+    void gender; void targetCPA; void bidStrategy;
+
     // 8. (Next pass: fill ad-group targeting + budget + pixel +
     //    optimization event, then Continue again into the ad step.
     //    For now we stop here so the next debug round can see what
@@ -814,6 +977,7 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
       nameFilled,
       catalogOff,
       continueClicked,
+      adGroupReport,
       adgroupBudgetUSD,
       bodyExcerpt,
       screenshots: shots,
