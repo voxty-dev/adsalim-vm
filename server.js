@@ -820,30 +820,40 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
     async function openLabeledDropdown(page, labelRe) {
       return await page.evaluate((rs) => {
         const re = new RegExp(rs);
-        const all = Array.from(document.querySelectorAll("label, div, span, p"));
+        const all = Array.from(document.querySelectorAll("*"));
         let label = null;
         for (const el of all) {
           if (el.children.length > 1) continue;
-          const t = (el.innerText || "").trim();
-          if (re.test(t) && t.length < 80) { label = el; break; }
+          const t = (el.innerText || el.textContent || "").trim();
+          if (!t || t.length > 80) continue;
+          if (re.test(t)) { label = el; break; }
         }
         if (!label) return false;
+        function visible(el) {
+          const r = el.getBoundingClientRect();
+          const cs = window.getComputedStyle(el);
+          return r.width > 0 && r.height > 0 && cs.display !== "none" && cs.visibility !== "hidden";
+        }
         let cursor = label;
-        for (let i = 0; i < 6 && cursor; i++) {
+        for (let i = 0; i < 8 && cursor; i++) {
           const parent = cursor.parentElement;
           if (!parent) break;
-          // Find a select-like trigger below/next to the label.
-          const trigger = parent.querySelector(
-            '[role="combobox"], [class*="select" i]:not([class*="selected" i]), [class*="dropdown" i] [class*="trigger" i], [class*="picker" i]',
-          );
-          if (trigger) {
-            const r = trigger.getBoundingClientRect();
-            if (r.width > 0 && r.height > 0) {
-              trigger.scrollIntoView({ block: "center" });
-              trigger.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
-              trigger.click();
-              return true;
-            }
+          // Look for ANY clickable-looking element near the label that
+          // could be the dropdown trigger. TikTok uses Kuaishou design
+          // system — ks-select, ks-button, etc. — so we cast a wide net.
+          const candidates = Array.from(parent.querySelectorAll(
+            '[role="combobox"], [role="button"], button, ' +
+            'ks-select, ks-button, ks-input, ks-cascader, ' +
+            '[class*="select" i]:not([class*="selected" i]):not([class*="selector" i]), ' +
+            '[class*="dropdown" i], [class*="picker" i], [class*="trigger" i]',
+          ));
+          for (const c of candidates) {
+            if (!visible(c) || c.contains(label) || label.contains(c)) continue;
+            c.scrollIntoView({ block: "center" });
+            c.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+            c.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+            c.click();
+            return true;
           }
           cursor = parent;
         }
@@ -853,14 +863,21 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
 
     async function pickDropdownOption(page, optionRe) {
       // Wait briefly for options to render.
-      await page.waitForTimeout(400);
+      await page.waitForTimeout(500);
       return await page.evaluate((rs) => {
         const re = new RegExp(rs);
+        // Wide net: TikTok uses Kuaishou ks-option/ks-cascader-item, and
+        // also plain li/div. Allow substring match within longer items.
         const options = Array.from(document.querySelectorAll(
-          '[role="option"], [class*="option" i]:not([class*="options" i]), li, [class*="dropdown-item" i]',
+          '[role="option"], ks-option, ks-cascader-item, ' +
+          '[class*="option" i]:not([class*="options" i]), li, ' +
+          '[class*="dropdown-item" i], [class*="select-item" i], ' +
+          '[class*="cascader-item" i], [class*="menu-item" i]',
         ));
         for (const o of options) {
-          const t = (o.innerText || "").trim();
+          // Skip parent containers — focus on leaf-ish options.
+          if (o.children.length > 4) continue;
+          const t = (o.innerText || o.textContent || "").trim();
           if (!t || t.length > 200) continue;
           if (!re.test(t)) continue;
           const r = o.getBoundingClientRect();
@@ -868,6 +885,8 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
           const cs = window.getComputedStyle(o);
           if (cs.display === "none" || cs.visibility === "hidden") continue;
           o.scrollIntoView({ block: "center" });
+          o.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+          o.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
           o.click();
           return t;
         }
@@ -922,10 +941,12 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
     }
 
     // 10c. Bid strategy dropdown — "Target cost per result" / "Maximum delivery".
+    //      TikTok wording varies: "Maximum delivery", "Maximum delivery
+    //      (lowest cost)", "Highest volume", etc. Match permissively.
     if (bidStrategy) {
       const bidLabelRe = bidStrategy === "BID_TYPE_CUSTOM"
-        ? /^\s*Target\s*cost\s*per\s*result\s*$/i
-        : /^\s*(Maximum\s*delivery|Lowest\s*cost)\s*$/i;
+        ? /target\s*cost/i
+        : /maximum\s*delivery|lowest\s*cost|highest\s*volume|auto\s*bid/i;
       const opened = await openLabeledDropdown(page, /^\s*Bid\s*strategy\s*$/i);
       if (opened) {
         const picked = await pickDropdownOption(page, bidLabelRe);
