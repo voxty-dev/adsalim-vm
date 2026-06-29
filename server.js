@@ -823,7 +823,9 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
         const all = Array.from(document.querySelectorAll("*"));
         let label = null;
         for (const el of all) {
-          if (el.children.length > 1) continue;
+          // Allow up to 3 children — TikTok often wraps labels with an
+          // info icon and a tooltip ("Data connection ⓘ").
+          if (el.children.length > 3) continue;
           const t = (el.innerText || el.textContent || "").trim();
           if (!t || t.length > 80) continue;
           if (re.test(t)) { label = el; break; }
@@ -866,29 +868,58 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
       await page.waitForTimeout(500);
       return await page.evaluate((rs) => {
         const re = new RegExp(rs);
-        // Wide net: TikTok uses Kuaishou ks-option/ks-cascader-item, and
-        // also plain li/div. Allow substring match within longer items.
-        const options = Array.from(document.querySelectorAll(
+        function visible(el) {
+          const r = el.getBoundingClientRect();
+          const cs = window.getComputedStyle(el);
+          return r.width > 0 && r.height > 0 && cs.display !== "none" && cs.visibility !== "hidden";
+        }
+        function clickIt(el) {
+          el.scrollIntoView({ block: "center" });
+          el.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+          el.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+          el.click();
+        }
+
+        // Pass 1: structured option elements with matching text.
+        const optionLikes = Array.from(document.querySelectorAll(
           '[role="option"], ks-option, ks-cascader-item, ' +
           '[class*="option" i]:not([class*="options" i]), li, ' +
           '[class*="dropdown-item" i], [class*="select-item" i], ' +
           '[class*="cascader-item" i], [class*="menu-item" i]',
         ));
-        for (const o of options) {
-          // Skip parent containers — focus on leaf-ish options.
-          if (o.children.length > 4) continue;
+        for (const o of optionLikes) {
+          if (o.children.length > 6) continue;
           const t = (o.innerText || o.textContent || "").trim();
           if (!t || t.length > 200) continue;
           if (!re.test(t)) continue;
-          const r = o.getBoundingClientRect();
-          if (r.width === 0 || r.height === 0) continue;
-          const cs = window.getComputedStyle(o);
-          if (cs.display === "none" || cs.visibility === "hidden") continue;
-          o.scrollIntoView({ block: "center" });
-          o.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
-          o.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
-          o.click();
-          return t;
+          if (!visible(o)) continue;
+          clickIt(o);
+          return "pass1:" + t.slice(0, 60);
+        }
+
+        // Pass 2: walk EVERY visible leaf with matching text and try to
+        // find a clickable parent inside an open dropdown/popup. Some
+        // designs render options as <div>text</div> inside a portal.
+        const all = Array.from(document.querySelectorAll("*"));
+        for (const el of all) {
+          if (el.children.length > 0) continue;
+          const t = (el.innerText || el.textContent || "").trim();
+          if (!t || t.length > 200) continue;
+          if (!re.test(t)) continue;
+          if (!visible(el)) continue;
+          // Walk up to find a clickable parent that's inside a portal/popup.
+          let cursor = el;
+          for (let i = 0; i < 8 && cursor; i++) {
+            const cls = (typeof cursor.className === "string") ? cursor.className : "";
+            const inPopup = /popup|portal|overlay|dropdown|cascader|select|menu/i.test(cls);
+            if (inPopup || cursor.matches?.('button, [role="option"], [role="button"], li')) {
+              if (visible(cursor)) {
+                clickIt(cursor);
+                return "pass2:" + t.slice(0, 60);
+              }
+            }
+            cursor = cursor.parentElement;
+          }
         }
         return null;
       }, optionRe.source);
