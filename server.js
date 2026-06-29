@@ -331,6 +331,7 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
     adgroupBudgetUSD = 20,
     // Ad-group settings applied on step 2.
     pixelId = null,
+    pixelName = null,           // Human-readable label TikTok shows ("PRST TR 3")
     optimizationEvent = null,   // e.g. "SHOPPING", "PURCHASE", "ADD_TO_CART"
     countryIds = [],            // TikTok numeric location IDs
     ageGroupIds = [],           // ["AGE_18_24", ...]
@@ -874,19 +875,22 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
       }, optionRe.source);
     }
 
-    // 10a. Data connection (Pixel)
-    if (pixelId) {
+    // 10a. Data connection (Pixel) — match by visible pixel NAME ("PRST TR 3").
+    //      The numeric pixel_id never appears in the dropdown UI.
+    if (pixelName) {
       const opened = await openLabeledDropdown(page, /^\s*Data\s*connection\s*$/i);
       if (opened) {
-        const picked = await pickDropdownOption(page, new RegExp(pixelId, "i"));
-        adGroupReport.pixelPick = picked ? `picked:${picked}` : "no-match";
+        // Escape regex specials in the name before turning it into a RegExp.
+        const safeName = pixelName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const picked = await pickDropdownOption(page, new RegExp(`^\\s*${safeName}\\s*$`, "i"));
+        adGroupReport.pixelPick = picked ? `picked:${picked}` : `no-match:${pixelName}`;
         await page.waitForTimeout(400);
-        // Close any lingering dropdown.
         await page.keyboard.press("Escape").catch(() => {});
       } else {
         adGroupReport.pixelPick = "no-dropdown";
       }
     }
+    void pixelId; // numeric id kept for future API-based wiring
 
     // 10b. Optimization event
     if (optimizationEvent) {
