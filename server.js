@@ -892,17 +892,125 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
     }
     void pixelId; // numeric id kept for future API-based wiring
 
-    // 10b. Optimization event
+    // 10b. Optimization event — TikTok shows event names as the form
+    //      labels ("Purchase", "Add to Cart", "Shopping") rather than
+    //      the API enum values. Map the API enum to its UI label here.
     if (optimizationEvent) {
+      const eventLabelMap = {
+        SHOPPING: /^\s*(Shopping|Place an Order|Purchase)\s*$/i,
+        PURCHASE: /^\s*(Purchase|Place an Order)\s*$/i,
+        ADD_TO_CART: /^\s*(Add to Cart|Cart)\s*$/i,
+        ADD_PAYMENT_INFO: /^\s*Add Payment Info\s*$/i,
+        SUBSCRIBE: /^\s*Subscribe\s*$/i,
+        FORM: /^\s*(Form|Submit Form|Lead)\s*$/i,
+        CONTACT: /^\s*Contact\s*$/i,
+        ON_WEB_ORDER: /^\s*(Place an Order|Purchase)\s*$/i,
+        ON_WEB_DETAIL: /^\s*View Content\s*$/i,
+        ON_WEB_REGISTER: /^\s*Complete Registration\s*$/i,
+        ON_WEB_SUBSCRIBE: /^\s*Subscribe\s*$/i,
+      };
+      const labelRe = eventLabelMap[optimizationEvent] || new RegExp(`^\\s*${optimizationEvent}\\s*$`, "i");
       const opened = await openLabeledDropdown(page, /^\s*Optimization\s*event\s*$/i);
       if (opened) {
-        const picked = await pickDropdownOption(page, new RegExp(optimizationEvent, "i"));
-        adGroupReport.eventPick = picked ? `picked:${picked}` : "no-match";
+        const picked = await pickDropdownOption(page, labelRe);
+        adGroupReport.eventPick = picked ? `picked:${picked}` : `no-match:${optimizationEvent}`;
         await page.waitForTimeout(400);
         await page.keyboard.press("Escape").catch(() => {});
       } else {
         adGroupReport.eventPick = "no-dropdown";
       }
+    }
+
+    // 10c. Bid strategy dropdown — "Target cost per result" / "Maximum delivery".
+    if (bidStrategy) {
+      const bidLabelRe = bidStrategy === "BID_TYPE_CUSTOM"
+        ? /^\s*Target\s*cost\s*per\s*result\s*$/i
+        : /^\s*(Maximum\s*delivery|Lowest\s*cost)\s*$/i;
+      const opened = await openLabeledDropdown(page, /^\s*Bid\s*strategy\s*$/i);
+      if (opened) {
+        const picked = await pickDropdownOption(page, bidLabelRe);
+        adGroupReport.bidPick = picked ? `picked:${picked}` : `no-match:${bidStrategy}`;
+        await page.waitForTimeout(400);
+        await page.keyboard.press("Escape").catch(() => {});
+      } else {
+        adGroupReport.bidPick = "no-dropdown";
+      }
+    }
+
+    // 10d. Target CPA input — labelled <input> with a USD/Conversion suffix.
+    if (typeof targetCPA === "number" && targetCPA > 0) {
+      const filled = await page.evaluate((cpa) => {
+        const inputs = Array.from(document.querySelectorAll('input[type="text"], input[type="number"], input:not([type])'));
+        for (const inp of inputs) {
+          let cursor = inp;
+          let hasLabel = false;
+          for (let i = 0; i < 5 && cursor && !hasLabel; i++) {
+            const parent = cursor.parentElement;
+            if (!parent) break;
+            for (const sib of parent.children) {
+              if (sib === cursor) continue;
+              const t = (sib.innerText || "").trim();
+              if (/^Target\s*CPA(\s*\(USD\))?$/i.test(t)) { hasLabel = true; break; }
+            }
+            cursor = parent;
+          }
+          if (!hasLabel) continue;
+          inp.scrollIntoView({ block: "center" });
+          inp.focus();
+          inp.select();
+          const proto = window.HTMLInputElement.prototype;
+          const setter = Object.getOwnPropertyDescriptor(proto, "value").set;
+          setter.call(inp, "");
+          inp.dispatchEvent(new Event("input", { bubbles: true }));
+          setter.call(inp, String(cpa));
+          inp.dispatchEvent(new Event("input", { bubbles: true }));
+          inp.dispatchEvent(new Event("change", { bubbles: true }));
+          inp.dispatchEvent(new Event("blur", { bubbles: true }));
+          return true;
+        }
+        return false;
+      }, targetCPA);
+      adGroupReport.targetCPAFilled = filled;
+    }
+
+    // 10e. Daily budget input — TikTok exposes it labelled "Budget" with
+    //      a Daily/Lifetime selector before the amount and a USD suffix.
+    if (adgroupBudgetUSD && adgroupBudgetUSD > 0) {
+      const filled = await page.evaluate((amount) => {
+        const inputs = Array.from(document.querySelectorAll('input[type="text"], input[type="number"], input:not([type])'));
+        for (const inp of inputs) {
+          let cursor = inp;
+          let hasLabel = false;
+          for (let i = 0; i < 6 && cursor && !hasLabel; i++) {
+            const parent = cursor.parentElement;
+            if (!parent) break;
+            for (const sib of parent.children) {
+              if (sib === cursor) continue;
+              const t = (sib.innerText || "").trim();
+              if (/^Budget$/i.test(t)) { hasLabel = true; break; }
+            }
+            cursor = parent;
+          }
+          if (!hasLabel) continue;
+          // Skip the small Daily/Lifetime select that lives next to the
+          // amount — its value is "Daily" not a number.
+          if (/^(Daily|Lifetime)$/i.test(inp.value || "")) continue;
+          inp.scrollIntoView({ block: "center" });
+          inp.focus();
+          inp.select();
+          const proto = window.HTMLInputElement.prototype;
+          const setter = Object.getOwnPropertyDescriptor(proto, "value").set;
+          setter.call(inp, "");
+          inp.dispatchEvent(new Event("input", { bubbles: true }));
+          setter.call(inp, String(amount));
+          inp.dispatchEvent(new Event("input", { bubbles: true }));
+          inp.dispatchEvent(new Event("change", { bubbles: true }));
+          inp.dispatchEvent(new Event("blur", { bubbles: true }));
+          return true;
+        }
+        return false;
+      }, adgroupBudgetUSD);
+      adGroupReport.budgetFilled = filled;
     }
 
     // 11. Scroll down so the rest of the ad-group form (audience,
