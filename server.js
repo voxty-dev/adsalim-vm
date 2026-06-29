@@ -720,12 +720,32 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
     await page.waitForTimeout(300);
 
     // 9. Click "Continue" at the bottom of the page to advance to the
-    //    ad-group step. The button is sticky-positioned — scroll first.
+    //    ad-group step. clickByText too easily matches a <span>Continue</span>
+    //    inside the real <button>, and the span click doesn't trigger
+    //    onClick — so target <button> elements specifically.
     await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
     await page.waitForTimeout(400);
     await dismissModals(page);
-    const continueClicked = await clickByText(page, /^\s*continue\s*$/i, "continue");
-    await page.waitForTimeout(2500);
+    const continueClicked = await page.evaluate(() => {
+      const buttons = Array.from(document.querySelectorAll('button, [role="button"]'));
+      for (const btn of buttons) {
+        const text = (btn.innerText || btn.textContent || "").trim();
+        if (!/^continue$/i.test(text)) continue;
+        if (btn.disabled) continue;
+        const r = btn.getBoundingClientRect();
+        if (r.width === 0 || r.height === 0) continue;
+        const cs = window.getComputedStyle(btn);
+        if (cs.display === "none" || cs.visibility === "hidden" || cs.pointerEvents === "none") continue;
+        btn.scrollIntoView({ block: "center" });
+        btn.focus();
+        btn.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+        btn.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+        btn.click();
+        return text;
+      }
+      return null;
+    });
+    await page.waitForTimeout(3000);
     await dismissModals(page);
     await shot(page, "05-after-continue");
     // Carry the catalog result forward for the response so we can see
