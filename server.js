@@ -720,32 +720,77 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
     await page.waitForTimeout(300);
 
     // 9. Click "Continue" at the bottom of the page to advance to the
-    //    ad-group step. clickByText too easily matches a <span>Continue</span>
-    //    inside the real <button>, and the span click doesn't trigger
-    //    onClick — so target <button> elements specifically.
+    //    ad-group step. Three-pass search since TikTok's primary action
+    //    button isn't always a real <button>: it can be <a>, a div with
+    //    role="button", or a span wrapped in a custom React component.
     await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-    await page.waitForTimeout(400);
+    await page.waitForTimeout(600);
     await dismissModals(page);
     const continueClicked = await page.evaluate(() => {
-      const buttons = Array.from(document.querySelectorAll('button, [role="button"]'));
-      for (const btn of buttons) {
+      function visible(el) {
+        const r = el.getBoundingClientRect();
+        const cs = window.getComputedStyle(el);
+        return r.width > 0 && r.height > 0 && cs.display !== "none" && cs.visibility !== "hidden" && cs.pointerEvents !== "none";
+      }
+      function isDisabled(el) {
+        if (el.disabled) return true;
+        if (el.getAttribute("aria-disabled") === "true") return true;
+        const cls = (typeof el.className === "string") ? el.className : "";
+        return /disabled/i.test(cls);
+      }
+      function clickIt(el) {
+        el.scrollIntoView({ block: "center" });
+        try { el.focus(); } catch {}
+        el.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+        el.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+        el.click();
+      }
+
+      // Pass 1: real <button> or role="button" with innerText exactly "Continue".
+      let candidates = Array.from(document.querySelectorAll('button, [role="button"]'));
+      for (const btn of candidates) {
         const text = (btn.innerText || btn.textContent || "").trim();
         if (!/^continue$/i.test(text)) continue;
-        if (btn.disabled) continue;
-        const r = btn.getBoundingClientRect();
-        if (r.width === 0 || r.height === 0) continue;
-        const cs = window.getComputedStyle(btn);
-        if (cs.display === "none" || cs.visibility === "hidden" || cs.pointerEvents === "none") continue;
-        btn.scrollIntoView({ block: "center" });
-        btn.focus();
-        btn.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
-        btn.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
-        btn.click();
-        return text;
+        if (!visible(btn) || isDisabled(btn)) continue;
+        clickIt(btn);
+        return "pass1:button:" + text;
       }
+
+      // Pass 2: any clickable with aria-label="Continue" / data-testid containing "continue".
+      candidates = Array.from(document.querySelectorAll(
+        'button, [role="button"], a, [class*="btn" i], [class*="button" i]',
+      ));
+      for (const btn of candidates) {
+        const aria = (btn.getAttribute("aria-label") || "").trim();
+        const testid = (btn.getAttribute("data-testid") || "").toLowerCase();
+        const matches = /^continue$/i.test(aria) || /continue/i.test(testid);
+        if (!matches) continue;
+        if (!visible(btn) || isDisabled(btn)) continue;
+        clickIt(btn);
+        return "pass2:aria-or-testid";
+      }
+
+      // Pass 3: walk up from any leaf with text "Continue" to a clickable parent.
+      const all = Array.from(document.querySelectorAll("*"));
+      for (const el of all) {
+        if (el.children.length > 0) continue;
+        const text = (el.innerText || el.textContent || "").trim();
+        if (!/^continue$/i.test(text)) continue;
+        let cursor = el;
+        for (let i = 0; i < 8 && cursor; i++) {
+          if (cursor.matches?.('button, [role="button"], a, [class*="btn" i], [class*="button" i]')) {
+            if (visible(cursor) && !isDisabled(cursor)) {
+              clickIt(cursor);
+              return "pass3:walk-up:" + cursor.tagName.toLowerCase();
+            }
+          }
+          cursor = cursor.parentElement;
+        }
+      }
+
       return null;
     });
-    await page.waitForTimeout(3000);
+    await page.waitForTimeout(4000);
     await dismissModals(page);
     await shot(page, "05-after-continue");
     // Carry the catalog result forward for the response so we can see
