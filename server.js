@@ -432,42 +432,80 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
     await page.keyboard.press("Escape").catch(() => {});
   }
 
-  // Find a labelled toggle (e.g. "Catalog campaign") and force it to OFF.
-  // TikTok toggles are <button role="switch" aria-checked="true|false">.
+  // Find a labelled toggle (e.g. "Catalog campaign") and force it OFF.
+  // TikTok toggles render as <button role="switch">, <div class="switch">,
+  // or a wrapped <input type="checkbox">. Different parts of the form use
+  // different patterns, so the search casts a wide net + falls back to
+  // clicking the label itself.
   async function setToggleOff(page, labelRe) {
     return await page.evaluate((rs) => {
       const re = new RegExp(rs);
-      // Find label/text node matching labelRe.
-      const all = Array.from(document.querySelectorAll("label, div, span, p"));
-      let label = null;
-      for (const el of all) {
-        if (el.children.length > 2) continue;
-        const t = (el.innerText || el.textContent || "").trim();
-        if (re.test(t) && t.length < 60) { label = el; break; }
+
+      function visible(el) {
+        const r = el.getBoundingClientRect();
+        const cs = window.getComputedStyle(el);
+        return r.width > 0 && r.height > 0 && cs.display !== "none" && cs.visibility !== "hidden";
       }
-      if (!label) return { found: false };
-      // Walk ancestors looking for a sibling toggle.
+
+      function clickFor(el) {
+        try { el.scrollIntoView({ block: "center" }); } catch {}
+        try { el.dispatchEvent(new MouseEvent("mousedown", { bubbles: true })); } catch {}
+        try { el.dispatchEvent(new MouseEvent("mouseup", { bubbles: true })); } catch {}
+        try { el.click(); } catch {}
+      }
+
+      function isChecked(el) {
+        const aria = el.getAttribute("aria-checked");
+        if (aria === "true") return true;
+        if (aria === "false") return false;
+        const cls = (el.className && typeof el.className === "string") ? el.className : "";
+        if (/(?:^|[\s_-])(checked|active|on|open|true)(?:[\s_-]|$)/i.test(cls)) return true;
+        // Wrapped <input>
+        const input = el.querySelector?.('input[type="checkbox"], input[type="radio"]');
+        if (input && input.checked) return true;
+        return false;
+      }
+
+      // Find the label/text node.
+      let label = null;
+      const all = Array.from(document.querySelectorAll("*"));
+      for (const el of all) {
+        if (el.children.length > 1) continue;
+        const t = (el.innerText || el.textContent || "").trim();
+        if (!t || t.length > 60) continue;
+        if (re.test(t)) { label = el; break; }
+      }
+      if (!label) return { found: false, reason: "label-text-not-found" };
+
+      // Walk ancestors collecting toggle candidates within each subtree.
       let cursor = label;
-      for (let i = 0; i < 6 && cursor; i++) {
+      for (let i = 0; i < 8 && cursor; i++) {
         const parent = cursor.parentElement;
         if (!parent) break;
-        const toggle = parent.querySelector(
-          '[role="switch"], button[role="checkbox"], [class*="switch" i]:not([class*="switcher" i])',
-        );
-        if (toggle) {
-          const checked =
-            toggle.getAttribute("aria-checked") === "true" ||
-            /(?:^|\s)(?:checked|active|on|open)(?:\s|$|--)/i.test(toggle.className || "");
-          if (checked) {
-            toggle.scrollIntoView({ block: "center" });
-            toggle.click();
-            return { found: true, wasOn: true };
+        const candidates = Array.from(parent.querySelectorAll(
+          '[role="switch"], button[role="checkbox"], [aria-checked], ' +
+          '[class*="switch" i]:not([class*="switcher" i]), ' +
+          '[class*="toggle" i], [class*="checkbox" i]',
+        )).filter(visible);
+        for (const c of candidates) {
+          // Don't accept the label container itself as the toggle.
+          if (c.contains(label) || label.contains(c)) {
+            const checked = isChecked(c);
+            if (checked) { clickFor(c); return { found: true, wasOn: true, strategy: "inside" }; }
+          } else {
+            const checked = isChecked(c);
+            if (checked) { clickFor(c); return { found: true, wasOn: true, strategy: "sibling" }; }
+            // Found a toggle but it's already off — done.
+            return { found: true, wasOn: false, strategy: "sibling-off" };
           }
-          return { found: true, wasOn: false };
         }
         cursor = parent;
       }
-      return { found: false };
+
+      // Fallback — click the label itself; toggles inside <label> respond
+      // to label clicks via input association.
+      clickFor(label);
+      return { found: true, wasOn: "unknown", strategy: "label-click" };
     }, labelRe.source);
   }
 
