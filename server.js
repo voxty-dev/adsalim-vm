@@ -659,8 +659,60 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
     //    default on some accounts when Sales→Website is selected, but
     //    a catalog campaign needs a catalog feed configured, which we
     //    don't have. Continue stays disabled until the toggle is off.
-    const catalogOff = await setToggleOff(page, /^\s*Catalog\s*campaign\s*$/i);
-    await page.waitForTimeout(500);
+    //    Retry up to 3 times with a coordinate-click fallback between
+    //    attempts in case the toggle isn't reachable by selector.
+    let catalogOff = await setToggleOff(page, /^\s*Catalog\s*campaign\s*$/i);
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await page.waitForTimeout(600);
+      // Check if it's still on by looking at any aria-checked=true near
+      // the label, or a class with "checked|active|on".
+      const stillOn = await page.evaluate(() => {
+        const all = Array.from(document.querySelectorAll("*"));
+        let label = null;
+        for (const el of all) {
+          if (el.children.length > 1) continue;
+          const t = (el.innerText || "").trim();
+          if (/^\s*Catalog\s*campaign\s*$/i.test(t)) { label = el; break; }
+        }
+        if (!label) return false;
+        let cursor = label;
+        for (let i = 0; i < 10 && cursor; i++) {
+          const cands = Array.from(cursor.parentElement?.querySelectorAll(
+            '[role="switch"], [aria-checked], [class*="switch" i], [class*="toggle" i]',
+          ) ?? []);
+          for (const c of cands) {
+            const aria = c.getAttribute("aria-checked");
+            const cls = (typeof c.className === "string") ? c.className : "";
+            if (aria === "true") return true;
+            if (/(?:^|[\s_-])(checked|active|on|true)(?:[\s_-]|$)/i.test(cls)) return true;
+          }
+          cursor = cursor.parentElement;
+        }
+        return false;
+      });
+      if (!stillOn) break;
+      // Coordinate-based fallback: click ~28px to the LEFT of the label
+      // (where TikTok's switch visually lives).
+      const clicked = await page.evaluate(() => {
+        const all = Array.from(document.querySelectorAll("*"));
+        for (const el of all) {
+          if (el.children.length > 1) continue;
+          const t = (el.innerText || "").trim();
+          if (!/^\s*Catalog\s*campaign\s*$/i.test(t)) continue;
+          const r = el.getBoundingClientRect();
+          const x = r.left - 28;
+          const y = r.top + r.height / 2;
+          const target = document.elementFromPoint(x, y);
+          if (!target) return false;
+          target.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, clientX: x, clientY: y }));
+          target.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, clientX: x, clientY: y }));
+          target.click();
+          return true;
+        }
+        return false;
+      });
+      catalogOff = { found: true, wasOn: true, strategy: `coord-fallback-${attempt + 1}`, coordClicked: clicked };
+    }
 
     // 8. Dismiss any inline tooltip popups (e.g. "Choose your budget
     //    strategy") that block the Continue button.
