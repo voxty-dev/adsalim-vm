@@ -864,10 +864,13 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
     }
 
     async function pickDropdownOption(page, optionRe) {
-      // Wait briefly for options to render.
-      await page.waitForTimeout(500);
+      // Wait briefly for options to render — TikTok ks-cascader needs ~800ms.
+      await page.waitForTimeout(900);
       return await page.evaluate((rs) => {
         const re = new RegExp(rs);
+        // Diagnostic: collect ALL visible option-ish text we see so we
+        // can debug regex mismatches from outside the VM.
+        const seen = [];
         function visible(el) {
           const r = el.getBoundingClientRect();
           const cs = window.getComputedStyle(el);
@@ -891,8 +894,9 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
           if (o.children.length > 6) continue;
           const t = (o.innerText || o.textContent || "").trim();
           if (!t || t.length > 200) continue;
-          if (!re.test(t)) continue;
           if (!visible(o)) continue;
+          if (seen.length < 20) seen.push(t.slice(0, 60));
+          if (!re.test(t)) continue;
           clickIt(o);
           return "pass1:" + t.slice(0, 60);
         }
@@ -905,8 +909,11 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
           if (el.children.length > 0) continue;
           const t = (el.innerText || el.textContent || "").trim();
           if (!t || t.length > 200) continue;
-          if (!re.test(t)) continue;
           if (!visible(el)) continue;
+          if (seen.length < 20 && /popup|portal|overlay|dropdown|cascader|select|menu/i.test(
+            (el.parentElement?.className || "") + " " + (el.parentElement?.parentElement?.className || ""),
+          )) seen.push(t.slice(0, 60));
+          if (!re.test(t)) continue;
           // Walk up to find a clickable parent that's inside a portal/popup.
           let cursor = el;
           for (let i = 0; i < 8 && cursor; i++) {
@@ -921,19 +928,23 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
             cursor = cursor.parentElement;
           }
         }
-        return null;
+        // Return diagnostic showing what we DID see — first 20 visible
+        // option-like labels — so we can debug the regex from outside.
+        return "no-match | seen=[" + seen.slice(0, 8).join(" | ") + "]";
       }, optionRe.source);
     }
 
     // 10a. Data connection (Pixel) — match by visible pixel NAME ("PRST TR 3").
-    //      The numeric pixel_id never appears in the dropdown UI.
+    //      Use a CONTAINS match (not anchored) since TikTok renders names
+    //      with extra context like "PRST EU 3 (7648738051497197586)".
     if (pixelName) {
       const opened = await openLabeledDropdown(page, /^\s*Data\s*connection\s*$/i);
       if (opened) {
-        // Escape regex specials in the name before turning it into a RegExp.
         const safeName = pixelName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-        const picked = await pickDropdownOption(page, new RegExp(`^\\s*${safeName}\\s*$`, "i"));
-        adGroupReport.pixelPick = picked ? `picked:${picked}` : `no-match:${pixelName}`;
+        const picked = await pickDropdownOption(page, new RegExp(safeName, "i"));
+        adGroupReport.pixelPick = picked && !/^no-match/.test(picked)
+          ? `picked:${picked}`
+          : (picked || `no-match:${pixelName}`);
         await page.waitForTimeout(400);
         await page.keyboard.press("Escape").catch(() => {});
       } else {
