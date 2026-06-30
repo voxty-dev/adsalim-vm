@@ -142,13 +142,50 @@ app.post("/publish-draft", async (req, res) => {
     await page.waitForSelector('button, [role="button"]', { timeout: 15_000 }).catch(() => {});
     await page.waitForTimeout(800);
 
-    // Step A: dismiss any onboarding tooltips ("Got it" buttons) so they
-    // don't block subsequent clicks.
-    await page.evaluate(() => {
-      const gotItButtons = Array.from(document.querySelectorAll("button"))
-        .filter(b => /^got it$/i.test((b.innerText || "").trim()));
-      for (const b of gotItButtons) b.click();
-    }).catch(() => {});
+    // Step A: dismiss any onboarding/announcement modals so they don't
+    // block subsequent clicks. TikTok mounts these async (e.g. the
+    // "Find your tools in a new place" announcement appears ~1-2s after
+    // the editor renders), so a single pass at t=0 misses them. Loop
+    // for ~4s, dismissing every pass — multiple modals can stack.
+    const dismissBlockingModals = async () => {
+      return page.evaluate(() => {
+        const isVisible = (el) => {
+          const style = window.getComputedStyle(el);
+          if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
+          const r = el.getBoundingClientRect();
+          return r.width > 0 && r.height > 0;
+        };
+        let dismissed = 0;
+        // Pass 1: any visible "Got it" / "Skip" / "Maybe later" / "Close" / "Dismiss" button.
+        const buttons = Array.from(document.querySelectorAll('button, [role="button"], a'));
+        for (const b of buttons) {
+          if (b.disabled || !isVisible(b)) continue;
+          const t = (b.innerText || b.textContent || "").trim().toLowerCase();
+          if (/^(got it|skip|maybe later|close|dismiss|i understand|next|done|continue tour|skip tour)$/.test(t)) {
+            b.click();
+            dismissed++;
+          }
+        }
+        // Pass 2: modal close ✕ buttons (TikTok renders them as svg-only
+        // icons with aria-label="close" or class containing "close").
+        const closes = Array.from(document.querySelectorAll(
+          '[role="dialog"] [aria-label*="close" i], [role="dialog"] [class*="close" i], [class*="modal" i] [aria-label*="close" i], [class*="modal" i] [class*="close" i], [class*="dialog" i] [aria-label*="close" i]'
+        ));
+        for (const x of closes) {
+          if (!isVisible(x)) continue;
+          x.click();
+          dismissed++;
+        }
+        return dismissed;
+      }).catch(() => 0);
+    };
+    // First pass right now, then re-poll every 400ms for ~4s to catch
+    // async-mounted announcements like "Find your tools in a new place".
+    for (let i = 0; i < 10; i++) {
+      const n = await dismissBlockingModals();
+      if (i > 0 && n === 0) break;
+      await page.waitForTimeout(400);
+    }
 
     // Step B: if a validation warning is shown ("Check ad groups" +
     // "Create anyway"), click "Create anyway" to dismiss and transition
@@ -173,6 +210,13 @@ app.post("/publish-draft", async (req, res) => {
     // Step C: scroll to surface the sticky-footer Publish button.
     await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
     await page.waitForTimeout(400);
+
+    // Step C.5: one more modal sweep — scrolling can lazy-mount the
+    // announcement carousel ("Find your tools in a new place") which
+    // overlays the Publish button at the bottom-right.
+    await dismissBlockingModals();
+    await page.waitForTimeout(200);
+    await dismissBlockingModals();
 
     // Step D: click "Publish all". TikTok renders this as a styled <div>
     // (with a dropdown arrow), not a <button> — so we widen the
