@@ -1001,122 +1001,108 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
     // ("All", "Search or select interests & behaviors") because TikTok's
     // labels don't have proper accessibility wiring.
     async function pickFromDropdown(labelText, optionText) {
-      // Find the label via a custom DOM scan that returns a stable
-      // element handle. getByText({ exact: true }) failed because
-      // TikTok renders info icons as sibling spans, making the parent's
-      // innerText "Data connection?" or similar. We scan for elements
-      // whose VISIBLE text *starts with* the label and is no more than
-      // a couple chars longer (allowing the trailing ⓘ).
+      // Strategy: find the label by exact text, then click the FIRST
+      // dropdown-trigger element that appears AFTER the label in document
+      // order. TikTok's aio_adgroup form always lays out as label →
+      // description → trigger in document order, so "first trigger
+      // following the label" is unambiguous regardless of how deeply
+      // nested or how wide the trigger row is.
       try {
-        const labelHandle = await page.evaluateHandle((needle) => {
-          const all = Array.from(document.querySelectorAll("*"));
-          for (const el of all) {
-            if (el.children.length > 4) continue;
-            const t = (el.innerText || el.textContent || "").trim();
-            if (!t || t.length > needle.length + 8) continue;
-            if (!new RegExp("^" + needle.replace(/\s+/g, "\\s*") + "(?:\\s*[\\?ⓘ\\(\\)i ])?$", "i").test(t)) continue;
-            const r = el.getBoundingClientRect();
-            if (r.width === 0 || r.height === 0) continue;
-            const cs = window.getComputedStyle(el);
-            if (cs.display === "none" || cs.visibility === "hidden") continue;
-            return el;
-          }
-          return null;
-        }, labelText);
-        const isNull = await labelHandle.evaluate((el) => el === null);
-        if (isNull) {
-          await labelHandle.dispose();
-          return `error:label-not-found:${labelText}`;
-        }
-        const label = labelHandle.asElement();
-        await label.scrollIntoViewIfNeeded({ timeout: 3000 });
-        // Walk up to a form-row ancestor and click the dropdown trigger.
-        // Smart+ aio_adgroup form: label -> multi-line description ->
-        // dropdown (the dropdown can be full-row wide, ~700-800px).
-        // Previous 80px-below + 700px-width caps both excluded the real
-        // trigger. New approach: walk up ancestors; at each level,
-        // accept ANY ks-select / ks-cascader / role=combobox that's
-        // BELOW the label (within 600px gap). NO width cap. Pick the
-        // SMALLEST area among matches — the trigger box itself, not the
-        // form-row container around it.
-        const triggered = await label.evaluate((labelEl) => {
-          const labelRect = labelEl.getBoundingClientRect();
-          const triggerSel = [
+        const triggered = await page.evaluate((needle) => {
+          const TRIGGER_SEL = [
             '[role="combobox"]',
             'ks-select',
             'ks-cascader',
             'ks-input',
-            '[class*="ks-select" i]',
-            '[class*="ks-cascader" i]',
-            '[class*="ks-input" i][class*="select" i]',
-            'button[aria-haspopup]',
+            '[class*="ks-select" i]:not([class*="select-popup" i]):not([class*="select-dropdown" i]):not([class*="select-option" i])',
+            '[class*="ks-cascader" i]:not([class*="cascader-popup" i]):not([class*="cascader-option" i])',
+            'button[aria-haspopup="listbox"]',
+            'button[aria-haspopup="true"]',
             'div[role="textbox"]',
             'input[readonly]',
             '[class*="select__input" i]',
             '[class*="select-trigger" i]',
             '[class*="cascader__input" i]',
           ].join(", ");
-          let cursor = labelEl;
-          const diagnostic = [];
-          for (let i = 0; i < 8 && cursor; i++) {
-            const parent = cursor.parentElement;
-            if (!parent) break;
-            const all = Array.from(parent.querySelectorAll(triggerSel));
-            const candidates = [];
-            for (const c of all) {
-              if (c.contains(labelEl) || labelEl.contains(c)) continue;
-              const r = c.getBoundingClientRect();
-              if (r.width === 0 || r.height === 0) continue;
-              const cs = window.getComputedStyle(c);
-              if (cs.display === "none" || cs.visibility === "hidden") continue;
-              const verticalGap = r.top - labelRect.bottom;
-              const isBelow = r.top >= labelRect.top - 4 && verticalGap < 600;
-              const isRight = r.left >= labelRect.right - 4 && (r.left - labelRect.right) < 500 && Math.abs(r.top - labelRect.top) < 80;
-              if (!isBelow && !isRight) continue;
-              candidates.push({ el: c, area: r.width * r.height, gap: isBelow ? verticalGap : (r.left - labelRect.right) });
-            }
-            if (candidates.length) {
-              // Prefer SMALLEST area (the actual trigger box) — the
-              // form-row wrapper would also match but it's larger.
-              candidates.sort((a, b) => a.area - b.area || a.gap - b.gap);
-              const pick = candidates[0].el;
-              pick.scrollIntoView({ block: "center" });
-              pick.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
-              pick.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
-              pick.click();
-              return { ok: true, tag: pick.tagName.toLowerCase(), area: candidates[0].area | 0 };
-            }
-            // Collect diagnostic at this level: what selectable-ish
-            // elements DID we see (regardless of position)?
-            diagnostic.push("L" + i + ":" + all.length);
-            cursor = parent;
+
+          // 1. Find ALL elements whose visible text exactly matches the
+          //    label (allowing optional trailing icon char). Pick the one
+          //    that has a trigger nearby AFTER it in document order.
+          const labelRe = new RegExp(`^${needle.replace(/\s+/g, "\\s*")}(?:\\s*[\\?ⓘ\\(\\)i ])?$`, "i");
+          const visible = (el) => {
+            const r = el.getBoundingClientRect();
+            if (r.width === 0 || r.height === 0) return false;
+            const cs = window.getComputedStyle(el);
+            if (cs.display === "none" || cs.visibility === "hidden") return false;
+            return true;
+          };
+          const allEls = Array.from(document.querySelectorAll("*"));
+          const labelCandidates = [];
+          for (const el of allEls) {
+            if (el.children.length > 4) continue;
+            const t = (el.innerText || el.textContent || "").trim();
+            if (!t || !labelRe.test(t)) continue;
+            if (!visible(el)) continue;
+            labelCandidates.push(el);
           }
-          // Last-ditch: scan FULL DOCUMENT for any select-ish element
-          // visually beneath the label within 600px. Some TikTok layouts
-          // put the trigger in a wholly separate subtree (sidebar peer).
-          const doc = Array.from(document.querySelectorAll(triggerSel));
-          for (const c of doc) {
-            if (c.contains(labelEl)) continue;
-            const r = c.getBoundingClientRect();
-            if (r.width === 0 || r.height === 0) continue;
-            const cs = window.getComputedStyle(c);
-            if (cs.display === "none" || cs.visibility === "hidden") continue;
-            const verticalGap = r.top - labelRect.bottom;
-            if (verticalGap < -10 || verticalGap > 600) continue;
-            // Must be horizontally near the label.
-            if (Math.abs(r.left - labelRect.left) > 200) continue;
-            c.scrollIntoView({ block: "center" });
-            c.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
-            c.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
-            c.click();
-            return { ok: true, tag: c.tagName.toLowerCase(), via: "doc-fallback" };
+          if (!labelCandidates.length) {
+            return { ok: false, reason: "label-not-found" };
           }
-          return { ok: false, diag: diagnostic.join(",") };
-        });
-        await labelHandle.dispose();
+
+          const allTriggers = Array.from(document.querySelectorAll(TRIGGER_SEL)).filter(visible);
+
+          // 2. For each label candidate, find the FIRST trigger that:
+          //    - appears after the label in document order
+          //    - is visually below the label (top >= label.bottom - 10)
+          //    - has its top within 600px of label.bottom
+          //    Pick the (label, trigger) pair where the vertical gap is
+          //    smallest — that's the one TikTok actually rendered as a
+          //    pair.
+          let bestPair = null;
+          for (const label of labelCandidates) {
+            const labelRect = label.getBoundingClientRect();
+            for (const t of allTriggers) {
+              if (t.contains(label) || label.contains(t)) continue;
+              const pos = label.compareDocumentPosition(t);
+              if (!(pos & Node.DOCUMENT_POSITION_FOLLOWING)) continue;
+              const r = t.getBoundingClientRect();
+              if (r.top < labelRect.bottom - 10) continue;
+              const gap = r.top - labelRect.bottom;
+              if (gap > 600) continue;
+              if (!bestPair || gap < bestPair.gap) {
+                bestPair = { label, trigger: t, gap, labelRect, triggerRect: r };
+              }
+              // Only take the FIRST following trigger per label — the
+              // rest are subsequent fields, not this label's trigger.
+              break;
+            }
+          }
+          if (!bestPair) {
+            return {
+              ok: false,
+              reason: "no-following-trigger",
+              labelCount: labelCandidates.length,
+              triggerCount: allTriggers.length,
+            };
+          }
+
+          const t = bestPair.trigger;
+          t.scrollIntoView({ block: "center" });
+          t.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+          t.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+          t.click();
+          return {
+            ok: true,
+            tag: t.tagName.toLowerCase(),
+            cls: (t.className && typeof t.className === "string") ? t.className.slice(0, 60) : "",
+            gap: Math.round(bestPair.gap),
+          };
+        }, labelText);
+
         if (!triggered || !triggered.ok) {
-          const diag = triggered && triggered.diag ? `|diag=${triggered.diag}` : "";
-          return `error:trigger-not-found:${labelText}${diag}`;
+          const why = triggered ? triggered.reason : "evaluate-null";
+          const extra = triggered ? `|labels=${triggered.labelCount || 0}|triggers=${triggered.triggerCount || 0}` : "";
+          return `error:trigger-not-found:${labelText}|why=${why}${extra}`;
         }
         await page.waitForTimeout(900);
 
