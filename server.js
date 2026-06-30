@@ -971,17 +971,32 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
         await label.scrollIntoViewIfNeeded({ timeout: 3000 });
         // Walk up to a form-row ancestor and click the dropdown trigger.
         const triggered = await label.evaluate((labelEl) => {
+          // Walk up to 8 ancestors; for each, look for ANY clickable element
+          // beneath that's visually positioned below or right of the label.
           let cursor = labelEl;
-          for (let i = 0; i < 6 && cursor; i++) {
+          const labelRect = labelEl.getBoundingClientRect();
+          for (let i = 0; i < 8 && cursor; i++) {
             const parent = cursor.parentElement;
             if (!parent) break;
-            const cands = Array.from(parent.querySelectorAll(
-              '[role="combobox"], ks-select, ks-cascader, button:not([type="submit"]), [class*="select" i]:not([class*="selected" i]):not([class*="selector" i])',
+            const all = Array.from(parent.querySelectorAll(
+              '[role="combobox"], ks-select, ks-cascader, ks-input, ks-button, ' +
+              'button:not([type="submit"]):not([aria-label*="close" i]), ' +
+              'input[readonly], ' +
+              '[class*="select" i]:not([class*="selected" i]):not([class*="selector" i]):not([class*="select-section" i]), ' +
+              '[class*="dropdown" i]:not([class*="dropdown-menu" i]), ' +
+              '[class*="trigger" i], [class*="picker" i], ' +
+              'div[tabindex], [role="textbox"]',
             ));
-            for (const c of cands) {
+            for (const c of all) {
               if (c.contains(labelEl) || labelEl.contains(c)) continue;
               const r = c.getBoundingClientRect();
               if (r.width === 0 || r.height === 0) continue;
+              // Must be below OR to the right of the label, within ~300px.
+              const below = r.top >= labelRect.top - 4 && r.top - labelRect.bottom < 80;
+              const right = r.left >= labelRect.right - 4 && r.left - labelRect.right < 300 && Math.abs(r.top - labelRect.top) < 40;
+              if (!below && !right) continue;
+              const cs = window.getComputedStyle(c);
+              if (cs.display === "none" || cs.visibility === "hidden") continue;
               c.scrollIntoView({ block: "center" });
               c.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
               c.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
