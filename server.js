@@ -1031,65 +1031,93 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
         const label = labelHandle.asElement();
         await label.scrollIntoViewIfNeeded({ timeout: 3000 });
         // Walk up to a form-row ancestor and click the dropdown trigger.
-        // Smart+ aio_adgroup form has a multi-line DESCRIPTION between
-        // the label and the dropdown (e.g. Data connection -> 2 lines of
-        // help text + Events Manager link -> dropdown). The previous
-        // 80px-below cap couldn't reach across that description, so the
-        // trigger came back not-found. New approach: walk up ancestors,
-        // and at each scope, pick the CLOSEST dropdown-ish element below
-        // the label by vertical distance (capped at 500px). The right-of
-        // path is unchanged.
+        // Smart+ aio_adgroup form: label -> multi-line description ->
+        // dropdown (the dropdown can be full-row wide, ~700-800px).
+        // Previous 80px-below + 700px-width caps both excluded the real
+        // trigger. New approach: walk up ancestors; at each level,
+        // accept ANY ks-select / ks-cascader / role=combobox that's
+        // BELOW the label (within 600px gap). NO width cap. Pick the
+        // SMALLEST area among matches — the trigger box itself, not the
+        // form-row container around it.
         const triggered = await label.evaluate((labelEl) => {
           const labelRect = labelEl.getBoundingClientRect();
+          const triggerSel = [
+            '[role="combobox"]',
+            'ks-select',
+            'ks-cascader',
+            'ks-input',
+            '[class*="ks-select" i]',
+            '[class*="ks-cascader" i]',
+            '[class*="ks-input" i][class*="select" i]',
+            'button[aria-haspopup]',
+            'div[role="textbox"]',
+            'input[readonly]',
+            '[class*="select__input" i]',
+            '[class*="select-trigger" i]',
+            '[class*="cascader__input" i]',
+          ].join(", ");
           let cursor = labelEl;
+          const diagnostic = [];
           for (let i = 0; i < 8 && cursor; i++) {
             const parent = cursor.parentElement;
             if (!parent) break;
-            const all = Array.from(parent.querySelectorAll(
-              '[role="combobox"], ks-select, ks-cascader, ks-input, ks-button, ' +
-              'button:not([type="submit"]):not([aria-label*="close" i]), ' +
-              'input[readonly], ' +
-              '[class*="select" i]:not([class*="selected" i]):not([class*="selector" i]):not([class*="select-section" i]), ' +
-              '[class*="dropdown" i]:not([class*="dropdown-menu" i]), ' +
-              '[class*="trigger" i], [class*="picker" i], ' +
-              'div[tabindex], [role="textbox"]',
-            ));
-            const below = [];
-            const right = [];
+            const all = Array.from(parent.querySelectorAll(triggerSel));
+            const candidates = [];
             for (const c of all) {
               if (c.contains(labelEl) || labelEl.contains(c)) continue;
               const r = c.getBoundingClientRect();
               if (r.width === 0 || r.height === 0) continue;
               const cs = window.getComputedStyle(c);
               if (cs.display === "none" || cs.visibility === "hidden") continue;
-              // Skip elements wider than 700px — those are usually the
-              // form row container itself, not the actual trigger.
-              if (r.width > 700) continue;
               const verticalGap = r.top - labelRect.bottom;
-              const horizontalGap = r.left - labelRect.right;
-              const isBelow = r.top >= labelRect.top - 4 && verticalGap < 500;
-              const isRight = r.left >= labelRect.right - 4 && horizontalGap < 400 && Math.abs(r.top - labelRect.top) < 60;
-              if (isBelow) below.push({ el: c, dist: verticalGap });
-              else if (isRight) right.push({ el: c, dist: horizontalGap });
+              const isBelow = r.top >= labelRect.top - 4 && verticalGap < 600;
+              const isRight = r.left >= labelRect.right - 4 && (r.left - labelRect.right) < 500 && Math.abs(r.top - labelRect.top) < 80;
+              if (!isBelow && !isRight) continue;
+              candidates.push({ el: c, area: r.width * r.height, gap: isBelow ? verticalGap : (r.left - labelRect.right) });
             }
-            // Prefer the CLOSEST candidate (smallest gap) — that's
-            // almost always the trigger paired with this label.
-            below.sort((a, b) => a.dist - b.dist);
-            right.sort((a, b) => a.dist - b.dist);
-            const pick = below[0] || right[0];
-            if (pick) {
-              pick.el.scrollIntoView({ block: "center" });
-              pick.el.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
-              pick.el.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
-              pick.el.click();
-              return true;
+            if (candidates.length) {
+              // Prefer SMALLEST area (the actual trigger box) — the
+              // form-row wrapper would also match but it's larger.
+              candidates.sort((a, b) => a.area - b.area || a.gap - b.gap);
+              const pick = candidates[0].el;
+              pick.scrollIntoView({ block: "center" });
+              pick.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+              pick.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+              pick.click();
+              return { ok: true, tag: pick.tagName.toLowerCase(), area: candidates[0].area | 0 };
             }
+            // Collect diagnostic at this level: what selectable-ish
+            // elements DID we see (regardless of position)?
+            diagnostic.push("L" + i + ":" + all.length);
             cursor = parent;
           }
-          return false;
+          // Last-ditch: scan FULL DOCUMENT for any select-ish element
+          // visually beneath the label within 600px. Some TikTok layouts
+          // put the trigger in a wholly separate subtree (sidebar peer).
+          const doc = Array.from(document.querySelectorAll(triggerSel));
+          for (const c of doc) {
+            if (c.contains(labelEl)) continue;
+            const r = c.getBoundingClientRect();
+            if (r.width === 0 || r.height === 0) continue;
+            const cs = window.getComputedStyle(c);
+            if (cs.display === "none" || cs.visibility === "hidden") continue;
+            const verticalGap = r.top - labelRect.bottom;
+            if (verticalGap < -10 || verticalGap > 600) continue;
+            // Must be horizontally near the label.
+            if (Math.abs(r.left - labelRect.left) > 200) continue;
+            c.scrollIntoView({ block: "center" });
+            c.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+            c.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+            c.click();
+            return { ok: true, tag: c.tagName.toLowerCase(), via: "doc-fallback" };
+          }
+          return { ok: false, diag: diagnostic.join(",") };
         });
         await labelHandle.dispose();
-        if (!triggered) return `error:trigger-not-found:${labelText}`;
+        if (!triggered || !triggered.ok) {
+          const diag = triggered && triggered.diag ? `|diag=${triggered.diag}` : "";
+          return `error:trigger-not-found:${labelText}${diag}`;
+        }
         await page.waitForTimeout(900);
 
         // EXACT match via DOM scan first. Playwright :has-text() was
