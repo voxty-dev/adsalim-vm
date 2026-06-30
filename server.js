@@ -1009,20 +1009,24 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
       // nested or how wide the trigger row is.
       try {
         const triggered = await page.evaluate((needle) => {
-          const TRIGGER_SEL = [
+          // TikTok ads_aio_adgroup uses custom elements with hash-suffixed
+          // tag names that change every deploy:
+          //   <ks-input-selector-8ezba0f7>  -> Data connection-style picker
+          //   <ks-dropdown-menu-u27mrjdv>   -> Optimization event / Bid strategy
+          //   <ks-input-number-fkwyrc8l>    -> numeric inputs (Target CPA)
+          // CSS can't match a tag-name prefix, so we filter by tagName in JS.
+          const TAG_PREFIXES = [
+            /^ks-input-selector(-|$)/,
+            /^ks-dropdown-menu(-|$)/,
+            /^ks-select(-|$)/,
+            /^ks-cascader(-|$)/,
+          ];
+          const STATIC_SEL = [
             '[role="combobox"]',
-            'ks-select',
-            'ks-cascader',
-            'ks-input',
-            '[class*="ks-select" i]:not([class*="select-popup" i]):not([class*="select-dropdown" i]):not([class*="select-option" i])',
-            '[class*="ks-cascader" i]:not([class*="cascader-popup" i]):not([class*="cascader-option" i])',
             'button[aria-haspopup="listbox"]',
             'button[aria-haspopup="true"]',
             'div[role="textbox"]',
             'input[readonly]',
-            '[class*="select__input" i]',
-            '[class*="select-trigger" i]',
-            '[class*="cascader__input" i]',
           ].join(", ");
 
           // 1. Find ALL elements whose visible text exactly matches the
@@ -1049,7 +1053,13 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
             return { ok: false, reason: "label-not-found" };
           }
 
-          const allTriggers = Array.from(document.querySelectorAll(TRIGGER_SEL)).filter(visible);
+          // Union of: tag-prefix matches + static-CSS matches.
+          const tagPrefixMatches = allEls.filter((el) => {
+            const tag = el.tagName ? el.tagName.toLowerCase() : "";
+            return TAG_PREFIXES.some((re) => re.test(tag));
+          });
+          const staticMatches = Array.from(document.querySelectorAll(STATIC_SEL));
+          const allTriggers = Array.from(new Set([...tagPrefixMatches, ...staticMatches])).filter(visible);
 
           // 2. For each label candidate, find the FIRST trigger that:
           //    - appears after the label in document order
