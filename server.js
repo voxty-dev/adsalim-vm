@@ -929,69 +929,95 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
       await page.waitForTimeout(900);
       return await page.evaluate((rs) => {
         const re = new RegExp(rs);
-        // Diagnostic: collect ALL visible option-ish text we see so we
-        // can debug regex mismatches from outside the VM.
-        const seen = [];
-        function visible(el) {
+        const visible = (el) => {
           const r = el.getBoundingClientRect();
           const cs = window.getComputedStyle(el);
           return r.width > 0 && r.height > 0 && cs.display !== "none" && cs.visibility !== "hidden";
-        }
-        function clickIt(el) {
+        };
+        const clickIt = (el) => {
           el.scrollIntoView({ block: "center" });
           el.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
           el.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
           el.click();
-        }
+        };
 
-        // Pass 1: structured option elements with matching text.
-        const optionLikes = Array.from(document.querySelectorAll(
-          '[role="option"], ks-option, ks-cascader-item, ' +
-          '[class*="option" i]:not([class*="options" i]), li, ' +
-          '[class*="dropdown-item" i], [class*="select-item" i], ' +
-          '[class*="cascader-item" i], [class*="menu-item" i]',
-        ));
-        for (const o of optionLikes) {
-          if (o.children.length > 6) continue;
-          const t = (o.innerText || o.textContent || "").trim();
-          if (!t || t.length > 200) continue;
-          if (!visible(o)) continue;
-          if (seen.length < 20) seen.push(t.slice(0, 60));
-          if (!re.test(t)) continue;
-          clickIt(o);
-          return "pass1:" + t.slice(0, 60);
-        }
-
-        // Pass 2: walk EVERY visible leaf with matching text and try to
-        // find a clickable parent inside an open dropdown/popup. Some
-        // designs render options as <div>text</div> inside a portal.
+        // Find HIGH Z-INDEX overlays — these are the open popups. Previous
+        // version scanned the whole document, which picked up text from
+        // unrelated visible dropdowns elsewhere on the page (audience
+        // section's "All", "Search or select interests...") and reported
+        // them as "seen" even when the actual popup contained different
+        // options. Now we scope ALL option scans to the highest-z popup.
         const all = Array.from(document.querySelectorAll("*"));
-        for (const el of all) {
-          if (el.children.length > 0) continue;
-          const t = (el.innerText || el.textContent || "").trim();
-          if (!t || t.length > 200) continue;
-          if (!visible(el)) continue;
-          if (seen.length < 20 && /popup|portal|overlay|dropdown|cascader|select|menu/i.test(
-            (el.parentElement?.className || "") + " " + (el.parentElement?.parentElement?.className || ""),
-          )) seen.push(t.slice(0, 60));
-          if (!re.test(t)) continue;
-          // Walk up to find a clickable parent that's inside a portal/popup.
-          let cursor = el;
-          for (let i = 0; i < 8 && cursor; i++) {
-            const cls = (typeof cursor.className === "string") ? cursor.className : "";
-            const inPopup = /popup|portal|overlay|dropdown|cascader|select|menu/i.test(cls);
-            if (inPopup || cursor.matches?.('button, [role="option"], [role="button"], li')) {
-              if (visible(cursor)) {
-                clickIt(cursor);
-                return "pass2:" + t.slice(0, 60);
+        const popups = all.filter((el) => {
+          const cs = window.getComputedStyle(el);
+          if (cs.position !== "fixed" && cs.position !== "absolute") return false;
+          if (!visible(el)) return false;
+          const r = el.getBoundingClientRect();
+          if (r.width < 100 || r.height < 40) return false;
+          const z = parseInt(cs.zIndex);
+          if (isNaN(z) || z < 100) return false;
+          // Skip the page's own modal/announcement overlays — they don't
+          // contain dropdown options (no clickable leaf text).
+          return true;
+        });
+        popups.sort((a, b) => {
+          const za = parseInt(window.getComputedStyle(a).zIndex) || 0;
+          const zb = parseInt(window.getComputedStyle(b).zIndex) || 0;
+          return zb - za;
+        });
+
+        const seen = [];
+        const scopes = popups.length ? popups.slice(0, 3) : [document.body];
+
+        for (const scope of scopes) {
+          // Pass 1: structured option-like elements with matching text.
+          const optionLikes = Array.from(scope.querySelectorAll(
+            '[role="option"], ks-option, ks-cascader-item, ' +
+            '[class*="option" i]:not([class*="options" i]), li, ' +
+            '[class*="dropdown-item" i], [class*="select-item" i], ' +
+            '[class*="cascader-item" i], [class*="menu-item" i], ' +
+            '[class*="lego-list-item" i], [class*="row" i][class*="item" i]',
+          ));
+          for (const o of optionLikes) {
+            if (o.children.length > 6) continue;
+            const t = (o.innerText || o.textContent || "").trim();
+            if (!t || t.length > 200) continue;
+            if (!visible(o)) continue;
+            if (seen.length < 30) seen.push(t.slice(0, 60));
+            if (!re.test(t)) continue;
+            clickIt(o);
+            return "pass1:" + t.slice(0, 60);
+          }
+
+          // Pass 2: walk leaf text inside the popup. If text matches,
+          // click the leaf or its nearest clickable parent.
+          const leaves = Array.from(scope.querySelectorAll("*"));
+          for (const el of leaves) {
+            if (el.children.length > 0) continue;
+            const t = (el.innerText || el.textContent || "").trim();
+            if (!t || t.length > 200) continue;
+            if (!visible(el)) continue;
+            if (seen.length < 30) seen.push(t.slice(0, 60));
+            if (!re.test(t)) continue;
+            let cursor = el;
+            for (let i = 0; i < 8 && cursor; i++) {
+              const cs = window.getComputedStyle(cursor);
+              if (cs.cursor === "pointer" ||
+                  cursor.matches?.('button, [role="option"], [role="button"], li, a')) {
+                if (visible(cursor)) {
+                  clickIt(cursor);
+                  return "pass2:" + t.slice(0, 60);
+                }
               }
+              cursor = cursor.parentElement;
             }
-            cursor = cursor.parentElement;
+            // Fallback: click the leaf itself.
+            clickIt(el);
+            return "pass3:" + t.slice(0, 60);
           }
         }
-        // Return diagnostic showing what we DID see — first 20 visible
-        // option-like labels — so we can debug the regex from outside.
-        return "no-match | seen=[" + seen.slice(0, 8).join(" | ") + "]";
+
+        return "no-match | popups=" + popups.length + " | seen=[" + seen.slice(0, 10).join(" | ") + "]";
       }, optionRe.source);
     }
 
@@ -1200,37 +1226,43 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
         const escaped = optionText.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
         const exactRe = new RegExp(`^\\s*${escaped}(?:\\s*\\([^)]*\\))?\\s*$`, "i");
         let picked = await pickDropdownOption(page, exactRe);
-        if (typeof picked === "string" && /^pass[12]:/.test(picked)) {
+        if (typeof picked === "string" && /^pass[123]:/.test(picked)) {
           return `picked:${optionText}|via:${picked}`;
         }
 
-        // Fallback: TikTok renders some dropdowns as type-ahead. Find a
-        // visible search input inside an open popover/portal, type the
-        // option text to filter, then re-scan.
+        // Fallback: type-ahead. Find a visible input INSIDE a recently
+        // mounted high-z overlay (the open popup) and type the option
+        // text to filter. Scope to the highest-z popup so we don't end
+        // up typing into Target CPA's input or some unrelated field.
         const typed = await page.evaluate((needle) => {
-          const inputs = Array.from(document.querySelectorAll(
-            'input[type="text"], input[type="search"], input:not([type])'
-          ));
-          const candidate = inputs.find((i) => {
-            const r = i.getBoundingClientRect();
-            if (r.width === 0 || r.height === 0) return false;
-            const cs = window.getComputedStyle(i);
+          const all = Array.from(document.querySelectorAll("*"));
+          const popups = all.filter((el) => {
+            const cs = window.getComputedStyle(el);
+            if (cs.position !== "fixed" && cs.position !== "absolute") return false;
+            const r = el.getBoundingClientRect();
+            if (r.width < 100 || r.height < 40) return false;
             if (cs.display === "none" || cs.visibility === "hidden") return false;
-            // Must be inside a recently-mounted popover-ish container OR
-            // be the currently-focused element (TikTok puts the cascader
-            // search at the top of the open popover).
-            let cursor = i.parentElement;
-            for (let n = 0; n < 10 && cursor; n++) {
-              const cls = (typeof cursor.className === "string") ? cursor.className : "";
-              if (/popup|portal|overlay|dropdown|cascader|select-dropdown|select-popup|select-panel|popover/i.test(cls)) return true;
-              cursor = cursor.parentElement;
-            }
-            return document.activeElement === i;
+            const z = parseInt(cs.zIndex);
+            if (isNaN(z) || z < 100) return false;
+            return true;
           });
+          popups.sort((a, b) => (parseInt(window.getComputedStyle(b).zIndex) || 0) - (parseInt(window.getComputedStyle(a).zIndex) || 0));
+          const scopes = popups.length ? popups.slice(0, 3) : [document.body];
+          let candidate = null;
+          for (const sc of scopes) {
+            const inputs = Array.from(sc.querySelectorAll('input[type="text"], input[type="search"], input:not([type])'));
+            for (const i of inputs) {
+              const r = i.getBoundingClientRect();
+              if (r.width === 0 || r.height === 0) continue;
+              const cs = window.getComputedStyle(i);
+              if (cs.display === "none" || cs.visibility === "hidden") continue;
+              candidate = i;
+              break;
+            }
+            if (candidate) break;
+          }
           if (!candidate) return false;
           candidate.focus();
-          // Native-setter to trigger React onChange — direct .value =
-          // assignment is swallowed by React's synthetic event system.
           const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;
           if (setter) {
             setter.call(candidate, "");
@@ -1247,15 +1279,15 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
         if (typed) {
           await page.waitForTimeout(700);
           picked = await pickDropdownOption(page, exactRe);
-          if (typeof picked === "string" && /^pass[12]:/.test(picked)) {
+          if (typeof picked === "string" && /^pass[123]:/.test(picked)) {
             return `picked:${optionText}|via:type-ahead:${picked}`;
           }
         }
 
-        // Last resort: substring match (the old behaviour) but log it.
+        // Last resort: substring match.
         const looseRe = new RegExp(escaped, "i");
         const loose = await pickDropdownOption(page, looseRe);
-        if (typeof loose === "string" && /^pass[12]:/.test(loose)) {
+        if (typeof loose === "string" && /^pass[123]:/.test(loose)) {
           return `picked:${optionText}|via:loose-fallback:${loose}`;
         }
 
