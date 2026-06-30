@@ -1099,10 +1099,56 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
           };
         }, labelText);
 
+        let triggerVia = triggered && triggered.ok ? `ok:${triggered.tag}|gap=${triggered.gap}` : "";
+
+        // Brute-force fallback: if document-order pairing failed,
+        // simulate a mouse click at calculated coordinates below each
+        // label candidate. This bypasses ALL selector matching — we
+        // just hit the area where TikTok renders the dropdown trigger
+        // and check whether a popup appeared.
         if (!triggered || !triggered.ok) {
-          const why = triggered ? triggered.reason : "evaluate-null";
-          const extra = triggered ? `|labels=${triggered.labelCount || 0}|triggers=${triggered.triggerCount || 0}` : "";
-          return `error:trigger-not-found:${labelText}|why=${why}${extra}`;
+          const labelPositions = await page.evaluate((needle) => {
+            const labelRe = new RegExp(`^${needle.replace(/\s+/g, "\\s*")}(?:\\s*[\\?ⓘ\\(\\)i ])?$`, "i");
+            const allEls = Array.from(document.querySelectorAll("*"));
+            const out = [];
+            for (const el of allEls) {
+              if (el.children.length > 4) continue;
+              const t = (el.innerText || el.textContent || "").trim();
+              if (!t || !labelRe.test(t)) continue;
+              const r = el.getBoundingClientRect();
+              if (r.width === 0 || r.height === 0) continue;
+              const cs = window.getComputedStyle(el);
+              if (cs.display === "none" || cs.visibility === "hidden") continue;
+              out.push({ x: r.left, y: r.top, w: r.width, h: r.height });
+            }
+            return out;
+          }, labelText);
+
+          let bruteOpened = false;
+          outer: for (const lp of labelPositions) {
+            for (const offset of [55, 95, 140, 190, 250]) {
+              const cx = lp.x + Math.min(lp.w / 2, 120);
+              const cy = lp.y + lp.h + offset;
+              try { await page.mouse.click(cx, cy); } catch {}
+              await page.waitForTimeout(350);
+              const opened = await page.evaluate(() => {
+                return !!document.querySelector(
+                  '[role="listbox"], [class*="select-popup" i], [class*="select-dropdown" i]:not([class*="dropdown-arrow"]), [class*="cascader-popup" i], [class*="dropdown-menu" i]'
+                );
+              });
+              if (opened) {
+                triggerVia = `brute-click|offset=${offset}`;
+                bruteOpened = true;
+                break outer;
+              }
+            }
+          }
+
+          if (!bruteOpened) {
+            const why = triggered ? triggered.reason : "evaluate-null";
+            const extra = triggered ? `|labels=${triggered.labelCount || 0}|triggers=${triggered.triggerCount || 0}` : "";
+            return `error:trigger-not-found:${labelText}|why=${why}${extra}|brute-tried=${labelPositions.length}`;
+          }
         }
         await page.waitForTimeout(900);
 
