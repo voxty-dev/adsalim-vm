@@ -1182,9 +1182,30 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
 
           const t = bestPair.trigger;
           t.scrollIntoView({ block: "center" });
-          t.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
-          t.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
-          t.click();
+          // For custom elements like <ks-input-selector-*>, programmatic
+          // .click() on the wrapper often doesn't open the popup. Click
+          // strategy stack:
+          //   a) the FIRST visible cursor:pointer descendant (the
+          //      actual TikTok-styled clickable inside the wrapper)
+          //   b) the FIRST input descendant (some triggers focus an
+          //      input that opens the dropdown on focus/click)
+          //   c) the wrapper itself with full pointer-event sequence
+          const innerPointer = Array.from(t.querySelectorAll("*")).find((el) => {
+            const r = el.getBoundingClientRect();
+            if (r.width === 0 || r.height === 0) return false;
+            const cs = window.getComputedStyle(el);
+            if (cs.cursor !== "pointer") return false;
+            return cs.display !== "none" && cs.visibility !== "hidden";
+          });
+          const innerInput = t.querySelector("input");
+          const targets = [innerPointer, innerInput, t].filter(Boolean);
+          for (const target of targets) {
+            try { target.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true })); } catch {}
+            try { target.dispatchEvent(new MouseEvent("mousedown", { bubbles: true })); } catch {}
+            try { target.dispatchEvent(new PointerEvent("pointerup", { bubbles: true })); } catch {}
+            try { target.dispatchEvent(new MouseEvent("mouseup", { bubbles: true })); } catch {}
+            try { target.click(); } catch {}
+          }
           const tr = t.getBoundingClientRect();
           return {
             ok: true,
@@ -1193,6 +1214,7 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
             gap: Math.round(bestPair.gap),
             cx: tr.left + tr.width / 2,
             cy: tr.top + tr.height / 2,
+            innerHTML: t.innerHTML.slice(0, 400).replace(/\s+/g, " "),
           };
         }, labelText);
 
@@ -1349,7 +1371,21 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
           return `picked:${optionText}|via:loose-fallback:${loose}`;
         }
 
-        return `error:option-not-found:${optionText}|seen=${String(picked).slice(0, 200)}`;
+        // Snap a screenshot so we can SEE what's on the page when the
+        // option pick failed — much faster than guessing what TikTok
+        // mounted (or didn't).
+        let dbgUrl = "";
+        try {
+          const buf = await page.screenshot({ fullPage: false });
+          if (buf && typeof saveScreenshot === "function") {
+            const id = saveScreenshot(buf);
+            dbgUrl = `|screenshot-id=${id}`;
+          }
+        } catch {}
+        const triggerSnippet = triggered && triggered.innerHTML
+          ? `|trigger-tag=${triggered.tag}|trigger-html=${triggered.innerHTML.slice(0, 200)}`
+          : "";
+        return `error:option-not-found:${optionText}|seen=${String(picked).slice(0, 200)}${triggerSnippet}${dbgUrl}`;
       } catch (e) {
         const msg = (e.message || "").slice(0, 120).replace(/\s+/g, " ");
         return `error:${msg}`;
