@@ -1071,12 +1071,75 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
         await labelHandle.dispose();
         if (!triggered) return `error:trigger-not-found:${labelText}`;
         await page.waitForTimeout(900);
-        // Pick the option in the open dropdown.
-        const opt = page.locator(
-          `[role="option"]:has-text("${optionText}"), ks-option:has-text("${optionText}"), li:has-text("${optionText}"), [class*="option"]:not([class*="options"]):has-text("${optionText}"), [class*="cascader-item"]:has-text("${optionText}")`,
-        ).first();
-        await opt.click({ timeout: 3000 });
-        return `picked:${optionText}`;
+
+        // EXACT match via DOM scan first. Playwright :has-text() was
+        // doing substring match, so picking "PRST TR 3" matched any
+        // option containing "PRST" + "TR" — TikTok ended up with the
+        // wrong pixel selected. Use anchored regex via the existing
+        // pickDropdownOption helper.
+        const escaped = optionText.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const exactRe = new RegExp(`^\\s*${escaped}(?:\\s*\\([^)]*\\))?\\s*$`, "i");
+        let picked = await pickDropdownOption(page, exactRe);
+        if (typeof picked === "string" && /^pass[12]:/.test(picked)) {
+          return `picked:${optionText}|via:${picked}`;
+        }
+
+        // Fallback: TikTok renders some dropdowns as type-ahead. Find a
+        // visible search input inside an open popover/portal, type the
+        // option text to filter, then re-scan.
+        const typed = await page.evaluate((needle) => {
+          const inputs = Array.from(document.querySelectorAll(
+            'input[type="text"], input[type="search"], input:not([type])'
+          ));
+          const candidate = inputs.find((i) => {
+            const r = i.getBoundingClientRect();
+            if (r.width === 0 || r.height === 0) return false;
+            const cs = window.getComputedStyle(i);
+            if (cs.display === "none" || cs.visibility === "hidden") return false;
+            // Must be inside a recently-mounted popover-ish container OR
+            // be the currently-focused element (TikTok puts the cascader
+            // search at the top of the open popover).
+            let cursor = i.parentElement;
+            for (let n = 0; n < 10 && cursor; n++) {
+              const cls = (typeof cursor.className === "string") ? cursor.className : "";
+              if (/popup|portal|overlay|dropdown|cascader|select-dropdown|select-popup|select-panel|popover/i.test(cls)) return true;
+              cursor = cursor.parentElement;
+            }
+            return document.activeElement === i;
+          });
+          if (!candidate) return false;
+          candidate.focus();
+          // Native-setter to trigger React onChange — direct .value =
+          // assignment is swallowed by React's synthetic event system.
+          const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;
+          if (setter) {
+            setter.call(candidate, "");
+            candidate.dispatchEvent(new Event("input", { bubbles: true }));
+            setter.call(candidate, needle);
+            candidate.dispatchEvent(new Event("input", { bubbles: true }));
+          } else {
+            candidate.value = needle;
+            candidate.dispatchEvent(new Event("input", { bubbles: true }));
+          }
+          return true;
+        }, optionText);
+
+        if (typed) {
+          await page.waitForTimeout(700);
+          picked = await pickDropdownOption(page, exactRe);
+          if (typeof picked === "string" && /^pass[12]:/.test(picked)) {
+            return `picked:${optionText}|via:type-ahead:${picked}`;
+          }
+        }
+
+        // Last resort: substring match (the old behaviour) but log it.
+        const looseRe = new RegExp(escaped, "i");
+        const loose = await pickDropdownOption(page, looseRe);
+        if (typeof loose === "string" && /^pass[12]:/.test(loose)) {
+          return `picked:${optionText}|via:loose-fallback:${loose}`;
+        }
+
+        return `error:option-not-found:${optionText}|seen=${String(picked).slice(0, 200)}`;
       } catch (e) {
         const msg = (e.message || "").slice(0, 120).replace(/\s+/g, " ");
         return `error:${msg}`;
@@ -1140,6 +1203,15 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
     if (adgroupBudgetUSD && adgroupBudgetUSD > 0) {
       adGroupReport.budgetFilled = await fillLabeledInput("Budget", adgroupBudgetUSD);
     }
+
+    // 10f. Goal-based budget increase — TikTok auto-enables this when
+    // you enter a daily budget. We force it OFF so the budget the user
+    // typed is the actual hard cap (no automatic 20-200% increase).
+    // Toggle mounts a moment after budget input, so wait + scroll first.
+    await page.waitForTimeout(700);
+    await page.evaluate(() => window.scrollBy(0, 250));
+    await page.waitForTimeout(300);
+    adGroupReport.goalBasedBudgetOff = await setToggleOff(page, /^\s*Goal-based budget increase\s*$/i);
 
     // 11. Scroll down so the rest of the ad-group form (audience,
     //     placements, budget, schedule) is in view for screenshots.
