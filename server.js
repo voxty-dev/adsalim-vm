@@ -940,20 +940,62 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
     // ("All", "Search or select interests & behaviors") because TikTok's
     // labels don't have proper accessibility wiring.
     async function pickFromDropdown(labelText, optionText) {
+      // Find the label via a custom DOM scan that returns a stable
+      // element handle. getByText({ exact: true }) failed because
+      // TikTok renders info icons as sibling spans, making the parent's
+      // innerText "Data connection?" or similar. We scan for elements
+      // whose VISIBLE text *starts with* the label and is no more than
+      // a couple chars longer (allowing the trailing ⓘ).
       try {
-        // Find the EXACT label text — `getByText` with `exact: true` is
-        // strict, so "Data connection" won't match "Search or select…".
-        const label = page.getByText(labelText, { exact: true }).first();
+        const labelHandle = await page.evaluateHandle((needle) => {
+          const all = Array.from(document.querySelectorAll("*"));
+          for (const el of all) {
+            if (el.children.length > 4) continue;
+            const t = (el.innerText || el.textContent || "").trim();
+            if (!t || t.length > needle.length + 8) continue;
+            if (!new RegExp("^" + needle.replace(/\s+/g, "\\s*") + "(?:\\s*[\\?ⓘ\\(\\)i ])?$", "i").test(t)) continue;
+            const r = el.getBoundingClientRect();
+            if (r.width === 0 || r.height === 0) continue;
+            const cs = window.getComputedStyle(el);
+            if (cs.display === "none" || cs.visibility === "hidden") continue;
+            return el;
+          }
+          return null;
+        }, labelText);
+        const isNull = await labelHandle.evaluate((el) => el === null);
+        if (isNull) {
+          await labelHandle.dispose();
+          return `error:label-not-found:${labelText}`;
+        }
+        const label = labelHandle.asElement();
         await label.scrollIntoViewIfNeeded({ timeout: 3000 });
-        // Walk up to a form-row ancestor (max 5 levels), then find the
-        // nearest combobox/button trigger.
-        const row = label.locator("xpath=ancestor::*[position()<=5]").first();
-        const trigger = row.locator(
-          '[role="combobox"], ks-select, ks-cascader, button:not([type="submit"]), [class*="select" i]:not([class*="selected" i]):not([class*="selector" i])',
-        ).first();
-        await trigger.click({ timeout: 3000 });
+        // Walk up to a form-row ancestor and click the dropdown trigger.
+        const triggered = await label.evaluate((labelEl) => {
+          let cursor = labelEl;
+          for (let i = 0; i < 6 && cursor; i++) {
+            const parent = cursor.parentElement;
+            if (!parent) break;
+            const cands = Array.from(parent.querySelectorAll(
+              '[role="combobox"], ks-select, ks-cascader, button:not([type="submit"]), [class*="select" i]:not([class*="selected" i]):not([class*="selector" i])',
+            ));
+            for (const c of cands) {
+              if (c.contains(labelEl) || labelEl.contains(c)) continue;
+              const r = c.getBoundingClientRect();
+              if (r.width === 0 || r.height === 0) continue;
+              c.scrollIntoView({ block: "center" });
+              c.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+              c.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+              c.click();
+              return true;
+            }
+            cursor = parent;
+          }
+          return false;
+        });
+        await labelHandle.dispose();
+        if (!triggered) return `error:trigger-not-found:${labelText}`;
         await page.waitForTimeout(900);
-        // Click matching option inside the open dropdown popup.
+        // Pick the option in the open dropdown.
         const opt = page.locator(
           `[role="option"]:has-text("${optionText}"), ks-option:has-text("${optionText}"), li:has-text("${optionText}"), [class*="option"]:not([class*="options"]):has-text("${optionText}"), [class*="cascader-item"]:has-text("${optionText}")`,
         ).first();
