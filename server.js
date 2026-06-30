@@ -934,55 +934,47 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
       }, optionRe.source);
     }
 
-    // Playwright high-level helper for picking a dropdown by its label
-    // and option text. Much more robust than custom DOM walking — uses
-    // Playwright's accessibility heuristics (works with ks-* + portals).
+    // Scoped helpers — find the LABEL element with EXACT text match, then
+    // click the nearest dropdown trigger within its form-row ancestor.
+    // Playwright's getByLabel was matching audience-targeting labels
+    // ("All", "Search or select interests & behaviors") because TikTok's
+    // labels don't have proper accessibility wiring.
     async function pickFromDropdown(labelText, optionText) {
       try {
-        // Strategy 1: Playwright's getByLabel
-        const trigger = page.getByLabel(labelText, { exact: false }).first();
+        // Find the EXACT label text — `getByText` with `exact: true` is
+        // strict, so "Data connection" won't match "Search or select…".
+        const label = page.getByText(labelText, { exact: true }).first();
+        await label.scrollIntoViewIfNeeded({ timeout: 3000 });
+        // Walk up to a form-row ancestor (max 5 levels), then find the
+        // nearest combobox/button trigger.
+        const row = label.locator("xpath=ancestor::*[position()<=5]").first();
+        const trigger = row.locator(
+          '[role="combobox"], ks-select, ks-cascader, button:not([type="submit"]), [class*="select" i]:not([class*="selected" i]):not([class*="selector" i])',
+        ).first();
         await trigger.click({ timeout: 3000 });
-        await page.waitForTimeout(700);
-        // Try multiple option selectors
+        await page.waitForTimeout(900);
+        // Click matching option inside the open dropdown popup.
         const opt = page.locator(
-          `[role="option"]:has-text("${optionText}"), li:has-text("${optionText}"), [class*="option"]:has-text("${optionText}"), ks-option:has-text("${optionText}"), [class*="cascader"]:has-text("${optionText}")`
+          `[role="option"]:has-text("${optionText}"), ks-option:has-text("${optionText}"), li:has-text("${optionText}"), [class*="option"]:not([class*="options"]):has-text("${optionText}"), [class*="cascader-item"]:has-text("${optionText}")`,
         ).first();
         await opt.click({ timeout: 3000 });
         return `picked:${optionText}`;
-      } catch (e1) {
-        // Strategy 2: find label by text, click nearest combobox sibling.
-        try {
-          const label = page.getByText(new RegExp(`^\\s*${labelText}\\s*$`, "i")).first();
-          await label.scrollIntoViewIfNeeded({ timeout: 2000 });
-          // Click sibling combobox / select-like element.
-          const row = label.locator("xpath=ancestor::*[position()<=4]").first();
-          const combo = row.locator('[role="combobox"], ks-select, ks-cascader, button, [class*="select"]').first();
-          await combo.click({ timeout: 3000 });
-          await page.waitForTimeout(700);
-          const opt2 = page.getByRole("option", { name: new RegExp(optionText, "i") }).first();
-          await opt2.click({ timeout: 3000 });
-          return `picked-fallback:${optionText}`;
-        } catch (e2) {
-          return `error:${(e1.message || "").slice(0, 80)} | ${(e2.message || "").slice(0, 80)}`;
-        }
+      } catch (e) {
+        const msg = (e.message || "").slice(0, 120).replace(/\s+/g, " ");
+        return `error:${msg}`;
       }
     }
 
     async function fillLabeledInput(labelText, value) {
       try {
-        const inp = page.getByLabel(labelText, { exact: false }).first();
+        const label = page.getByText(labelText, { exact: true }).first();
+        await label.scrollIntoViewIfNeeded({ timeout: 3000 });
+        const row = label.locator("xpath=ancestor::*[position()<=5]").first();
+        const inp = row.locator('input[type="text"], input[type="number"], input:not([type])').first();
         await inp.fill(String(value), { timeout: 3000 });
         return true;
       } catch {
-        try {
-          const label = page.getByText(new RegExp(`^\\s*${labelText}\\s*$`, "i")).first();
-          const row = label.locator("xpath=ancestor::*[position()<=4]").first();
-          const inp2 = row.locator('input[type="text"], input[type="number"], input:not([type])').first();
-          await inp2.fill(String(value), { timeout: 3000 });
-          return true;
-        } catch {
-          return false;
-        }
+        return false;
       }
     }
 
