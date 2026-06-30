@@ -1031,11 +1031,17 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
         const label = labelHandle.asElement();
         await label.scrollIntoViewIfNeeded({ timeout: 3000 });
         // Walk up to a form-row ancestor and click the dropdown trigger.
+        // Smart+ aio_adgroup form has a multi-line DESCRIPTION between
+        // the label and the dropdown (e.g. Data connection -> 2 lines of
+        // help text + Events Manager link -> dropdown). The previous
+        // 80px-below cap couldn't reach across that description, so the
+        // trigger came back not-found. New approach: walk up ancestors,
+        // and at each scope, pick the CLOSEST dropdown-ish element below
+        // the label by vertical distance (capped at 500px). The right-of
+        // path is unchanged.
         const triggered = await label.evaluate((labelEl) => {
-          // Walk up to 8 ancestors; for each, look for ANY clickable element
-          // beneath that's visually positioned below or right of the label.
-          let cursor = labelEl;
           const labelRect = labelEl.getBoundingClientRect();
+          let cursor = labelEl;
           for (let i = 0; i < 8 && cursor; i++) {
             const parent = cursor.parentElement;
             if (!parent) break;
@@ -1048,20 +1054,34 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
               '[class*="trigger" i], [class*="picker" i], ' +
               'div[tabindex], [role="textbox"]',
             ));
+            const below = [];
+            const right = [];
             for (const c of all) {
               if (c.contains(labelEl) || labelEl.contains(c)) continue;
               const r = c.getBoundingClientRect();
               if (r.width === 0 || r.height === 0) continue;
-              // Must be below OR to the right of the label, within ~300px.
-              const below = r.top >= labelRect.top - 4 && r.top - labelRect.bottom < 80;
-              const right = r.left >= labelRect.right - 4 && r.left - labelRect.right < 300 && Math.abs(r.top - labelRect.top) < 40;
-              if (!below && !right) continue;
               const cs = window.getComputedStyle(c);
               if (cs.display === "none" || cs.visibility === "hidden") continue;
-              c.scrollIntoView({ block: "center" });
-              c.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
-              c.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
-              c.click();
+              // Skip elements wider than 700px — those are usually the
+              // form row container itself, not the actual trigger.
+              if (r.width > 700) continue;
+              const verticalGap = r.top - labelRect.bottom;
+              const horizontalGap = r.left - labelRect.right;
+              const isBelow = r.top >= labelRect.top - 4 && verticalGap < 500;
+              const isRight = r.left >= labelRect.right - 4 && horizontalGap < 400 && Math.abs(r.top - labelRect.top) < 60;
+              if (isBelow) below.push({ el: c, dist: verticalGap });
+              else if (isRight) right.push({ el: c, dist: horizontalGap });
+            }
+            // Prefer the CLOSEST candidate (smallest gap) — that's
+            // almost always the trigger paired with this label.
+            below.sort((a, b) => a.dist - b.dist);
+            right.sort((a, b) => a.dist - b.dist);
+            const pick = below[0] || right[0];
+            if (pick) {
+              pick.el.scrollIntoView({ block: "center" });
+              pick.el.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+              pick.el.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+              pick.el.click();
               return true;
             }
             cursor = parent;
