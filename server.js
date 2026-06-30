@@ -222,20 +222,17 @@ app.post("/publish-draft", async (req, res) => {
     // (with a dropdown arrow), not a <button> — so we widen the
     // selector to any clickable element. Match strictly on visible text
     // so we don't accidentally click the dropdown arrow's own item.
-    const publishClicked = await page.evaluate(() => {
+    const findAndClickPublish = () => page.evaluate(() => {
       const all = Array.from(document.querySelectorAll(
-        'button, [role="button"], a, [class*="btn" i], [class*="button" i]'
+        'button, [role="button"], a, [class*="btn" i], [class*="button" i], div[class*="publish" i]'
       ));
       const patterns = [/^publish all$/, /^publish$/];
       for (const pat of patterns) {
         const match = all.find(el => {
           if (el.disabled) return false;
-          // Skip hidden elements
           const style = window.getComputedStyle(el);
           if (style.display === "none" || style.visibility === "hidden") return false;
           const text = (el.innerText || el.textContent || "").trim().toLowerCase();
-          // Some elements wrap "Publish all" with a dropdown arrow icon
-          // ("Publish all ▾") — match if text starts with publish all.
           return pat.test(text) || /^publish all\s*[▾▼⌄]/i.test(text);
         });
         if (match) {
@@ -246,6 +243,17 @@ app.post("/publish-draft", async (req, res) => {
       }
       return false;
     });
+
+    // Try up to 4 times: between attempts, sweep modals + scroll. TikTok's
+    // announcement carousel can re-mount after dismissal, and the publish
+    // button can be obscured by a tooltip the first time we look.
+    let publishClicked = await findAndClickPublish();
+    for (let i = 0; i < 3 && !publishClicked; i++) {
+      await dismissBlockingModals();
+      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+      await page.waitForTimeout(600);
+      publishClicked = await findAndClickPublish();
+    }
 
     if (!publishClicked) {
       const diag = await page.evaluate(() => {
@@ -290,20 +298,29 @@ app.post("/publish-draft", async (req, res) => {
       return false;
     }).catch(() => {});
 
-    // Poll for an explicit success/error signal for up to 15s. Previous
+    // Poll for an explicit success/error signal for up to 20s. Previous
     // version was fail-OPEN (returned ok:true unless an explicit error
     // was visible) which silently masked publishes that quietly stalled
     // — the campaigns then showed up as drafts in TikTok while adsalim
-    // reported "published". Now fail-CLOSED: no success toast within
-    // the window = ok:false.
+    // reported "published". Now fail-CLOSED: no success signal within
+    // the window = ok:false. PRIMARY success signal is URL change to
+    // /manage/campaign — TikTok always navigates there on real success.
+    // Toast text was missing successes (G1 actually published as Active
+    // but our narrow regex didn't catch the toast text TikTok used).
     let postState = { hasSuccess: false, hasError: false, bodyText: "", url: page.url() };
     const POLL_MS = 500;
-    const POLL_MAX = 30; // 30 * 500ms = 15s
+    const POLL_MAX = 40; // 40 * 500ms = 20s
     for (let attempt = 0; attempt < POLL_MAX; attempt++) {
       await page.waitForTimeout(POLL_MS);
       postState = await page.evaluate(() => {
+        const url = location.href;
         const bodyText = (document.body.innerText || "").slice(0, 5000);
-        const hasSuccess = /publish.*success|published successfully|create success|成功/i.test(bodyText);
+        // Primary: URL navigated away from the editor to the campaign
+        // manager → unambiguous success. TikTok always does this.
+        const navigatedToManager = /\/i18n\/manage\/campaign/i.test(url);
+        // Secondary: any of the known success toast strings.
+        const toastSuccess = /publish.*success|publish.*succeed|published successfully|create success|submitted|submitted for review|pending review|saved successfully|成功|创建成功/i.test(bodyText);
+        const hasSuccess = navigatedToManager || toastSuccess;
         const hasError = /failed|error|insufficient|permission denied|risk/i.test(bodyText.slice(0, 2000));
         return { hasSuccess, hasError, bodyText: bodyText.slice(0, 800), url: location.href };
       });
