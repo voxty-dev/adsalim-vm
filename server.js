@@ -1078,11 +1078,40 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
             }
           }
           if (!bestPair) {
+            // Diagnostic: for the FIRST label candidate, walk forward in
+            // document order and dump tag+class of the next ~30 elements.
+            // This tells us what TikTok actually puts after the label,
+            // so we know which class/role to add to TRIGGER_SEL.
+            const firstLabel = labelCandidates[0];
+            const forwardDump = [];
+            if (firstLabel) {
+              const labelRect = firstLabel.getBoundingClientRect();
+              const allDoc = Array.from(document.querySelectorAll("*"));
+              const labelIndex = allDoc.indexOf(firstLabel);
+              let dumped = 0;
+              for (let i = labelIndex + 1; i < allDoc.length && dumped < 30; i++) {
+                const el = allDoc[i];
+                const r = el.getBoundingClientRect();
+                if (r.width === 0 || r.height === 0) continue;
+                if (r.top < labelRect.bottom - 10) continue;
+                if (r.top - labelRect.bottom > 400) break;
+                const cs = window.getComputedStyle(el);
+                if (cs.display === "none" || cs.visibility === "hidden") continue;
+                const cls = (el.className && typeof el.className === "string") ? el.className.toString().slice(0, 50) : "";
+                const role = el.getAttribute && el.getAttribute("role") || "";
+                const ariaHasPopup = el.getAttribute && el.getAttribute("aria-haspopup") || "";
+                const cursor = cs.cursor;
+                const tag = el.tagName.toLowerCase();
+                forwardDump.push(`${tag}${role ? "[" + role + "]" : ""}${ariaHasPopup ? "[hp=" + ariaHasPopup + "]" : ""}${cursor === "pointer" ? "[p]" : ""}.${cls}`.slice(0, 90));
+                dumped++;
+              }
+            }
             return {
               ok: false,
               reason: "no-following-trigger",
               labelCount: labelCandidates.length,
               triggerCount: allTriggers.length,
+              dump: forwardDump.join(" | "),
             };
           }
 
@@ -1147,7 +1176,8 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
           if (!bruteOpened) {
             const why = triggered ? triggered.reason : "evaluate-null";
             const extra = triggered ? `|labels=${triggered.labelCount || 0}|triggers=${triggered.triggerCount || 0}` : "";
-            return `error:trigger-not-found:${labelText}|why=${why}${extra}|brute-tried=${labelPositions.length}`;
+            const dump = triggered && triggered.dump ? `|dump=${triggered.dump}` : "";
+            return `error:trigger-not-found:${labelText}|why=${why}${extra}|brute-tried=${labelPositions.length}${dump}`;
           }
         }
         await page.waitForTimeout(900);
