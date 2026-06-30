@@ -483,23 +483,45 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
   // Tries (in order): the modal's top-right close button, "Got It",
   // "Got it", and falls back to ESC.
   async function dismissModals(page) {
-    await page.evaluate(() => {
-      // 1) Close icons inside dialogs.
-      const closes = Array.from(document.querySelectorAll(
-        '[role="dialog"] [aria-label*="close" i], [role="dialog"] [class*="close" i], [class*="modal" i] [aria-label*="close" i]',
-      ));
-      for (const c of closes) {
-        try { c.click(); } catch {}
-      }
-      // 2) "Got It" / "Got it" buttons (scans every button — covers both
-      //    the announcement modal and inline "Choose your X" tooltips).
-      const btns = Array.from(document.querySelectorAll("button"));
-      for (const b of btns) {
-        const t = (b.innerText || "").trim();
-        if (/^got\s*it$/i.test(t)) { try { b.click(); } catch {} }
-      }
-    }).catch(() => {});
-    await page.keyboard.press("Escape").catch(() => {});
+    // Loop a few times so multi-step tours ("1/3 → 2/3 → 3/3") get
+    // fully dismissed if Skip isn't accepted and we end up advancing.
+    for (let i = 0; i < 4; i++) {
+      const dismissedAny = await page.evaluate(() => {
+        const isVisible = (el) => {
+          const r = el.getBoundingClientRect();
+          if (r.width === 0 || r.height === 0) return false;
+          const cs = window.getComputedStyle(el);
+          return cs.display !== "none" && cs.visibility !== "hidden" && cs.opacity !== "0";
+        };
+        let n = 0;
+        // 1) Close icons inside dialogs.
+        const closes = Array.from(document.querySelectorAll(
+          '[role="dialog"] [aria-label*="close" i], [role="dialog"] [class*="close" i], [class*="modal" i] [aria-label*="close" i], [class*="popover" i] [aria-label*="close" i]',
+        ));
+        for (const c of closes) {
+          if (!isVisible(c)) continue;
+          try { c.click(); n++; } catch {}
+        }
+        // 2) Any clickable text matching tour/onboarding dismiss verbs.
+        // Includes "Skip" / "Skip tour" / "Got it" / "Maybe later" /
+        // "Don't show again" / "Dismiss" / "Close" — these dismiss
+        // TikTok's product tour overlay ("Easily manage multiple ad
+        // groups and ads" / 1-of-3 / Skip / Next) which silently blocks
+        // every subsequent click if left mounted.
+        const dismissRe = /^(got\s*it|skip|skip\s*tour|skip\s*all|maybe\s*later|dismiss|close|i\s*understand|done|don'?t\s*show\s*again|no\s*thanks)$/i;
+        const clickables = Array.from(document.querySelectorAll('button, a, [role="button"], [class*="ks-link" i], [class*="link" i]'));
+        for (const b of clickables) {
+          if (!isVisible(b)) continue;
+          const t = (b.innerText || b.textContent || "").trim();
+          if (!t || t.length > 30) continue;
+          if (dismissRe.test(t)) { try { b.click(); n++; } catch {} }
+        }
+        return n;
+      }).catch(() => 0);
+      await page.keyboard.press("Escape").catch(() => {});
+      if (dismissedAny === 0) break;
+      await page.waitForTimeout(200);
+    }
   }
 
   // Find a labelled toggle (e.g. "Catalog campaign") and force it OFF.
@@ -941,12 +963,10 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
           el.click();
         };
 
-        // Find HIGH Z-INDEX overlays — these are the open popups. Previous
-        // version scanned the whole document, which picked up text from
-        // unrelated visible dropdowns elsewhere on the page (audience
-        // section's "All", "Search or select interests...") and reported
-        // them as "seen" even when the actual popup contained different
-        // options. Now we scope ALL option scans to the highest-z popup.
+        // Find HIGH Z-INDEX overlays — these are the open popups. Filter
+        // out the top nav (full-width sticky bar with "Ads Manager" /
+        // advertiser-name) which is also position:fixed with high z but
+        // contains no dropdown options.
         const all = Array.from(document.querySelectorAll("*"));
         const popups = all.filter((el) => {
           const cs = window.getComputedStyle(el);
@@ -956,8 +976,12 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
           if (r.width < 100 || r.height < 40) return false;
           const z = parseInt(cs.zIndex);
           if (isNaN(z) || z < 100) return false;
-          // Skip the page's own modal/announcement overlays — they don't
-          // contain dropdown options (no clickable leaf text).
+          // Skip full-width sticky bars (top nav / left sidebar).
+          if (r.width >= window.innerWidth - 50 && r.height < 80) return false;
+          if (r.height >= window.innerHeight - 50 && r.width < 100) return false;
+          // Skip elements that are themselves containers wrapping the
+          // whole viewport (modals' backdrops).
+          if (r.width >= window.innerWidth - 50 && r.height >= window.innerHeight - 50) return false;
           return true;
         });
         popups.sort((a, b) => {
@@ -1034,6 +1058,11 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
       // following the label" is unambiguous regardless of how deeply
       // nested or how wide the trigger row is.
       try {
+        // Tour modals ("1/3 Skip Next") and announcement overlays silently
+        // intercept clicks. Sweep before every trigger lookup — they
+        // re-mount async during the form flow.
+        await dismissModals(page);
+        await page.waitForTimeout(200);
         const triggered = await page.evaluate((needle) => {
           // TikTok ads_aio_adgroup uses custom elements with hash-suffixed
           // tag names that change every deploy:
@@ -1156,13 +1185,42 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
           t.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
           t.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
           t.click();
+          const tr = t.getBoundingClientRect();
           return {
             ok: true,
             tag: t.tagName.toLowerCase(),
             cls: (t.className && typeof t.className === "string") ? t.className.slice(0, 60) : "",
             gap: Math.round(bestPair.gap),
+            cx: tr.left + tr.width / 2,
+            cy: tr.top + tr.height / 2,
           };
         }, labelText);
+
+        // For custom elements like <ks-input-selector-*>, .click()
+        // sometimes fails to trigger the popup mount. Follow up with a
+        // real mouse click at the trigger's center as insurance, then
+        // verify a popup actually appeared.
+        if (triggered && triggered.ok && triggered.cx) {
+          await page.waitForTimeout(250);
+          const popupAfter = await page.evaluate(() => {
+            return Array.from(document.querySelectorAll("*")).some((el) => {
+              const cs = window.getComputedStyle(el);
+              if (cs.position !== "fixed" && cs.position !== "absolute") return false;
+              const r = el.getBoundingClientRect();
+              if (r.width < 100 || r.height < 40) return false;
+              if (cs.display === "none" || cs.visibility === "hidden") return false;
+              const z = parseInt(cs.zIndex);
+              if (isNaN(z) || z < 100) return false;
+              // Skip top nav / sticky header (full-width, very narrow).
+              if (r.width >= window.innerWidth - 50 && r.height < 80) return false;
+              return true;
+            });
+          });
+          if (!popupAfter) {
+            try { await page.mouse.click(triggered.cx, triggered.cy); } catch {}
+            await page.waitForTimeout(300);
+          }
+        }
 
         let triggerVia = triggered && triggered.ok ? `ok:${triggered.tag}|gap=${triggered.gap}` : "";
 
