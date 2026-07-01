@@ -1728,17 +1728,25 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
     await dismissModals(page);
     await shot(page, "06-adgroup-mid");
 
-    // 12. AUDIENCE TARGETING. The Smart+ aio_adgroup form starts in
-    //     "account-level" mode with location=Vietnam / all ages / all
-    //     genders — none of what the user typed. Click "Switch to
-    //     manual targeting" first to reveal the editable fields, then
-    //     fill locations / age groups / gender.
-    if ((countryIds && countryIds.length) || (ageGroupIds && ageGroupIds.length) || gender) {
-      // 12a. Click "Switch to manual targeting" link.
-      // First scroll to the Audience targeting section so the link is in
-      // the viewport (its at the BOTTOM of the audience card, ~1000px
-      // below Budget). Otherwise our element scan wont see it as
-      // "visible" and skips the click.
+    // 12. AUDIENCE TARGETING — keep AUTOMATIC targeting (Smart+ default),
+    //     do NOT switch to manual. The account-level automatic mode shows
+    //     two editable sub-sections with pencil (✏️) icons:
+    //       - "Audience controls"          -> Location (+ min age)
+    //       - "Automatic targeting guidance" -> Age groups
+    //     We click each pencil to open its editor, then fill the values.
+    if ((countryIds && countryIds.length) || (ageGroupIds && ageGroupIds.length)) {
+      const COUNTRY_MAP = {
+        "6252001": "United States", "3175395": "Italy", "2510769": "Spain",
+        "3017382": "France", "2635167": "United Kingdom", "2750405": "Netherlands",
+        "2921044": "Germany", "2802361": "Belgium", "2658434": "Switzerland",
+        "2782113": "Austria", "2264397": "Portugal", "2960313": "Luxembourg",
+        "3144096": "Norway", "2661886": "Sweden", "2623032": "Denmark",
+        "660013": "Finland", "294640": "Israel", "298795": "Turkey",
+        "2017370": "Russia", "1814991": "China", "1835841": "South Korea",
+        "1861060": "Japan",
+      };
+
+      // Scroll the Audience targeting section into view.
       await page.evaluate(() => {
         const heading = Array.from(document.querySelectorAll("*")).find((el) => {
           if (el.children.length > 4) return false;
@@ -1747,184 +1755,163 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
         });
         if (heading) heading.scrollIntoView({ block: "start" });
       });
-      await page.waitForTimeout(400);
+      await page.waitForTimeout(500);
       await dismissModals(page);
 
-      const switchInfo = await page.evaluate(() => {
-        const isVisible = (el) => {
-          const cs = window.getComputedStyle(el);
-          if (cs.display === "none" || cs.visibility === "hidden") return false;
-          const r = el.getBoundingClientRect();
-          return r.width > 0 && r.height > 0;
-        };
-        const re = /^switch\s*to\s*manual\s*targeting\s*[\?ⓘ\(\)i ]{0,2}$/i;
-        // Score candidates: prefer real clickable tags (a/button/[role]),
-        // penalize plain spans/divs. Also skip elements that CONTAIN
-        // another matching candidate (theyre wrappers, not the actual link).
-        const all = Array.from(document.querySelectorAll("*"));
-        const matches = [];
-        for (const el of all) {
-          if (el.children.length > 6) continue;
-          const t = (el.innerText || el.textContent || "").trim();
-          if (!re.test(t)) continue;
-          if (!isVisible(el)) continue;
-          matches.push(el);
-        }
-        if (!matches.length) return { ok: false, matches: 0 };
-        // Remove wrappers: element A wraps B if A.contains(B).
-        const leaves = matches.filter((el) => !matches.some((other) => other !== el && el.contains(other)));
-        const score = (el) => {
-          const tag = el.tagName.toLowerCase();
-          if (tag === "a" || tag === "button") return 100;
-          if (el.getAttribute("role") === "button") return 90;
-          const cls = (el.className && typeof el.className === "string") ? el.className : "";
-          if (/(?:^|\s)(?:ks-link|link|clickable)(?:$|\s|_)/i.test(cls)) return 80;
-          if (window.getComputedStyle(el).cursor === "pointer") return 70;
-          return 10;
-        };
-        leaves.sort((a, b) => score(b) - score(a));
-        const pick = leaves[0];
-        const r = pick.getBoundingClientRect();
-        pick.scrollIntoView({ block: "center" });
-        return {
-          ok: true,
-          txt: (pick.innerText || pick.textContent || "").trim().slice(0, 40),
-          tag: pick.tagName.toLowerCase(),
-          score: score(pick),
-          cx: r.left + r.width / 2,
-          cy: r.top + r.height / 2,
-          matches: matches.length,
-          leaves: leaves.length,
-        };
-      });
-
-      let didSwitch = false;
-      if (switchInfo && switchInfo.ok) {
-        // Trusted mouse click at the link's center — programmatic .click()
-        // often doesnt fire TikToks route change; a real mouse event does.
-        try {
-          await page.mouse.move(switchInfo.cx, switchInfo.cy);
-          await page.waitForTimeout(80);
-          await page.mouse.click(switchInfo.cx, switchInfo.cy, { delay: 60 });
-        } catch {}
-        // Verify: after switch, the link should disappear + new fields
-        // (Locations, Gender, Age groups) should mount.
-        await page.waitForTimeout(1500);
-        await dismissModals(page);
-        await page.waitForTimeout(500);
-        const linkGone = await page.evaluate(() => {
-          const re = /^switch\s*to\s*manual\s*targeting\s*[\?ⓘ\(\)i ]{0,2}$/i;
-          const all = Array.from(document.querySelectorAll("*"));
-          return !all.some((el) => {
-            if (el.children.length > 6) return false;
-            const t = (el.innerText || el.textContent || "").trim();
-            if (!re.test(t)) return false;
+      // Helper: click the edit pencil in the same row as a section
+      // heading. The pencil is a small clickable icon to the RIGHT of
+      // the heading text, same vertical level. Returns coords for a
+      // trusted click.
+      const clickEditPencil = async (headingRe) => {
+        const info = await page.evaluate((reSrc) => {
+          const re = new RegExp(reSrc, "i");
+          const isVisible = (el) => {
             const cs = window.getComputedStyle(el);
             if (cs.display === "none" || cs.visibility === "hidden") return false;
             const r = el.getBoundingClientRect();
             return r.width > 0 && r.height > 0;
-          });
-        });
-        didSwitch = linkGone;
-        adGroupReport.switchToManual = `clicked|txt=${switchInfo.txt}|tag=${switchInfo.tag}|score=${switchInfo.score}|matches=${switchInfo.matches}|leaves=${switchInfo.leaves}|linkGone=${linkGone}`;
-      } else {
-        adGroupReport.switchToManual = `not-found|matches=${(switchInfo && switchInfo.matches) || 0}`;
-      }
+          };
+          // Find the heading element (exact-ish text).
+          const all = Array.from(document.querySelectorAll("*"));
+          let heading = null;
+          for (const el of all) {
+            if (el.children.length > 3) continue;
+            const t = (el.innerText || el.textContent || "").trim();
+            if (re.test(t) && isVisible(el)) { heading = el; break; }
+          }
+          if (!heading) return { ok: false, reason: "heading-not-found" };
+          const hr = heading.getBoundingClientRect();
+          // Walk up a few ancestors; within each, look for an icon-ish
+          // clickable to the RIGHT of the heading on the same row.
+          let cursor = heading;
+          for (let i = 0; i < 5 && cursor; i++) {
+            const parent = cursor.parentElement;
+            if (!parent) break;
+            const cands = Array.from(parent.querySelectorAll(
+              'svg, [class*="edit" i], [class*="pencil" i], [class*="pen" i], ' +
+              '[aria-label*="edit" i], [role="button"], button, [class*="icon" i]'
+            ));
+            let best = null, bestDist = Infinity;
+            for (const c of cands) {
+              if (c.contains(heading) || heading.contains(c)) continue;
+              if (!isVisible(c)) continue;
+              const r = c.getBoundingClientRect();
+              // Must be to the RIGHT, same row (within 30px vertical).
+              if (r.left < hr.right - 5) continue;
+              if (Math.abs((r.top + r.height / 2) - (hr.top + hr.height / 2)) > 30) continue;
+              // Icon-sized (avoid grabbing a huge container).
+              if (r.width > 80 || r.height > 80) continue;
+              const dist = r.left - hr.right;
+              if (dist < bestDist) { best = c; bestDist = dist; }
+            }
+            if (best) {
+              const r = best.getBoundingClientRect();
+              best.scrollIntoView({ block: "center" });
+              return {
+                ok: true,
+                cx: r.left + r.width / 2,
+                cy: r.top + r.height / 2,
+                tag: best.tagName.toLowerCase(),
+              };
+            }
+            cursor = parent;
+          }
+          return { ok: false, reason: "pencil-not-found" };
+        }, headingRe.source);
+        if (info && info.ok) {
+          try {
+            await page.mouse.move(info.cx, info.cy);
+            await page.waitForTimeout(80);
+            await page.mouse.click(info.cx, info.cy, { delay: 60 });
+          } catch {}
+          await page.waitForTimeout(1200);
+          await dismissModals(page);
+        }
+        return info;
+      };
 
-      // 12b. Country picker. TikTok's Locations input is a searchable
-      //      cascader — open it, type each country name, click the
-      //      first matching option.
-      if (didSwitch && countryIds && countryIds.length) {
-        const COUNTRY_MAP = {
-          "6252001": "United States",
-          "3175395": "Italy",
-          "2510769": "Spain",
-          "3017382": "France",
-          "2635167": "United Kingdom",
-          "2750405": "Netherlands",
-          "2921044": "Germany",
-          "2802361": "Belgium",
-          "2658434": "Switzerland",
-          "2782113": "Austria",
-          "2264397": "Portugal",
-          "2960313": "Luxembourg",
-          "3144096": "Norway",
-          "2661886": "Sweden",
-          "2623032": "Denmark",
-          "660013":  "Finland",
-          "294640":  "Israel",
-          "298795":  "Turkey",
-          "2017370": "Russia",
-          "1814991": "China",
-          "1835841": "South Korea",
-          "1861060": "Japan",
-        };
-        const countryNames = countryIds.map((id) => COUNTRY_MAP[id]).filter(Boolean);
-        adGroupReport.countryPicks = [];
-        for (const name of countryNames) {
-          const r = await pickFromDropdown("Locations", name);
-          adGroupReport.countryPicks.push(`${name}=>${r}`);
+      // 12a. LOCATION via "Audience controls" pencil.
+      if (countryIds && countryIds.length) {
+        const editInfo = await clickEditPencil(/^audience controls(?:\s*[\?ⓘ])?$/i);
+        adGroupReport.audienceControlsEdit = editInfo && editInfo.ok ? `opened|tag=${editInfo.tag}` : `error:${editInfo && editInfo.reason}`;
+        if (editInfo && editInfo.ok) {
+          const countryNames = countryIds.map((id) => COUNTRY_MAP[id]).filter(Boolean);
+          // First remove the pre-applied default location (Vietnam) so it
+          // doesnt linger alongside the ones we add.
+          await page.evaluate(() => {
+            // Remove chips by clicking their ✕ close buttons in the
+            // Locations field.
+            const closeBtns = Array.from(document.querySelectorAll(
+              '[class*="tag" i] [class*="close" i], [class*="chip" i] [class*="close" i], ' +
+              '[class*="selected" i] [class*="close" i], [class*="remove" i], ' +
+              '[aria-label*="remove" i], [aria-label*="close" i]'
+            ));
+            for (const b of closeBtns) {
+              const r = b.getBoundingClientRect();
+              if (r.width === 0 || r.height === 0) continue;
+              const cs = window.getComputedStyle(b);
+              if (cs.display === "none" || cs.visibility === "hidden") continue;
+              // Only remove chips near the Locations label (top part of
+              // the panel) — avoid nuking unrelated chips.
+              try { b.click(); } catch {}
+            }
+          });
           await page.waitForTimeout(500);
+          adGroupReport.countryPicks = [];
+          for (const name of countryNames) {
+            const r = await pickFromDropdown("Locations", name);
+            adGroupReport.countryPicks.push(`${name}=>${r}`);
+            await page.waitForTimeout(600);
+          }
         }
       }
 
-      // 12c. Age group chips. Each chip is a clickable pill; we toggle
-      //      to match desired set. TikTok labels: "13-17" / "18-24" /
-      //      "25-34" / "35-44" / "45-54" / "55+".
-      if (didSwitch && ageGroupIds && ageGroupIds.length) {
+      // 12b. AGE via "Automatic targeting guidance" pencil.
+      if (ageGroupIds && ageGroupIds.length) {
         const AGE_MAP = {
-          AGE_13_17: "13-17",
-          AGE_18_24: "18-24",
-          AGE_25_34: "25-34",
-          AGE_35_44: "35-44",
-          AGE_45_54: "45-54",
-          AGE_55_100: "55+",
+          AGE_13_17: "13-17", AGE_18_24: "18-24", AGE_25_34: "25-34",
+          AGE_35_44: "35-44", AGE_45_54: "45-54", AGE_55_100: "55+",
         };
         const wantedLabels = new Set(ageGroupIds.map((id) => AGE_MAP[id]).filter(Boolean));
-        adGroupReport.ageGroupPicks = await page.evaluate((wanted) => {
-          const results = [];
-          const allChips = Array.from(document.querySelectorAll('button, [role="button"], [class*="chip" i], [class*="pill" i], [class*="tag" i], span'));
-          const chipLabels = ["13-17", "18-24", "25-34", "35-44", "45-54", "55+"];
-          for (const label of chipLabels) {
-            const chip = allChips.find((c) => {
-              const t = (c.innerText || c.textContent || "").trim();
-              if (t !== label) return false;
-              const cs = window.getComputedStyle(c);
-              if (cs.display === "none" || cs.visibility === "hidden") return false;
-              const r = c.getBoundingClientRect();
-              return r.width > 0 && r.height > 0;
-            });
-            if (!chip) { results.push(`${label}=missing`); continue; }
-            // Determine current state: chip has an "active"/"selected"
-            // class or aria-pressed=true.
-            const cls = (chip.className && typeof chip.className === "string") ? chip.className : "";
-            const isSelected =
-              /(?:^|[\s_-])(active|selected|checked|on)(?:[\s_-]|$)/i.test(cls) ||
-              chip.getAttribute("aria-pressed") === "true";
-            const want = wanted.has(label);
-            if (want !== isSelected) {
-              chip.scrollIntoView({ block: "center" });
-              chip.click();
-              results.push(`${label}=toggled(was:${isSelected}=>want:${want})`);
-            } else {
-              results.push(`${label}=ok(${isSelected ? "on" : "off"})`);
+        const editInfo = await clickEditPencil(/^automatic targeting guidance(?:\s*[·\-]?\s*optional)?(?:\s*[\?ⓘ])?$/i);
+        adGroupReport.autoGuidanceEdit = editInfo && editInfo.ok ? `opened|tag=${editInfo.tag}` : `error:${editInfo && editInfo.reason}`;
+        if (editInfo && editInfo.ok) {
+          adGroupReport.ageGroupPicks = await page.evaluate((wanted) => {
+            const results = [];
+            const chipLabels = ["13-17", "18-24", "25-34", "35-44", "45-54", "55+"];
+            const allEls = Array.from(document.querySelectorAll('button, [role="button"], [role="checkbox"], [class*="chip" i], [class*="pill" i], [class*="tag" i], [class*="checkbox" i], label, span'));
+            for (const label of chipLabels) {
+              const norm = label.replace(/\s+/g, "");
+              const chip = allEls.find((c) => {
+                const t = (c.innerText || c.textContent || "").trim().replace(/\s+/g, "");
+                if (t !== norm) return false;
+                const cs = window.getComputedStyle(c);
+                if (cs.display === "none" || cs.visibility === "hidden") return false;
+                const r = c.getBoundingClientRect();
+                return r.width > 0 && r.height > 0 && r.width < 200;
+              });
+              if (!chip) { results.push(`${label}=missing`); continue; }
+              const cls = (chip.className && typeof chip.className === "string") ? chip.className : "";
+              let isSelected =
+                /(?:^|[\s_-])(active|selected|checked|on)(?:[\s_-]|$)/i.test(cls) ||
+                chip.getAttribute("aria-pressed") === "true" ||
+                chip.getAttribute("aria-checked") === "true";
+              // Also check a wrapping input.
+              const input = chip.querySelector && chip.querySelector('input[type="checkbox"]');
+              if (input && input.checked) isSelected = true;
+              const want = wanted.has(label);
+              if (want !== isSelected) {
+                chip.scrollIntoView({ block: "center" });
+                chip.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+                chip.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+                chip.click();
+                results.push(`${label}=toggled(${isSelected}=>${want})`);
+              } else {
+                results.push(`${label}=ok(${isSelected ? "on" : "off"})`);
+              }
             }
-          }
-          return results;
-        }, [...wantedLabels]);
-      }
-
-      // 12d. Gender. TikTok renders it as a dropdown with All / Male /
-      //      Female.
-      if (didSwitch && gender) {
-        const GENDER_MAP = {
-          GENDER_UNLIMITED: "All",
-          GENDER_MALE: "Male",
-          GENDER_FEMALE: "Female",
-        };
-        const genderLabel = GENDER_MAP[gender];
-        if (genderLabel) {
-          adGroupReport.genderPick = await pickFromDropdown("Gender", genderLabel);
+            return results;
+          }, [...wantedLabels]);
         }
       }
     }
