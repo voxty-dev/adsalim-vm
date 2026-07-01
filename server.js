@@ -1764,7 +1764,7 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
       // target lego-icons, EXCLUDE arrows/chevrons, and click the nearest
       // clickable ancestor with a trusted mouse event. Returns whether an
       // editor opened.
-      const clickEditPencil = async (headingRe) => {
+      const clickEditPencil = async (headingRe, shotLabel) => {
         // Scroll the heading to center first so positions are stable.
         await page.evaluate((reSrc) => {
           const re = new RegExp(reSrc, "i");
@@ -1895,11 +1895,20 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
         }, headingRe.source);
 
         if (info && info.ok) {
-          // Count the "Locations"/"Minimum age"/age-chip fields BEFORE
-          // clicking so we can tell whether the editor actually opened.
-          const beforeFields = await page.evaluate(() => {
-            return document.querySelectorAll('input, [class*="ks-select" i], [class*="ks-input" i]').length;
+          // Count visible form controls BEFORE — include TikTok custom
+          // tags (ks-input-selector-*, ks-dropdown-menu-*) whose tagName
+          // starts with ks-, not just class matches.
+          const countFields = () => page.evaluate(() => {
+            const els = Array.from(document.querySelectorAll("input, [class*='select'], [class*='input']"));
+            const custom = Array.from(document.querySelectorAll("*")).filter((e) => /^ks-(input|dropdown|select|cascader)/.test((e.tagName || "").toLowerCase()));
+            let n = 0;
+            for (const e of [...els, ...custom]) {
+              const r = e.getBoundingClientRect();
+              if (r.width > 0 && r.height > 0) n++;
+            }
+            return n;
           });
+          const beforeFields = await countFields();
           // Trusted click on the pencil.
           try {
             await page.mouse.move(info.cx, info.cy);
@@ -1907,14 +1916,14 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
             await page.mouse.click(info.cx, info.cy, { delay: 60 });
           } catch {}
           await page.waitForTimeout(1200);
+          // Snapshot so we can SEE what the pencil click actually did.
+          if (shotLabel) await shot(page, shotLabel);
           // Do NOT call dismissModals here — the edit panel can look like
-          // a modal/drawer and dismissModals would close it, which is
-          // exactly why the editor "wasnt open" for the field fills.
-          const afterFields = await page.evaluate(() => {
-            return document.querySelectorAll('input, [class*="ks-select" i], [class*="ks-input" i]').length;
-          });
+          // a modal/drawer and dismissModals would close it.
+          const afterFields = await countFields();
           info.editorOpened = afterFields > beforeFields;
           info.fieldDelta = `${beforeFields}=>${afterFields}`;
+          info.urlAfter = page.url();
           // If nothing changed, retry once with a click on the pencils
           // parent (hops+1) — the glyph may not carry the handler.
           if (!info.editorOpened) {
@@ -1967,9 +1976,9 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
 
       // 12a. LOCATION via "Audience controls" pencil.
       if (countryIds && countryIds.length) {
-        const editInfo = await clickEditPencil(/^audience controls(?:\s*[\?ⓘ])?$/i);
+        const editInfo = await clickEditPencil(/^audience controls(?:\s*[\?ⓘ])?$/i, "08-after-audctrl-pencil");
         adGroupReport.audienceControlsEdit = editInfo && editInfo.ok
-          ? `clicked|opened=${editInfo.editorOpened}|fields=${editInfo.fieldDelta}|cls=${editInfo.cls}|diag=${editInfo.diag}`
+          ? `clicked|opened=${editInfo.editorOpened}|fields=${editInfo.fieldDelta}|url=${(editInfo.urlAfter || "").slice(-40)}|cls=${editInfo.cls}`
           : `error:${editInfo && editInfo.reason}|hr=${editInfo && editInfo.headingRect}|diag=${editInfo && editInfo.diag}`;
         if (editInfo && editInfo.ok) {
           const countryNames = countryIds.map((id) => COUNTRY_MAP[id]).filter(Boolean);
@@ -2012,9 +2021,9 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
         const wantedLabels = new Set(ageGroupIds.map((id) => AGE_MAP[id]).filter(Boolean));
         // TikTok renamed this section: "Automatic targeting guidance" ->
         // "Audience suggestions". Match either, with optional "Optional".
-        const editInfo = await clickEditPencil(/^(?:automatic targeting guidance|audience suggestions)(?:\s*[·\-]?\s*optional)?(?:\s*[\?ⓘ])?$/i);
+        const editInfo = await clickEditPencil(/^(?:automatic targeting guidance|audience suggestions)(?:\s*[·\-]?\s*optional)?(?:\s*[\?ⓘ])?$/i, "09-after-autoguid-pencil");
         adGroupReport.autoGuidanceEdit = editInfo && editInfo.ok
-          ? `clicked|opened=${editInfo.editorOpened}|fields=${editInfo.fieldDelta}|cls=${editInfo.cls}|diag=${editInfo.diag}`
+          ? `clicked|opened=${editInfo.editorOpened}|fields=${editInfo.fieldDelta}|url=${(editInfo.urlAfter || "").slice(-40)}|cls=${editInfo.cls}`
           : `error:${editInfo && editInfo.reason}|hr=${editInfo && editInfo.headingRect}|diag=${editInfo && editInfo.diag}`;
         if (editInfo && editInfo.ok) {
           adGroupReport.ageGroupPicks = await page.evaluate((wanted) => {
