@@ -1759,9 +1759,29 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
       await dismissModals(page);
 
       // Helper: click the edit pencil in the same row as a section
-      // heading. The pencil is the RIGHTMOST small clickable on the same
-      // visual row as the heading. Returns coords for a trusted click.
+      // heading. TikTok's pencil is a <div class="lego-icons_*"> (hash
+      // rotates); the chevron next to it is lego-arrow_* / chevron. We
+      // target lego-icons, EXCLUDE arrows/chevrons, and click the nearest
+      // clickable ancestor with a trusted mouse event. Returns whether an
+      // editor opened.
       const clickEditPencil = async (headingRe) => {
+        // Scroll the heading to center first so positions are stable.
+        await page.evaluate((reSrc) => {
+          const re = new RegExp(reSrc, "i");
+          const all = Array.from(document.querySelectorAll("*"));
+          for (const el of all) {
+            if (el.children.length > 2) continue;
+            const t = (el.innerText || el.textContent || "").trim();
+            if (re.test(t)) {
+              const cs = window.getComputedStyle(el);
+              if (cs.display === "none" || cs.visibility === "hidden") continue;
+              el.scrollIntoView({ block: "center" });
+              break;
+            }
+          }
+        }, headingRe.source);
+        await page.waitForTimeout(400);
+
         const info = await page.evaluate((reSrc) => {
           const re = new RegExp(reSrc, "i");
           const isVisible = (el) => {
@@ -1770,9 +1790,12 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
             const r = el.getBoundingClientRect();
             return r.width > 0 && r.height > 0;
           };
-          // Find the heading element — the SHORTEST-text element that
-          // matches (avoids grabbing a big wrapper whose innerText starts
-          // with the heading). Prefer bold/heading-ish tags.
+          const clsOf = (el) => {
+            if (!el.className) return "";
+            if (typeof el.className === "string") return el.className;
+            if (el.className.baseVal) return el.className.baseVal;
+            return "";
+          };
           const all = Array.from(document.querySelectorAll("*"));
           let heading = null;
           for (const el of all) {
@@ -1783,50 +1806,60 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
           if (!heading) return { ok: false, reason: "heading-not-found" };
           const hr = heading.getBoundingClientRect();
           const hCenterY = hr.top + hr.height / 2;
+          const minLeft = hr.left + 120;
 
-          // Collect ALL visible small clickables/icons on the SAME ROW as
-          // the heading (vertical center within 40px). The heading span is
-          // often full-width (654px) with the pencil INSIDE its right edge,
-          // so we do NOT require the icon to be right of the heading's
-          // right edge — just on the same row and reasonably far right
-          // (past the heading text start + 120px). Pick the RIGHTMOST icon
-          // (chevron is leftmost, pencil is rightmost). Scan whole document
-          // since the pencil can be in a separate flex column.
-          const iconSel = 'svg, path, use, [class*="edit" i], [class*="pencil" i], [class*="pen" i], [aria-label*="edit" i], [role="button"], button, [class*="icon" i], i, span[class*="icon" i]';
-          const cands = Array.from(document.querySelectorAll(iconSel));
+          // Candidate icons: prefer lego-icons (the pencil). Widen row
+          // tolerance to 60px. EXCLUDE arrows/chevrons/carets.
+          const cands = Array.from(document.querySelectorAll('[class*="lego-icons" i], [class*="edit" i], [class*="pencil" i], svg, i, [class*="icon" i]'));
           const diag = [];
-          let best = null, bestLeft = -Infinity;
-          const minLeft = hr.left + 120; // past the heading text
+          const matches = [];
           for (const c of cands) {
             if (c.contains(heading) || heading.contains(c)) continue;
             if (!isVisible(c)) continue;
+            const cls = clsOf(c);
+            if (/arrow|chevron|caret|expand|collapse/i.test(cls)) continue;
             const r = c.getBoundingClientRect();
-            if (Math.abs((r.top + r.height / 2) - hCenterY) > 40) continue; // same row
-            if (r.width > 60 || r.height > 60) continue;        // icon-sized
-            if (r.width < 6 || r.height < 6) continue;
-            if (r.left < minLeft) continue;                      // right portion only
-            if (diag.length < 10) {
-              const cls = (c.className && typeof c.className === "string") ? c.className.slice(0, 24) : (c.className && c.className.baseVal) ? c.className.baseVal.slice(0, 24) : "";
-              diag.push(`${c.tagName.toLowerCase()}@${Math.round(r.left)},${Math.round(r.top)}.${cls}`);
-            }
-            if (r.left > bestLeft) { best = c; bestLeft = r.left; }
+            if (Math.abs((r.top + r.height / 2) - hCenterY) > 60) continue;
+            if (r.width > 60 || r.height > 60 || r.width < 6 || r.height < 6) continue;
+            if (r.left < minLeft) continue;
+            const isPencil = /lego-icons|edit|pencil/i.test(cls);
+            matches.push({ el: c, left: r.left, isPencil, r });
+            if (diag.length < 10) diag.push(`${c.tagName.toLowerCase()}@${Math.round(r.left)},${Math.round(r.top)}.${cls.slice(0, 20)}`);
           }
-          if (!best) {
+          if (!matches.length) {
             return { ok: false, reason: "pencil-not-found", headingRect: `${Math.round(hr.left)},${Math.round(hr.top)},${Math.round(hr.width)}x${Math.round(hr.height)}`, diag: diag.join(" | ") };
           }
-          const r = best.getBoundingClientRect();
-          best.scrollIntoView({ block: "center" });
-          const cls = (best.className && typeof best.className === "string") ? best.className.slice(0, 30) : (best.className && best.className.baseVal) ? best.className.baseVal.slice(0, 30) : "";
+          // Prefer a lego-icons/edit pencil; else rightmost.
+          matches.sort((a, b) => (b.isPencil - a.isPencil) || (b.left - a.left));
+          const pick = matches[0].el;
+          // Walk up to the nearest clickable ancestor (cursor:pointer /
+          // button / [role=button]) — the icon glyph itself may not carry
+          // the click handler.
+          let clickTarget = pick;
+          let hops = 0;
+          let cur = pick;
+          while (cur && hops < 5) {
+            const cs = window.getComputedStyle(cur);
+            if (cs.cursor === "pointer" || cur.matches?.('button, [role="button"], a')) { clickTarget = cur; break; }
+            cur = cur.parentElement; hops++;
+          }
+          const tr = clickTarget.getBoundingClientRect();
+          clickTarget.scrollIntoView({ block: "center" });
           return {
             ok: true,
-            cx: r.left + r.width / 2,
-            cy: r.top + r.height / 2,
-            tag: best.tagName.toLowerCase(),
-            cls,
+            cx: tr.left + tr.width / 2,
+            cy: tr.top + tr.height / 2,
+            tag: clickTarget.tagName.toLowerCase(),
+            cls: clsOf(clickTarget).slice(0, 30),
+            hops,
             diag: diag.join(" | "),
           };
         }, headingRe.source);
+
         if (info && info.ok) {
+          // Trusted click + verify an editor opened (a new dropdown/input
+          // appears in the audience card). Retry once at the icon center
+          // if nothing changed.
           try {
             await page.mouse.move(info.cx, info.cy);
             await page.waitForTimeout(80);
@@ -1842,7 +1875,7 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
       if (countryIds && countryIds.length) {
         const editInfo = await clickEditPencil(/^audience controls(?:\s*[\?ⓘ])?$/i);
         adGroupReport.audienceControlsEdit = editInfo && editInfo.ok
-          ? `opened|tag=${editInfo.tag}|cls=${editInfo.cls}|diag=${editInfo.diag}`
+          ? `clicked|tag=${editInfo.tag}|cls=${editInfo.cls}|hops=${editInfo.hops}|diag=${editInfo.diag}`
           : `error:${editInfo && editInfo.reason}|hr=${editInfo && editInfo.headingRect}|diag=${editInfo && editInfo.diag}`;
         if (editInfo && editInfo.ok) {
           const countryNames = countryIds.map((id) => COUNTRY_MAP[id]).filter(Boolean);
@@ -1887,7 +1920,7 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
         // "Audience suggestions". Match either, with optional "Optional".
         const editInfo = await clickEditPencil(/^(?:automatic targeting guidance|audience suggestions)(?:\s*[·\-]?\s*optional)?(?:\s*[\?ⓘ])?$/i);
         adGroupReport.autoGuidanceEdit = editInfo && editInfo.ok
-          ? `opened|tag=${editInfo.tag}|cls=${editInfo.cls}|diag=${editInfo.diag}`
+          ? `clicked|tag=${editInfo.tag}|cls=${editInfo.cls}|hops=${editInfo.hops}|diag=${editInfo.diag}`
           : `error:${editInfo && editInfo.reason}|hr=${editInfo && editInfo.headingRect}|diag=${editInfo && editInfo.diag}`;
         if (editInfo && editInfo.ok) {
           adGroupReport.ageGroupPicks = await page.evaluate((wanted) => {
