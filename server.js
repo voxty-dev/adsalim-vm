@@ -494,6 +494,33 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
           return cs.display !== "none" && cs.visibility !== "hidden" && cs.opacity !== "0";
         };
         let n = 0;
+        // 0) NEUTRALIZE TOUR SPOTLIGHT OVERLAYS. TikTok's product tour
+        // ("Easily manage multiple ad groups and ads" / 1-of-3) renders
+        // a full-page dark spotlight overlay with pointer-events:auto
+        // that catches EVERY click on the form. Even after Skip is
+        // clicked, some overlays linger — set their pointer-events to
+        // none so form clicks reach the intended element.
+        const overlaySel = [
+          '[class*="tour" i]:not([class*="tooltip" i])',
+          '[class*="onboarding" i]',
+          '[class*="spotlight" i]',
+          '[class*="mask" i]:not([class*="pattern" i])',
+          '[class*="highlight-overlay" i]',
+          '[class*="tutorial" i]',
+          '[class*="walkthrough" i]',
+          '[class*="coach-mark" i]',
+          '[data-testid*="tour" i]',
+          '[data-testid*="onboard" i]',
+        ].join(", ");
+        const overlays = Array.from(document.querySelectorAll(overlaySel));
+        for (const o of overlays) {
+          try {
+            o.style.pointerEvents = "none";
+            o.style.opacity = "0";
+            o.style.display = "none";
+            n++;
+          } catch {}
+        }
         // 1) Close icons inside dialogs.
         const closes = Array.from(document.querySelectorAll(
           '[role="dialog"] [aria-label*="close" i], [role="dialog"] [class*="close" i], [class*="modal" i] [aria-label*="close" i], [class*="popover" i] [aria-label*="close" i]',
@@ -503,13 +530,8 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
           try { c.click(); n++; } catch {}
         }
         // 2) Any clickable text matching tour/onboarding dismiss verbs.
-        // Includes "Skip" / "Skip tour" / "Got it" / "Maybe later" /
-        // "Don't show again" / "Dismiss" / "Close" — these dismiss
-        // TikTok's product tour overlay ("Easily manage multiple ad
-        // groups and ads" / 1-of-3 / Skip / Next) which silently blocks
-        // every subsequent click if left mounted.
-        const dismissRe = /^(got\s*it|skip|skip\s*tour|skip\s*all|maybe\s*later|dismiss|close|i\s*understand|done|don'?t\s*show\s*again|no\s*thanks)$/i;
-        const clickables = Array.from(document.querySelectorAll('button, a, [role="button"], [class*="ks-link" i], [class*="link" i]'));
+        const dismissRe = /^(got\s*it|skip|skip\s*tour|skip\s*all|maybe\s*later|dismiss|close|i\s*understand|done|don'?t\s*show\s*again|no\s*thanks|no,?\s*thanks)$/i;
+        const clickables = Array.from(document.querySelectorAll('button, a, [role="button"], [class*="ks-link" i], [class*="link" i], span[class*="tour" i]'));
         for (const b of clickables) {
           if (!isVisible(b)) continue;
           const t = (b.innerText || b.textContent || "").trim();
@@ -1108,13 +1130,43 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
             return { ok: false, reason: "label-not-found" };
           }
 
-          // Union of: tag-prefix matches + static-CSS matches.
+          // Custom elements like <ks-dropdown-menu-*> may have
+          // style="display: contents" on themselves — no bounding box.
+          // Compute an effective rect by walking descendants and taking
+          // the largest visible box. Falls back to null if truly nothing.
+          const effectiveRect = (el) => {
+            const own = el.getBoundingClientRect();
+            if (own.width > 0 && own.height > 0) return own;
+            const stack = Array.from(el.children || []);
+            let best = null;
+            let bestArea = 0;
+            while (stack.length) {
+              const c = stack.pop();
+              if (c.children) for (const gc of c.children) stack.push(gc);
+              const cr = c.getBoundingClientRect();
+              if (cr.width < 5 || cr.height < 5) continue;
+              const cs = window.getComputedStyle(c);
+              if (cs.display === "none" || cs.visibility === "hidden") continue;
+              if (cs.display === "contents") continue;
+              const area = cr.width * cr.height;
+              if (area > bestArea) { best = cr; bestArea = area; }
+            }
+            return best;
+          };
+          const isTriggerVisible = (el) => {
+            const cs = window.getComputedStyle(el);
+            if (cs.display === "none" || cs.visibility === "hidden") return false;
+            // Accept display:contents — the effective rect handler below
+            // will resolve to a real descendant box.
+            return effectiveRect(el) !== null;
+          };
+
           const tagPrefixMatches = allEls.filter((el) => {
             const tag = el.tagName ? el.tagName.toLowerCase() : "";
             return TAG_PREFIXES.some((re) => re.test(tag));
           });
           const staticMatches = Array.from(document.querySelectorAll(STATIC_SEL));
-          const allTriggers = Array.from(new Set([...tagPrefixMatches, ...staticMatches])).filter(visible);
+          const allTriggers = Array.from(new Set([...tagPrefixMatches, ...staticMatches])).filter(isTriggerVisible);
 
           // 2. For each label candidate, find the FIRST trigger that:
           //    - appears after the label in document order
@@ -1130,7 +1182,8 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
               if (t.contains(label) || label.contains(t)) continue;
               const pos = label.compareDocumentPosition(t);
               if (!(pos & Node.DOCUMENT_POSITION_FOLLOWING)) continue;
-              const r = t.getBoundingClientRect();
+              const r = effectiveRect(t);
+              if (!r) continue;
               if (r.top < labelRect.bottom - 10) continue;
               const gap = r.top - labelRect.bottom;
               if (gap > 600) continue;
