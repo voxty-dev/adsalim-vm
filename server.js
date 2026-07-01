@@ -736,14 +736,44 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
 
     if (!info || !info.ok) return `error:${(info && info.reason) || "eval-null"}`;
     if (info.checked === false) return `already-off|tag=${info.tag}`;
-    // Trusted mouse click at the toggle's effective center.
-    try {
-      await page.mouse.move(info.cx, info.cy);
-      await page.waitForTimeout(80);
-      await page.mouse.click(info.cx, info.cy, { delay: 60 });
-    } catch {}
-    await page.waitForTimeout(300);
-    return `clicked|tag=${info.tag}|wasChecked=${info.checked === null ? "unknown" : info.checked}`;
+
+    // Click, verify, re-click if still on. TikTok's ks-switch sometimes
+    // re-enables Goal-based budget after our first click; also a click
+    // on an off toggle would turn it ON, so we always verify state and
+    // re-click only if we see it in the ON state.
+    const isNowOn = async () => await page.evaluate((tagHash) => {
+      // Re-find the same toggle by hash-suffixed tagName.
+      const el = Array.from(document.querySelectorAll("*")).find((e) => e.tagName && e.tagName.toLowerCase() === tagHash);
+      if (!el) return null;
+      const inner = el.querySelector('[role="switch"], input[type="checkbox"]');
+      if (inner) {
+        if (inner.getAttribute("aria-checked") === "true") return true;
+        if (inner.getAttribute("aria-checked") === "false") return false;
+        if (typeof inner.checked === "boolean") return inner.checked;
+      }
+      const cls = (el.className && typeof el.className === "string") ? el.className : "";
+      if (/(?:^|[\s_-])(checked|active|on|open|true)(?:[\s_-]|$)/i.test(cls)) return true;
+      const descOn = Array.from(el.querySelectorAll("*")).some((c) => {
+        const cc = (c.className && typeof c.className === "string") ? c.className : "";
+        return /(?:^|[\s_-])(checked|active|on|open|true)(?:[\s_-]|$)/i.test(cc);
+      });
+      return descOn;
+    }, info.tag);
+
+    let attempts = 0;
+    let final = null;
+    while (attempts < 3) {
+      try {
+        await page.mouse.move(info.cx, info.cy);
+        await page.waitForTimeout(80);
+        await page.mouse.click(info.cx, info.cy, { delay: 60 });
+      } catch {}
+      await page.waitForTimeout(500);
+      final = await isNowOn();
+      if (final === false) break;
+      attempts++;
+    }
+    return `attempts=${attempts + 1}|tag=${info.tag}|wasChecked=${info.checked === null ? "unknown" : info.checked}|nowOn=${final}`;
   }
 
   let browser;
@@ -1705,23 +1735,47 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
     //     fill locations / age groups / gender.
     if ((countryIds && countryIds.length) || (ageGroupIds && ageGroupIds.length) || gender) {
       // 12a. Click "Switch to manual targeting" link.
+      // First scroll to the Audience targeting section so the link is in
+      // the viewport (its at the BOTTOM of the audience card, ~1000px
+      // below Budget). Otherwise our element scan wont see it as
+      // "visible" and skips the click.
+      await page.evaluate(() => {
+        const heading = Array.from(document.querySelectorAll("*")).find((el) => {
+          if (el.children.length > 4) return false;
+          const t = (el.innerText || el.textContent || "").trim();
+          return /^audience targeting(?:\s*[\?ⓘ])?$/i.test(t);
+        });
+        if (heading) heading.scrollIntoView({ block: "start" });
+      });
+      await page.waitForTimeout(400);
+      await dismissModals(page);
+
       const switchClicked = await page.evaluate(() => {
-        const links = Array.from(document.querySelectorAll('a, button, [role="button"], [class*="ks-link" i], [class*="link" i], span[class*="link" i], span'));
-        for (const l of links) {
+        const isVisible = (el) => {
+          const cs = window.getComputedStyle(el);
+          if (cs.display === "none" || cs.visibility === "hidden") return false;
+          const r = el.getBoundingClientRect();
+          return r.width > 0 && r.height > 0;
+        };
+        // Text on TikTok is "Switch to manual targeting ⓘ" — the ⓘ is a
+        // separate sibling but a parent's innerText concatenates it.
+        // Allow up to 2 trailing icon-ish chars.
+        const re = /^switch\s*to\s*manual\s*targeting\s*[\?ⓘ\(\)i ]{0,2}$/i;
+        const all = Array.from(document.querySelectorAll('a, button, [role="button"], [class*="ks-link" i], [class*="link" i], span[class*="link" i], span, div'));
+        for (const l of all) {
+          if (l.children.length > 4) continue;
           const t = (l.innerText || l.textContent || "").trim();
-          if (!/^switch to manual targeting$/i.test(t)) continue;
-          const cs = window.getComputedStyle(l);
-          if (cs.display === "none" || cs.visibility === "hidden") continue;
-          const r = l.getBoundingClientRect();
-          if (r.width === 0 || r.height === 0) continue;
+          if (!re.test(t)) continue;
+          if (!isVisible(l)) continue;
           l.scrollIntoView({ block: "center" });
           l.click();
-          return true;
+          return { ok: true, txt: t.slice(0, 40) };
         }
-        return false;
+        return { ok: false };
       });
-      adGroupReport.switchToManual = switchClicked ? "clicked" : "not-found";
-      if (switchClicked) {
+      adGroupReport.switchToManual = switchClicked && switchClicked.ok ? `clicked|txt=${switchClicked.txt}` : "not-found";
+      const didSwitch = switchClicked && switchClicked.ok;
+      if (didSwitch) {
         // Manual mode reveals a new set of fields; wait for mount.
         await page.waitForTimeout(1500);
         await dismissModals(page);
@@ -1730,7 +1784,7 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
       // 12b. Country picker. TikTok's Locations input is a searchable
       //      cascader — open it, type each country name, click the
       //      first matching option.
-      if (switchClicked && countryIds && countryIds.length) {
+      if (didSwitch && countryIds && countryIds.length) {
         const COUNTRY_MAP = {
           "6252001": "United States",
           "3175395": "Italy",
@@ -1767,7 +1821,7 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
       // 12c. Age group chips. Each chip is a clickable pill; we toggle
       //      to match desired set. TikTok labels: "13-17" / "18-24" /
       //      "25-34" / "35-44" / "45-54" / "55+".
-      if (switchClicked && ageGroupIds && ageGroupIds.length) {
+      if (didSwitch && ageGroupIds && ageGroupIds.length) {
         const AGE_MAP = {
           AGE_13_17: "13-17",
           AGE_18_24: "18-24",
@@ -1812,7 +1866,7 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
 
       // 12d. Gender. TikTok renders it as a dropdown with All / Male /
       //      Female.
-      if (switchClicked && gender) {
+      if (didSwitch && gender) {
         const GENDER_MAP = {
           GENDER_UNLIMITED: "All",
           GENDER_MALE: "Male",
