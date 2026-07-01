@@ -1895,16 +1895,72 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
         }, headingRe.source);
 
         if (info && info.ok) {
-          // Trusted click + verify an editor opened (a new dropdown/input
-          // appears in the audience card). Retry once at the icon center
-          // if nothing changed.
+          // Count the "Locations"/"Minimum age"/age-chip fields BEFORE
+          // clicking so we can tell whether the editor actually opened.
+          const beforeFields = await page.evaluate(() => {
+            return document.querySelectorAll('input, [class*="ks-select" i], [class*="ks-input" i]').length;
+          });
+          // Trusted click on the pencil.
           try {
             await page.mouse.move(info.cx, info.cy);
             await page.waitForTimeout(80);
             await page.mouse.click(info.cx, info.cy, { delay: 60 });
           } catch {}
           await page.waitForTimeout(1200);
-          await dismissModals(page);
+          // Do NOT call dismissModals here — the edit panel can look like
+          // a modal/drawer and dismissModals would close it, which is
+          // exactly why the editor "wasnt open" for the field fills.
+          const afterFields = await page.evaluate(() => {
+            return document.querySelectorAll('input, [class*="ks-select" i], [class*="ks-input" i]').length;
+          });
+          info.editorOpened = afterFields > beforeFields;
+          info.fieldDelta = `${beforeFields}=>${afterFields}`;
+          // If nothing changed, retry once with a click on the pencils
+          // parent (hops+1) — the glyph may not carry the handler.
+          if (!info.editorOpened) {
+            const retried = await page.evaluate((reSrc) => {
+              const re = new RegExp(reSrc, "i");
+              const all = Array.from(document.querySelectorAll("*"));
+              let heading = null;
+              for (const el of all) {
+                if (el.children.length > 2) continue;
+                const t = (el.innerText || el.textContent || "").trim();
+                if (re.test(t)) { const cs = window.getComputedStyle(el); if (cs.display !== "none" && cs.visibility !== "hidden") { heading = el; break; } }
+              }
+              if (!heading) return null;
+              const hr = heading.getBoundingClientRect();
+              // Find the lego-editIcon in the heading subtree, click IT and
+              // its parent with full pointer sequence.
+              let cur = heading;
+              for (let i = 0; i < 6 && cur; i++) {
+                const p = cur.parentElement; if (!p) break;
+                const pen = Array.from(p.querySelectorAll("*")).find((d) => {
+                  const tag = (d.tagName || "").toLowerCase();
+                  const cls = (d.className && typeof d.className === "string") ? d.className.toLowerCase() : "";
+                  return /lego-editicon|lego-icons|edit|pencil/.test(tag + " " + cls) && !/arrow|chevron|caret/.test(tag + " " + cls);
+                });
+                if (pen) {
+                  const targets = [pen, pen.parentElement, pen.parentElement && pen.parentElement.parentElement].filter(Boolean);
+                  for (const t of targets) {
+                    t.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+                    t.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+                    t.dispatchEvent(new PointerEvent("pointerup", { bubbles: true }));
+                    t.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+                    t.click();
+                  }
+                  const r = pen.getBoundingClientRect();
+                  return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+                }
+                cur = p;
+              }
+              return null;
+            }, headingRe.source);
+            await page.waitForTimeout(1000);
+            const after2 = await page.evaluate(() => document.querySelectorAll('input, [class*="ks-select" i], [class*="ks-input" i]').length);
+            info.editorOpened = after2 > beforeFields;
+            info.fieldDelta = `${beforeFields}=>${afterFields}=>${after2}`;
+            info.retried = !!retried;
+          }
         }
         return info;
       };
@@ -1913,7 +1969,7 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
       if (countryIds && countryIds.length) {
         const editInfo = await clickEditPencil(/^audience controls(?:\s*[\?ⓘ])?$/i);
         adGroupReport.audienceControlsEdit = editInfo && editInfo.ok
-          ? `clicked|tag=${editInfo.tag}|cls=${editInfo.cls}|hops=${editInfo.hops}|diag=${editInfo.diag}`
+          ? `clicked|opened=${editInfo.editorOpened}|fields=${editInfo.fieldDelta}|cls=${editInfo.cls}|diag=${editInfo.diag}`
           : `error:${editInfo && editInfo.reason}|hr=${editInfo && editInfo.headingRect}|diag=${editInfo && editInfo.diag}`;
         if (editInfo && editInfo.ok) {
           const countryNames = countryIds.map((id) => COUNTRY_MAP[id]).filter(Boolean);
@@ -1958,7 +2014,7 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
         // "Audience suggestions". Match either, with optional "Optional".
         const editInfo = await clickEditPencil(/^(?:automatic targeting guidance|audience suggestions)(?:\s*[·\-]?\s*optional)?(?:\s*[\?ⓘ])?$/i);
         adGroupReport.autoGuidanceEdit = editInfo && editInfo.ok
-          ? `clicked|tag=${editInfo.tag}|cls=${editInfo.cls}|hops=${editInfo.hops}|diag=${editInfo.diag}`
+          ? `clicked|opened=${editInfo.editorOpened}|fields=${editInfo.fieldDelta}|cls=${editInfo.cls}|diag=${editInfo.diag}`
           : `error:${editInfo && editInfo.reason}|hr=${editInfo && editInfo.headingRect}|diag=${editInfo && editInfo.diag}`;
         if (editInfo && editInfo.ok) {
           adGroupReport.ageGroupPicks = await page.evaluate((wanted) => {
