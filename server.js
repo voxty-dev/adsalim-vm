@@ -1796,6 +1796,20 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
             if (el.className.baseVal) return el.className.baseVal;
             return "";
           };
+          // Chevron/arrow test now checks TAG NAME too — TikTok renders
+          // <ks-icon-chevron-up class="ks-icon">, so the "chevron" is in
+          // the tag, not the class. That leaked through before.
+          const isChevron = (el) => {
+            const tag = (el.tagName || "").toLowerCase();
+            const cls = clsOf(el).toLowerCase();
+            return /arrow|chevron|caret|expand|collapse|angle/.test(tag) ||
+                   /arrow|chevron|caret|expand|collapse|angle/.test(cls);
+          };
+          const isPencilEl = (el) => {
+            const tag = (el.tagName || "").toLowerCase();
+            const cls = clsOf(el).toLowerCase();
+            return /lego-icons|edit|pencil/.test(tag) || /lego-icons|edit|pencil/.test(cls);
+          };
           const all = Array.from(document.querySelectorAll("*"));
           let heading = null;
           for (const el of all) {
@@ -1805,39 +1819,63 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
           }
           if (!heading) return { ok: false, reason: "heading-not-found" };
           const hr = heading.getBoundingClientRect();
-          const hCenterY = hr.top + hr.height / 2;
-          const minLeft = hr.left + 120;
 
-          // Candidate icons: prefer lego-icons (the pencil). Widen row
-          // tolerance to 60px. EXCLUDE arrows/chevrons/carets.
-          const cands = Array.from(document.querySelectorAll('[class*="lego-icons" i], [class*="edit" i], [class*="pencil" i], svg, i, [class*="icon" i]'));
+          // PRIMARY: walk up ancestors from the heading; at each, find a
+          // pencil descendant (lego-icons/edit, NOT chevron) that is
+          // visible + icon-sized. This ties the pencil to the heading's
+          // own row subtree, avoiding the card-level collapse chevron.
           const diag = [];
-          const matches = [];
-          for (const c of cands) {
-            if (c.contains(heading) || heading.contains(c)) continue;
-            if (!isVisible(c)) continue;
-            const cls = clsOf(c);
-            if (/arrow|chevron|caret|expand|collapse/i.test(cls)) continue;
-            const r = c.getBoundingClientRect();
-            if (Math.abs((r.top + r.height / 2) - hCenterY) > 60) continue;
-            if (r.width > 60 || r.height > 60 || r.width < 6 || r.height < 6) continue;
-            if (r.left < minLeft) continue;
-            const isPencil = /lego-icons|edit|pencil/i.test(cls);
-            matches.push({ el: c, left: r.left, isPencil, r });
-            if (diag.length < 10) diag.push(`${c.tagName.toLowerCase()}@${Math.round(r.left)},${Math.round(r.top)}.${cls.slice(0, 20)}`);
+          let pencil = null;
+          let cursor = heading;
+          for (let i = 0; i < 6 && cursor && !pencil; i++) {
+            const parent = cursor.parentElement;
+            if (!parent) break;
+            const descendants = Array.from(parent.querySelectorAll("*"));
+            for (const d of descendants) {
+              if (d === heading || d.contains(heading)) continue;
+              if (!isVisible(d)) continue;
+              if (isChevron(d)) continue;
+              if (!isPencilEl(d)) continue;
+              const r = d.getBoundingClientRect();
+              if (r.width > 60 || r.height > 60 || r.width < 6 || r.height < 6) continue;
+              pencil = d;
+              if (diag.length < 6) diag.push(`P:${d.tagName.toLowerCase()}@${Math.round(r.left)},${Math.round(r.top)}.${clsOf(d).slice(0, 20)}`);
+              break;
+            }
+            cursor = parent;
           }
-          if (!matches.length) {
+
+          // FALLBACK: same-row position scan across the doc, pencil-class
+          // preferred, chevrons excluded (tag+class).
+          if (!pencil) {
+            const hCenterY = hr.top + hr.height / 2;
+            const minLeft = hr.left + 120;
+            const cands = Array.from(document.querySelectorAll("*"));
+            const matches = [];
+            for (const c of cands) {
+              if (c === heading || c.contains(heading) || heading.contains(c)) continue;
+              if (!isVisible(c)) continue;
+              if (isChevron(c)) continue;
+              const r = c.getBoundingClientRect();
+              if (Math.abs((r.top + r.height / 2) - hCenterY) > 60) continue;
+              if (r.width > 60 || r.height > 60 || r.width < 6 || r.height < 6) continue;
+              if (r.left < minLeft) continue;
+              const pen = isPencilEl(c);
+              matches.push({ el: c, left: r.left, pen });
+              if (diag.length < 8) diag.push(`F:${c.tagName.toLowerCase()}@${Math.round(r.left)},${Math.round(r.top)}.${clsOf(c).slice(0, 18)}`);
+            }
+            matches.sort((a, b) => (b.pen - a.pen) || (b.left - a.left));
+            if (matches.length) pencil = matches[0].el;
+          }
+
+          if (!pencil) {
             return { ok: false, reason: "pencil-not-found", headingRect: `${Math.round(hr.left)},${Math.round(hr.top)},${Math.round(hr.width)}x${Math.round(hr.height)}`, diag: diag.join(" | ") };
           }
-          // Prefer a lego-icons/edit pencil; else rightmost.
-          matches.sort((a, b) => (b.isPencil - a.isPencil) || (b.left - a.left));
-          const pick = matches[0].el;
-          // Walk up to the nearest clickable ancestor (cursor:pointer /
-          // button / [role=button]) — the icon glyph itself may not carry
-          // the click handler.
-          let clickTarget = pick;
+
+          // Walk up to the nearest clickable ancestor.
+          let clickTarget = pencil;
           let hops = 0;
-          let cur = pick;
+          let cur = pencil;
           while (cur && hops < 5) {
             const cs = window.getComputedStyle(cur);
             if (cs.cursor === "pointer" || cur.matches?.('button, [role="button"], a')) { clickTarget = cur; break; }
