@@ -2139,42 +2139,77 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
           ? `clicked|opened=${editInfo.editorOpened}|fields=${editInfo.fieldDelta}|url=${(editInfo.urlAfter || "").slice(-40)}|cls=${editInfo.cls}`
           : `error:${editInfo && editInfo.reason}|hr=${editInfo && editInfo.headingRect}|diag=${editInfo && editInfo.diag}`;
         if (editInfo && editInfo.ok) {
-          adGroupReport.ageGroupPicks = await page.evaluate((wanted) => {
-            const results = [];
+          // Find each age chip + its selection state + click coords.
+          // TikTok renders a selected chip with a ✓ checkmark and a teal
+          // border (e.g. "18-24 ✓"). So chip text STARTS WITH the label
+          // (not equals), and "selected" = has a checkmark char / check
+          // icon / teal-ish border / selected class.
+          const chipInfo = await page.evaluate((wanted) => {
             const chipLabels = ["13-17", "18-24", "25-34", "35-44", "45-54", "55+"];
-            const allEls = Array.from(document.querySelectorAll('button, [role="button"], [role="checkbox"], [class*="chip" i], [class*="pill" i], [class*="tag" i], [class*="checkbox" i], label, span'));
+            const isVisible = (el) => {
+              const cs = window.getComputedStyle(el);
+              if (cs.display === "none" || cs.visibility === "hidden") return false;
+              const r = el.getBoundingClientRect();
+              return r.width > 0 && r.height > 0;
+            };
+            const tealBorder = (el) => {
+              const cs = window.getComputedStyle(el);
+              const bc = cs.borderColor || cs.borderTopColor || "";
+              const m = bc.match(/rgba?\(([^)]+)\)/);
+              if (!m) return false;
+              const [r, g, b] = m[1].split(",").map((x) => parseInt(x.trim()));
+              // TikTok teal ~ rgb(37-60, 180-220, 180-220): green+blue high, red low.
+              return g > 120 && b > 120 && r < 120;
+            };
+            const results = [];
+            const toClick = [];
+            const all = Array.from(document.querySelectorAll('button, [role="button"], [class*="chip" i], [class*="pill" i], [class*="tag" i], span, div'));
             for (const label of chipLabels) {
-              const norm = label.replace(/\s+/g, "");
-              const chip = allEls.find((c) => {
-                const t = (c.innerText || c.textContent || "").trim().replace(/\s+/g, "");
-                if (t !== norm) return false;
-                const cs = window.getComputedStyle(c);
-                if (cs.display === "none" || cs.visibility === "hidden") return false;
+              // chip whose trimmed text starts with the label and is short.
+              const chip = all.find((c) => {
+                if (c.children.length > 3) return false;
+                const t = (c.innerText || c.textContent || "").trim();
+                if (!t.startsWith(label)) return false;
+                if (t.length > label.length + 4) return false; // allow " ✓"
+                if (!isVisible(c)) return false;
                 const r = c.getBoundingClientRect();
-                return r.width > 0 && r.height > 0 && r.width < 200;
+                return r.width > 20 && r.width < 200 && r.height < 80;
               });
               if (!chip) { results.push(`${label}=missing`); continue; }
+              const t = (chip.innerText || chip.textContent || "").trim();
               const cls = (chip.className && typeof chip.className === "string") ? chip.className : "";
-              let isSelected =
-                /(?:^|[\s_-])(active|selected|checked|on)(?:[\s_-]|$)/i.test(cls) ||
+              const hasCheckIcon = !!chip.querySelector('svg, [class*="check" i], [class*="tick" i], [class*="selected" i]');
+              let selected =
+                /[✓√✔]/.test(t) ||
+                hasCheckIcon ||
+                /(?:^|[\s_-])(active|selected|checked)(?:[\s_-]|$)/i.test(cls) ||
                 chip.getAttribute("aria-pressed") === "true" ||
-                chip.getAttribute("aria-checked") === "true";
-              // Also check a wrapping input.
-              const input = chip.querySelector && chip.querySelector('input[type="checkbox"]');
-              if (input && input.checked) isSelected = true;
-              const want = wanted.has(label);
-              if (want !== isSelected) {
+                chip.getAttribute("aria-checked") === "true" ||
+                tealBorder(chip);
+              const want = wanted.includes(label);
+              if (want !== selected) {
+                const r = chip.getBoundingClientRect();
                 chip.scrollIntoView({ block: "center" });
-                chip.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
-                chip.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
-                chip.click();
-                results.push(`${label}=toggled(${isSelected}=>${want})`);
+                const r2 = chip.getBoundingClientRect();
+                toClick.push({ label, cx: r2.left + r2.width / 2, cy: r2.top + r2.height / 2, was: selected, want });
+                results.push(`${label}=toggle(${selected}=>${want})`);
               } else {
-                results.push(`${label}=ok(${isSelected ? "on" : "off"})`);
+                results.push(`${label}=ok(${selected ? "on" : "off"})`);
               }
             }
-            return results;
+            return { results, toClick };
           }, [...wantedLabels]);
+
+          // Trusted clicks for chips needing a toggle.
+          for (const c of chipInfo.toClick) {
+            try {
+              await page.mouse.move(c.cx, c.cy);
+              await page.waitForTimeout(60);
+              await page.mouse.click(c.cx, c.cy, { delay: 50 });
+            } catch {}
+            await page.waitForTimeout(300);
+          }
+          adGroupReport.ageGroupPicks = chipInfo.results;
         }
       }
     }
