@@ -623,6 +623,129 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
     }, labelRe.source);
   }
 
+  // Same story as pickFromDropdown for toggles: TikTok uses custom
+  // elements like <ks-switch-*> that may have display:contents on the
+  // outer wrapper, so plain-CSS + in-page .click() misses them. This
+  // helper mirrors the doc-order + effectiveRect + trusted-mouse-click
+  // pipeline. Use for Goal-based budget increase and any other toggle
+  // on the aio_adgroup page.
+  async function toggleOffByDocOrder(page, labelText) {
+    await dismissModals(page);
+    await page.waitForTimeout(200);
+    const info = await page.evaluate((needle) => {
+      const labelRe = new RegExp(`^${needle.replace(/\s+/g, "\\s*")}(?:\\s*[\\?ⓘ\\(\\)i ])?$`, "i");
+      const visible = (el) => {
+        const cs = window.getComputedStyle(el);
+        return cs.display !== "none" && cs.visibility !== "hidden";
+      };
+      const effectiveRect = (el) => {
+        const own = el.getBoundingClientRect();
+        if (own.width > 0 && own.height > 0) return own;
+        const stack = Array.from(el.children || []);
+        let bestRect = null, bestArea = 0;
+        while (stack.length) {
+          const c = stack.pop();
+          if (c.children) for (const gc of c.children) stack.push(gc);
+          const r = c.getBoundingClientRect();
+          if (r.width < 5 || r.height < 5) continue;
+          const cs = window.getComputedStyle(c);
+          if (cs.display === "none" || cs.visibility === "hidden") continue;
+          if (cs.display === "contents") continue;
+          const area = r.width * r.height;
+          if (area > bestArea) { bestArea = area; bestRect = r; }
+        }
+        return bestRect;
+      };
+      const all = Array.from(document.querySelectorAll("*"));
+      const labels = [];
+      for (const el of all) {
+        if (el.children.length > 4) continue;
+        const t = (el.innerText || el.textContent || "").trim();
+        if (!t || !labelRe.test(t)) continue;
+        if (!visible(el) || !effectiveRect(el)) continue;
+        labels.push(el);
+      }
+      if (!labels.length) return { ok: false, reason: "label-not-found" };
+
+      // Toggles come as ks-switch-*, [role="switch"], or a wrapping
+      // input[type="checkbox"].
+      const TOGGLE_PREFIXES = [/^ks-switch(-|$)/, /^ks-toggle(-|$)/];
+      const toggles = all.filter((el) => {
+        const tag = el.tagName ? el.tagName.toLowerCase() : "";
+        if (TOGGLE_PREFIXES.some((re) => re.test(tag))) return true;
+        if (el.matches?.('[role="switch"], input[type="checkbox"]')) return true;
+        if (el.className && typeof el.className === "string" && /(?:^|\s)ks-switch(?:$|\s|_)/.test(el.className)) return true;
+        return false;
+      }).filter((el) => visible(el) && effectiveRect(el));
+
+      let best = null;
+      for (const label of labels) {
+        const lr = label.getBoundingClientRect();
+        for (const t of toggles) {
+          if (t.contains(label) || label.contains(t)) continue;
+          const pos = label.compareDocumentPosition(t);
+          if (!(pos & Node.DOCUMENT_POSITION_FOLLOWING)) continue;
+          const r = effectiveRect(t);
+          if (!r) continue;
+          // Toggles for horizontal-labeled rows sit to the RIGHT of the
+          // label, not below. Accept either.
+          const dy = Math.abs(r.top + r.height / 2 - (lr.top + lr.height / 2));
+          const dx = r.left - lr.right;
+          const isRight = dx > -10 && dx < 800 && dy < 40;
+          const dyBelow = r.top - lr.bottom;
+          const isBelow = dyBelow > -10 && dyBelow < 200;
+          if (!isRight && !isBelow) continue;
+          const dist = isRight ? Math.max(0, dx) + dy : dyBelow;
+          if (!best || dist < best.dist) best = { label, toggle: t, dist, r };
+          break;
+        }
+      }
+      if (!best) return { ok: false, reason: "no-toggle-found", labels: labels.length, toggles: toggles.length };
+
+      // Is it on?
+      const t = best.toggle;
+      const aria = t.getAttribute && t.getAttribute("aria-checked");
+      let checked = null;
+      if (aria === "true") checked = true;
+      else if (aria === "false") checked = false;
+      else {
+        const cls = (t.className && typeof t.className === "string") ? t.className : "";
+        if (/(?:^|[\s_-])(checked|active|on|open|true)(?:[\s_-]|$)/i.test(cls)) checked = true;
+        // TikTok's ks-switch has a colored inner track when on — look
+        // for a descendant with a "checked" / "on" / "active" class.
+        if (checked === null) {
+          const descChecked = Array.from(t.querySelectorAll("*")).some((el) => {
+            const c = (el.className && typeof el.className === "string") ? el.className : "";
+            return /(?:^|[\s_-])(checked|active|on|open|true)(?:[\s_-]|$)/i.test(c);
+          });
+          if (descChecked) checked = true;
+        }
+      }
+
+      // Scroll into view + report the click point for the outer trusted
+      // mouse-click.
+      t.scrollIntoView({ block: "center" });
+      return {
+        ok: true,
+        checked,
+        cx: best.r.left + best.r.width / 2,
+        cy: best.r.top + best.r.height / 2,
+        tag: t.tagName.toLowerCase(),
+      };
+    }, labelText);
+
+    if (!info || !info.ok) return `error:${(info && info.reason) || "eval-null"}`;
+    if (info.checked === false) return `already-off|tag=${info.tag}`;
+    // Trusted mouse click at the toggle's effective center.
+    try {
+      await page.mouse.move(info.cx, info.cy);
+      await page.waitForTimeout(80);
+      await page.mouse.click(info.cx, info.cy, { delay: 60 });
+    } catch {}
+    await page.waitForTimeout(300);
+    return `clicked|tag=${info.tag}|wasChecked=${info.checked === null ? "unknown" : info.checked}`;
+  }
+
   let browser;
   try {
     browser = await chromium.launch({
@@ -1559,7 +1682,7 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
     await page.waitForTimeout(700);
     await page.evaluate(() => window.scrollBy(0, 250));
     await page.waitForTimeout(300);
-    adGroupReport.goalBasedBudgetOff = await setToggleOff(page, /^\s*Goal-based budget increase\s*$/i);
+    adGroupReport.goalBasedBudgetOff = await toggleOffByDocOrder(page, "Goal-based budget increase");
 
     // 11. Scroll down so the rest of the ad-group form (audience,
     //     placements, budget, schedule) is in view for screenshots.
