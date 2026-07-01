@@ -1759,9 +1759,8 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
       await dismissModals(page);
 
       // Helper: click the edit pencil in the same row as a section
-      // heading. The pencil is a small clickable icon to the RIGHT of
-      // the heading text, same vertical level. Returns coords for a
-      // trusted click.
+      // heading. The pencil is the RIGHTMOST small clickable on the same
+      // visual row as the heading. Returns coords for a trusted click.
       const clickEditPencil = async (headingRe) => {
         const info = await page.evaluate((reSrc) => {
           const re = new RegExp(reSrc, "i");
@@ -1771,52 +1770,59 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
             const r = el.getBoundingClientRect();
             return r.width > 0 && r.height > 0;
           };
-          // Find the heading element (exact-ish text).
+          // Find the heading element — the SHORTEST-text element that
+          // matches (avoids grabbing a big wrapper whose innerText starts
+          // with the heading). Prefer bold/heading-ish tags.
           const all = Array.from(document.querySelectorAll("*"));
           let heading = null;
           for (const el of all) {
-            if (el.children.length > 3) continue;
+            if (el.children.length > 2) continue;
             const t = (el.innerText || el.textContent || "").trim();
             if (re.test(t) && isVisible(el)) { heading = el; break; }
           }
           if (!heading) return { ok: false, reason: "heading-not-found" };
           const hr = heading.getBoundingClientRect();
-          // Walk up a few ancestors; within each, look for an icon-ish
-          // clickable to the RIGHT of the heading on the same row.
-          let cursor = heading;
-          for (let i = 0; i < 5 && cursor; i++) {
-            const parent = cursor.parentElement;
-            if (!parent) break;
-            const cands = Array.from(parent.querySelectorAll(
-              'svg, [class*="edit" i], [class*="pencil" i], [class*="pen" i], ' +
-              '[aria-label*="edit" i], [role="button"], button, [class*="icon" i]'
-            ));
-            let best = null, bestDist = Infinity;
-            for (const c of cands) {
-              if (c.contains(heading) || heading.contains(c)) continue;
-              if (!isVisible(c)) continue;
-              const r = c.getBoundingClientRect();
-              // Must be to the RIGHT, same row (within 30px vertical).
-              if (r.left < hr.right - 5) continue;
-              if (Math.abs((r.top + r.height / 2) - (hr.top + hr.height / 2)) > 30) continue;
-              // Icon-sized (avoid grabbing a huge container).
-              if (r.width > 80 || r.height > 80) continue;
-              const dist = r.left - hr.right;
-              if (dist < bestDist) { best = c; bestDist = dist; }
+          const hCenterY = hr.top + hr.height / 2;
+
+          // Collect ALL visible small clickables/icons on the SAME ROW
+          // (vertical center within 40px) and to the RIGHT of the heading.
+          // Scan the whole document — the pencil may be several DOM levels
+          // away from the heading (separate flex column), so an ancestor
+          // walk misses it.
+          const iconSel = 'svg, path, use, [class*="edit" i], [class*="pencil" i], [class*="pen" i], [aria-label*="edit" i], [role="button"], button, [class*="icon" i], i, span[class*="icon" i]';
+          const cands = Array.from(document.querySelectorAll(iconSel));
+          const diag = [];
+          let best = null, bestLeft = -Infinity;
+          for (const c of cands) {
+            if (c.contains(heading) || heading.contains(c)) continue;
+            if (!isVisible(c)) continue;
+            const r = c.getBoundingClientRect();
+            if (r.left < hr.right - 5) continue;               // must be to the right
+            if (Math.abs((r.top + r.height / 2) - hCenterY) > 40) continue; // same row
+            if (r.width > 60 || r.height > 60) continue;        // icon-sized
+            if (r.width < 6 || r.height < 6) continue;
+            if (diag.length < 8) {
+              const cls = (c.className && typeof c.className === "string") ? c.className.slice(0, 24) : (c.className && c.className.baseVal) ? c.className.baseVal.slice(0, 24) : "";
+              diag.push(`${c.tagName.toLowerCase()}@${Math.round(r.left)},${Math.round(r.top)}.${cls}`);
             }
-            if (best) {
-              const r = best.getBoundingClientRect();
-              best.scrollIntoView({ block: "center" });
-              return {
-                ok: true,
-                cx: r.left + r.width / 2,
-                cy: r.top + r.height / 2,
-                tag: best.tagName.toLowerCase(),
-              };
-            }
-            cursor = parent;
+            // The edit pencil is the RIGHTMOST icon on the row (chevron is
+            // on the left). Pick the one with the greatest left offset.
+            if (r.left > bestLeft) { best = c; bestLeft = r.left; }
           }
-          return { ok: false, reason: "pencil-not-found" };
+          if (!best) {
+            return { ok: false, reason: "pencil-not-found", headingRect: `${Math.round(hr.left)},${Math.round(hr.top)},${Math.round(hr.width)}x${Math.round(hr.height)}`, diag: diag.join(" | ") };
+          }
+          const r = best.getBoundingClientRect();
+          best.scrollIntoView({ block: "center" });
+          const cls = (best.className && typeof best.className === "string") ? best.className.slice(0, 30) : (best.className && best.className.baseVal) ? best.className.baseVal.slice(0, 30) : "";
+          return {
+            ok: true,
+            cx: r.left + r.width / 2,
+            cy: r.top + r.height / 2,
+            tag: best.tagName.toLowerCase(),
+            cls,
+            diag: diag.join(" | "),
+          };
         }, headingRe.source);
         if (info && info.ok) {
           try {
@@ -1833,7 +1839,9 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
       // 12a. LOCATION via "Audience controls" pencil.
       if (countryIds && countryIds.length) {
         const editInfo = await clickEditPencil(/^audience controls(?:\s*[\?ⓘ])?$/i);
-        adGroupReport.audienceControlsEdit = editInfo && editInfo.ok ? `opened|tag=${editInfo.tag}` : `error:${editInfo && editInfo.reason}`;
+        adGroupReport.audienceControlsEdit = editInfo && editInfo.ok
+          ? `opened|tag=${editInfo.tag}|cls=${editInfo.cls}|diag=${editInfo.diag}`
+          : `error:${editInfo && editInfo.reason}|hr=${editInfo && editInfo.headingRect}|diag=${editInfo && editInfo.diag}`;
         if (editInfo && editInfo.ok) {
           const countryNames = countryIds.map((id) => COUNTRY_MAP[id]).filter(Boolean);
           // First remove the pre-applied default location (Vietnam) so it
@@ -1873,8 +1881,12 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
           AGE_35_44: "35-44", AGE_45_54: "45-54", AGE_55_100: "55+",
         };
         const wantedLabels = new Set(ageGroupIds.map((id) => AGE_MAP[id]).filter(Boolean));
-        const editInfo = await clickEditPencil(/^automatic targeting guidance(?:\s*[·\-]?\s*optional)?(?:\s*[\?ⓘ])?$/i);
-        adGroupReport.autoGuidanceEdit = editInfo && editInfo.ok ? `opened|tag=${editInfo.tag}` : `error:${editInfo && editInfo.reason}`;
+        // TikTok renamed this section: "Automatic targeting guidance" ->
+        // "Audience suggestions". Match either, with optional "Optional".
+        const editInfo = await clickEditPencil(/^(?:automatic targeting guidance|audience suggestions)(?:\s*[·\-]?\s*optional)?(?:\s*[\?ⓘ])?$/i);
+        adGroupReport.autoGuidanceEdit = editInfo && editInfo.ok
+          ? `opened|tag=${editInfo.tag}|cls=${editInfo.cls}|diag=${editInfo.diag}`
+          : `error:${editInfo && editInfo.reason}|hr=${editInfo && editInfo.headingRect}|diag=${editInfo && editInfo.diag}`;
         if (editInfo && editInfo.ok) {
           adGroupReport.ageGroupPicks = await page.evaluate((wanted) => {
             const results = [];
