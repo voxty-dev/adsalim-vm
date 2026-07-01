@@ -1784,29 +1784,31 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
           const hr = heading.getBoundingClientRect();
           const hCenterY = hr.top + hr.height / 2;
 
-          // Collect ALL visible small clickables/icons on the SAME ROW
-          // (vertical center within 40px) and to the RIGHT of the heading.
-          // Scan the whole document — the pencil may be several DOM levels
-          // away from the heading (separate flex column), so an ancestor
-          // walk misses it.
+          // Collect ALL visible small clickables/icons on the SAME ROW as
+          // the heading (vertical center within 40px). The heading span is
+          // often full-width (654px) with the pencil INSIDE its right edge,
+          // so we do NOT require the icon to be right of the heading's
+          // right edge — just on the same row and reasonably far right
+          // (past the heading text start + 120px). Pick the RIGHTMOST icon
+          // (chevron is leftmost, pencil is rightmost). Scan whole document
+          // since the pencil can be in a separate flex column.
           const iconSel = 'svg, path, use, [class*="edit" i], [class*="pencil" i], [class*="pen" i], [aria-label*="edit" i], [role="button"], button, [class*="icon" i], i, span[class*="icon" i]';
           const cands = Array.from(document.querySelectorAll(iconSel));
           const diag = [];
           let best = null, bestLeft = -Infinity;
+          const minLeft = hr.left + 120; // past the heading text
           for (const c of cands) {
             if (c.contains(heading) || heading.contains(c)) continue;
             if (!isVisible(c)) continue;
             const r = c.getBoundingClientRect();
-            if (r.left < hr.right - 5) continue;               // must be to the right
             if (Math.abs((r.top + r.height / 2) - hCenterY) > 40) continue; // same row
             if (r.width > 60 || r.height > 60) continue;        // icon-sized
             if (r.width < 6 || r.height < 6) continue;
-            if (diag.length < 8) {
+            if (r.left < minLeft) continue;                      // right portion only
+            if (diag.length < 10) {
               const cls = (c.className && typeof c.className === "string") ? c.className.slice(0, 24) : (c.className && c.className.baseVal) ? c.className.baseVal.slice(0, 24) : "";
               diag.push(`${c.tagName.toLowerCase()}@${Math.round(r.left)},${Math.round(r.top)}.${cls}`);
             }
-            // The edit pencil is the RIGHTMOST icon on the row (chevron is
-            // on the left). Pick the one with the greatest left offset.
             if (r.left > bestLeft) { best = c; bestLeft = r.left; }
           }
           if (!best) {
