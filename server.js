@@ -1872,17 +1872,32 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
             return { ok: false, reason: "pencil-not-found", headingRect: `${Math.round(hr.left)},${Math.round(hr.top)},${Math.round(hr.width)}x${Math.round(hr.height)}`, diag: diag.join(" | ") };
           }
 
-          // Walk up to the nearest clickable ancestor.
+          // Dump the pencil's ancestor chain (4 levels) so we can see
+          // which wrapper actually carries the click handler.
+          const chain = [];
+          let ch = pencil;
+          for (let i = 0; i < 5 && ch; i++) {
+            const cs = window.getComputedStyle(ch);
+            const r = ch.getBoundingClientRect();
+            chain.push(`${ch.tagName.toLowerCase()}.${clsOf(ch).slice(0, 16)}[cur=${cs.cursor.slice(0, 4)}|${Math.round(r.width)}x${Math.round(r.height)}]`);
+            ch = ch.parentElement;
+          }
+
+          // Prefer a clickable ancestor (button/[role=button]/cursor:pointer)
+          // but fall back to the pencil itself. Also mark it for direct
+          // in-page dispatch as a second attempt.
           let clickTarget = pencil;
           let hops = 0;
           let cur = pencil;
           while (cur && hops < 5) {
             const cs = window.getComputedStyle(cur);
-            if (cs.cursor === "pointer" || cur.matches?.('button, [role="button"], a')) { clickTarget = cur; break; }
+            if (cur.matches?.('button, [role="button"], a, [class*="btn" i]') || cs.cursor === "pointer") { clickTarget = cur; break; }
             cur = cur.parentElement; hops++;
           }
           const tr = clickTarget.getBoundingClientRect();
           clickTarget.scrollIntoView({ block: "center" });
+          // Tag the pencil so we can re-find it for in-page dispatch.
+          pencil.setAttribute("data-vm-pencil", "1");
           return {
             ok: true,
             cx: tr.left + tr.width / 2,
@@ -1891,6 +1906,7 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
             cls: clsOf(clickTarget).slice(0, 30),
             hops,
             diag: diag.join(" | "),
+            chain: chain.join(" > "),
           };
         }, headingRe.source);
 
@@ -1909,13 +1925,34 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
             return n;
           });
           const beforeFields = await countFields();
-          // Trusted click on the pencil.
+          // Attempt 1: trusted mouse click at the target center.
           try {
             await page.mouse.move(info.cx, info.cy);
             await page.waitForTimeout(80);
             await page.mouse.click(info.cx, info.cy, { delay: 60 });
           } catch {}
-          await page.waitForTimeout(1200);
+          await page.waitForTimeout(600);
+          let mid = await countFields();
+          // Attempt 2: if nothing changed, dispatch a full pointer+mouse
+          // sequence on the tagged pencil AND each ancestor up to 4 levels
+          // (the handler may be on a wrapper the mouse click missed).
+          if (mid <= beforeFields) {
+            await page.evaluate(() => {
+              const pen = document.querySelector('[data-vm-pencil="1"]');
+              if (!pen) return;
+              let el = pen;
+              for (let i = 0; i < 4 && el; i++) {
+                for (const type of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
+                  try {
+                    const Ctor = type.startsWith("pointer") ? PointerEvent : MouseEvent;
+                    el.dispatchEvent(new Ctor(type, { bubbles: true, cancelable: true }));
+                  } catch {}
+                }
+                el = el.parentElement;
+              }
+            });
+            await page.waitForTimeout(800);
+          }
           // Snapshot so we can SEE what the pencil click actually did.
           if (shotLabel) await shot(page, shotLabel);
           // Do NOT call dismissModals here — the edit panel can look like
@@ -1978,7 +2015,7 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
       if (countryIds && countryIds.length) {
         const editInfo = await clickEditPencil(/^audience controls(?:\s*[\?ⓘ])?$/i, "08-after-audctrl-pencil");
         adGroupReport.audienceControlsEdit = editInfo && editInfo.ok
-          ? `clicked|opened=${editInfo.editorOpened}|fields=${editInfo.fieldDelta}|url=${(editInfo.urlAfter || "").slice(-40)}|cls=${editInfo.cls}`
+          ? `clicked|opened=${editInfo.editorOpened}|fields=${editInfo.fieldDelta}|chain=${editInfo.chain}`
           : `error:${editInfo && editInfo.reason}|hr=${editInfo && editInfo.headingRect}|diag=${editInfo && editInfo.diag}`;
         if (editInfo && editInfo.ok) {
           const countryNames = countryIds.map((id) => COUNTRY_MAP[id]).filter(Boolean);
