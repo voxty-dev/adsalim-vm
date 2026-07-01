@@ -2019,30 +2019,106 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
           : `error:${editInfo && editInfo.reason}|hr=${editInfo && editInfo.headingRect}|diag=${editInfo && editInfo.diag}`;
         if (editInfo && editInfo.ok) {
           const countryNames = countryIds.map((id) => COUNTRY_MAP[id]).filter(Boolean);
-          // First remove the pre-applied default location (Vietnam) so it
-          // doesnt linger alongside the ones we add.
+
+          // The Locations field is a search-as-you-type multi-select, not
+          // a plain dropdown. Dedicated handler: focus its input, type the
+          // country name, wait for the results, click the match.
+          const pickLocation = async (name) => {
+            // Find the search input inside the Locations field. Look for
+            // the "Locations" label, then the first input after it.
+            const inputPos = await page.evaluate(() => {
+              const all = Array.from(document.querySelectorAll("*"));
+              let label = null;
+              for (const el of all) {
+                if (el.children.length > 2) continue;
+                const t = (el.innerText || el.textContent || "").trim();
+                if (/^locations(?:\s*[\?ⓘ])?$/i.test(t)) {
+                  const cs = window.getComputedStyle(el);
+                  if (cs.display !== "none" && cs.visibility !== "hidden") { label = el; break; }
+                }
+              }
+              if (!label) return null;
+              const lr = label.getBoundingClientRect();
+              // First visible input below the label within 200px.
+              const inputs = Array.from(document.querySelectorAll('input'));
+              let best = null, bestGap = Infinity;
+              for (const inp of inputs) {
+                const r = inp.getBoundingClientRect();
+                if (r.width === 0 || r.height === 0) continue;
+                const gap = r.top - lr.bottom;
+                if (gap < -10 || gap > 200) continue;
+                if (gap < bestGap) { best = inp; bestGap = gap; }
+              }
+              if (!best) return null;
+              const r = best.getBoundingClientRect();
+              return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+            });
+            if (!inputPos) return "no-input";
+            // Focus, type, wait, click matching option.
+            try {
+              await page.mouse.click(inputPos.x, inputPos.y);
+              await page.waitForTimeout(200);
+              await page.keyboard.type(name, { delay: 40 });
+            } catch {}
+            await page.waitForTimeout(1000);
+            // Click the option in the results popup whose text starts with
+            // the country name (TikTok shows "Italy" / "Italy, Rome" etc).
+            const picked = await page.evaluate((needle) => {
+              const re = new RegExp("^\\s*" + needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+              const visible = (el) => {
+                const r = el.getBoundingClientRect();
+                const cs = window.getComputedStyle(el);
+                return r.width > 0 && r.height > 0 && cs.display !== "none" && cs.visibility !== "hidden";
+              };
+              // Options render in a popup; scan option-ish leaves.
+              const opts = Array.from(document.querySelectorAll('[role="option"], li, [class*="option" i], [class*="item" i], [class*="lego-list" i], [class*="dropdown" i] *'));
+              for (const o of opts) {
+                if (o.children.length > 3) continue;
+                const t = (o.innerText || o.textContent || "").trim();
+                if (!t || t.length > 60) continue;
+                if (!re.test(t)) continue;
+                if (!visible(o)) continue;
+                o.scrollIntoView({ block: "center" });
+                o.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+                o.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+                o.click();
+                return "picked:" + t.slice(0, 40);
+              }
+              return "no-option";
+            }, name);
+            await page.waitForTimeout(500);
+            return picked;
+          };
+
+          // Remove the pre-applied Vietnam chip: find ✕ inside the
+          // Locations field only (near the Locations label).
           await page.evaluate(() => {
-            // Remove chips by clicking their ✕ close buttons in the
-            // Locations field.
-            const closeBtns = Array.from(document.querySelectorAll(
-              '[class*="tag" i] [class*="close" i], [class*="chip" i] [class*="close" i], ' +
-              '[class*="selected" i] [class*="close" i], [class*="remove" i], ' +
-              '[aria-label*="remove" i], [aria-label*="close" i]'
-            ));
-            for (const b of closeBtns) {
+            const all = Array.from(document.querySelectorAll("*"));
+            let label = null;
+            for (const el of all) {
+              if (el.children.length > 2) continue;
+              const t = (el.innerText || el.textContent || "").trim();
+              if (/^locations(?:\s*[\?ⓘ])?$/i.test(t)) { label = el; break; }
+            }
+            if (!label) return;
+            const lr = label.getBoundingClientRect();
+            const closes = Array.from(document.querySelectorAll('[class*="tag" i] [class*="close" i], [class*="chip" i] [class*="close" i], [aria-label*="remove" i], [aria-label*="close" i], svg'));
+            for (const b of closes) {
               const r = b.getBoundingClientRect();
               if (r.width === 0 || r.height === 0) continue;
-              const cs = window.getComputedStyle(b);
-              if (cs.display === "none" || cs.visibility === "hidden") continue;
-              // Only remove chips near the Locations label (top part of
-              // the panel) — avoid nuking unrelated chips.
+              // Only chips within ~120px below the Locations label.
+              if (r.top < lr.bottom - 5 || r.top - lr.bottom > 120) continue;
+              const cls = (b.className && typeof b.className === "string") ? b.className : "";
+              const parentCls = (b.parentElement && typeof b.parentElement.className === "string") ? b.parentElement.className : "";
+              if (!/close|remove|tag|chip/i.test(cls + " " + parentCls)) continue;
               try { b.click(); } catch {}
             }
           });
           await page.waitForTimeout(500);
+
           adGroupReport.countryPicks = [];
           for (const name of countryNames) {
-            const r = await pickFromDropdown("Locations", name);
+            const r = await pickLocation(name);
             adGroupReport.countryPicks.push(`${name}=>${r}`);
             await page.waitForTimeout(600);
           }
