@@ -1633,6 +1633,11 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
     // 10a. Data connection (Pixel)
     if (pixelName) {
       adGroupReport.pixelPick = await pickFromDropdown("Data connection", pixelName);
+      // TikTok reloads the Optimization-event list based on the new
+      // pixel — subsequent event/bid picks race that reload without a
+      // wait, hence popup=0 for event immediately after a successful
+      // pixel pick.
+      await page.waitForTimeout(1500);
     }
     void pixelId;
 
@@ -1655,6 +1660,7 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
       };
       const eventLabel = eventLabelMap[optimizationEvent] || optimizationEvent;
       adGroupReport.eventPick = await pickFromDropdown("Optimization event", eventLabel);
+      await page.waitForTimeout(600);
     }
 
     // 10c. Bid strategy dropdown
@@ -1663,6 +1669,7 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
         ? "Target cost per result"
         : "Maximum delivery";
       adGroupReport.bidPick = await pickFromDropdown("Bid strategy", bidLabel);
+      await page.waitForTimeout(400);
     }
 
     // 10d. Target CPA input
@@ -1691,9 +1698,132 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
     await dismissModals(page);
     await shot(page, "06-adgroup-mid");
 
-    // 12. (Future) Set country / age / gender / budget / bid strategy.
-    //     We surface what we did via adGroupReport and let the next
-    //     iteration wire each form-fill.
+    // 12. AUDIENCE TARGETING. The Smart+ aio_adgroup form starts in
+    //     "account-level" mode with location=Vietnam / all ages / all
+    //     genders — none of what the user typed. Click "Switch to
+    //     manual targeting" first to reveal the editable fields, then
+    //     fill locations / age groups / gender.
+    if ((countryIds && countryIds.length) || (ageGroupIds && ageGroupIds.length) || gender) {
+      // 12a. Click "Switch to manual targeting" link.
+      const switchClicked = await page.evaluate(() => {
+        const links = Array.from(document.querySelectorAll('a, button, [role="button"], [class*="ks-link" i], [class*="link" i], span[class*="link" i], span'));
+        for (const l of links) {
+          const t = (l.innerText || l.textContent || "").trim();
+          if (!/^switch to manual targeting$/i.test(t)) continue;
+          const cs = window.getComputedStyle(l);
+          if (cs.display === "none" || cs.visibility === "hidden") continue;
+          const r = l.getBoundingClientRect();
+          if (r.width === 0 || r.height === 0) continue;
+          l.scrollIntoView({ block: "center" });
+          l.click();
+          return true;
+        }
+        return false;
+      });
+      adGroupReport.switchToManual = switchClicked ? "clicked" : "not-found";
+      if (switchClicked) {
+        // Manual mode reveals a new set of fields; wait for mount.
+        await page.waitForTimeout(1500);
+        await dismissModals(page);
+      }
+
+      // 12b. Country picker. TikTok's Locations input is a searchable
+      //      cascader — open it, type each country name, click the
+      //      first matching option.
+      if (switchClicked && countryIds && countryIds.length) {
+        const COUNTRY_MAP = {
+          "6252001": "United States",
+          "3175395": "Italy",
+          "2510769": "Spain",
+          "3017382": "France",
+          "2635167": "United Kingdom",
+          "2750405": "Netherlands",
+          "2921044": "Germany",
+          "2802361": "Belgium",
+          "2658434": "Switzerland",
+          "2782113": "Austria",
+          "2264397": "Portugal",
+          "2960313": "Luxembourg",
+          "3144096": "Norway",
+          "2661886": "Sweden",
+          "2623032": "Denmark",
+          "660013":  "Finland",
+          "294640":  "Israel",
+          "298795":  "Turkey",
+          "2017370": "Russia",
+          "1814991": "China",
+          "1835841": "South Korea",
+          "1861060": "Japan",
+        };
+        const countryNames = countryIds.map((id) => COUNTRY_MAP[id]).filter(Boolean);
+        adGroupReport.countryPicks = [];
+        for (const name of countryNames) {
+          const r = await pickFromDropdown("Locations", name);
+          adGroupReport.countryPicks.push(`${name}=>${r}`);
+          await page.waitForTimeout(500);
+        }
+      }
+
+      // 12c. Age group chips. Each chip is a clickable pill; we toggle
+      //      to match desired set. TikTok labels: "13-17" / "18-24" /
+      //      "25-34" / "35-44" / "45-54" / "55+".
+      if (switchClicked && ageGroupIds && ageGroupIds.length) {
+        const AGE_MAP = {
+          AGE_13_17: "13-17",
+          AGE_18_24: "18-24",
+          AGE_25_34: "25-34",
+          AGE_35_44: "35-44",
+          AGE_45_54: "45-54",
+          AGE_55_100: "55+",
+        };
+        const wantedLabels = new Set(ageGroupIds.map((id) => AGE_MAP[id]).filter(Boolean));
+        adGroupReport.ageGroupPicks = await page.evaluate((wanted) => {
+          const results = [];
+          const allChips = Array.from(document.querySelectorAll('button, [role="button"], [class*="chip" i], [class*="pill" i], [class*="tag" i], span'));
+          const chipLabels = ["13-17", "18-24", "25-34", "35-44", "45-54", "55+"];
+          for (const label of chipLabels) {
+            const chip = allChips.find((c) => {
+              const t = (c.innerText || c.textContent || "").trim();
+              if (t !== label) return false;
+              const cs = window.getComputedStyle(c);
+              if (cs.display === "none" || cs.visibility === "hidden") return false;
+              const r = c.getBoundingClientRect();
+              return r.width > 0 && r.height > 0;
+            });
+            if (!chip) { results.push(`${label}=missing`); continue; }
+            // Determine current state: chip has an "active"/"selected"
+            // class or aria-pressed=true.
+            const cls = (chip.className && typeof chip.className === "string") ? chip.className : "";
+            const isSelected =
+              /(?:^|[\s_-])(active|selected|checked|on)(?:[\s_-]|$)/i.test(cls) ||
+              chip.getAttribute("aria-pressed") === "true";
+            const want = wanted.has(label);
+            if (want !== isSelected) {
+              chip.scrollIntoView({ block: "center" });
+              chip.click();
+              results.push(`${label}=toggled(was:${isSelected}=>want:${want})`);
+            } else {
+              results.push(`${label}=ok(${isSelected ? "on" : "off"})`);
+            }
+          }
+          return results;
+        }, [...wantedLabels]);
+      }
+
+      // 12d. Gender. TikTok renders it as a dropdown with All / Male /
+      //      Female.
+      if (switchClicked && gender) {
+        const GENDER_MAP = {
+          GENDER_UNLIMITED: "All",
+          GENDER_MALE: "Male",
+          GENDER_FEMALE: "Female",
+        };
+        const genderLabel = GENDER_MAP[gender];
+        if (genderLabel) {
+          adGroupReport.genderPick = await pickFromDropdown("Gender", genderLabel);
+        }
+      }
+    }
 
     // 13. Click Continue at the bottom to advance to the Ad step.
     await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
