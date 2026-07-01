@@ -1750,35 +1750,85 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
       await page.waitForTimeout(400);
       await dismissModals(page);
 
-      const switchClicked = await page.evaluate(() => {
+      const switchInfo = await page.evaluate(() => {
         const isVisible = (el) => {
           const cs = window.getComputedStyle(el);
           if (cs.display === "none" || cs.visibility === "hidden") return false;
           const r = el.getBoundingClientRect();
           return r.width > 0 && r.height > 0;
         };
-        // Text on TikTok is "Switch to manual targeting ⓘ" — the ⓘ is a
-        // separate sibling but a parent's innerText concatenates it.
-        // Allow up to 2 trailing icon-ish chars.
         const re = /^switch\s*to\s*manual\s*targeting\s*[\?ⓘ\(\)i ]{0,2}$/i;
-        const all = Array.from(document.querySelectorAll('a, button, [role="button"], [class*="ks-link" i], [class*="link" i], span[class*="link" i], span, div'));
-        for (const l of all) {
-          if (l.children.length > 4) continue;
-          const t = (l.innerText || l.textContent || "").trim();
+        // Score candidates: prefer real clickable tags (a/button/[role]),
+        // penalize plain spans/divs. Also skip elements that CONTAIN
+        // another matching candidate (theyre wrappers, not the actual link).
+        const all = Array.from(document.querySelectorAll("*"));
+        const matches = [];
+        for (const el of all) {
+          if (el.children.length > 6) continue;
+          const t = (el.innerText || el.textContent || "").trim();
           if (!re.test(t)) continue;
-          if (!isVisible(l)) continue;
-          l.scrollIntoView({ block: "center" });
-          l.click();
-          return { ok: true, txt: t.slice(0, 40) };
+          if (!isVisible(el)) continue;
+          matches.push(el);
         }
-        return { ok: false };
+        if (!matches.length) return { ok: false, matches: 0 };
+        // Remove wrappers: element A wraps B if A.contains(B).
+        const leaves = matches.filter((el) => !matches.some((other) => other !== el && el.contains(other)));
+        const score = (el) => {
+          const tag = el.tagName.toLowerCase();
+          if (tag === "a" || tag === "button") return 100;
+          if (el.getAttribute("role") === "button") return 90;
+          const cls = (el.className && typeof el.className === "string") ? el.className : "";
+          if (/(?:^|\s)(?:ks-link|link|clickable)(?:$|\s|_)/i.test(cls)) return 80;
+          if (window.getComputedStyle(el).cursor === "pointer") return 70;
+          return 10;
+        };
+        leaves.sort((a, b) => score(b) - score(a));
+        const pick = leaves[0];
+        const r = pick.getBoundingClientRect();
+        pick.scrollIntoView({ block: "center" });
+        return {
+          ok: true,
+          txt: (pick.innerText || pick.textContent || "").trim().slice(0, 40),
+          tag: pick.tagName.toLowerCase(),
+          score: score(pick),
+          cx: r.left + r.width / 2,
+          cy: r.top + r.height / 2,
+          matches: matches.length,
+          leaves: leaves.length,
+        };
       });
-      adGroupReport.switchToManual = switchClicked && switchClicked.ok ? `clicked|txt=${switchClicked.txt}` : "not-found";
-      const didSwitch = switchClicked && switchClicked.ok;
-      if (didSwitch) {
-        // Manual mode reveals a new set of fields; wait for mount.
+
+      let didSwitch = false;
+      if (switchInfo && switchInfo.ok) {
+        // Trusted mouse click at the link's center — programmatic .click()
+        // often doesnt fire TikToks route change; a real mouse event does.
+        try {
+          await page.mouse.move(switchInfo.cx, switchInfo.cy);
+          await page.waitForTimeout(80);
+          await page.mouse.click(switchInfo.cx, switchInfo.cy, { delay: 60 });
+        } catch {}
+        // Verify: after switch, the link should disappear + new fields
+        // (Locations, Gender, Age groups) should mount.
         await page.waitForTimeout(1500);
         await dismissModals(page);
+        await page.waitForTimeout(500);
+        const linkGone = await page.evaluate(() => {
+          const re = /^switch\s*to\s*manual\s*targeting\s*[\?ⓘ\(\)i ]{0,2}$/i;
+          const all = Array.from(document.querySelectorAll("*"));
+          return !all.some((el) => {
+            if (el.children.length > 6) return false;
+            const t = (el.innerText || el.textContent || "").trim();
+            if (!re.test(t)) return false;
+            const cs = window.getComputedStyle(el);
+            if (cs.display === "none" || cs.visibility === "hidden") return false;
+            const r = el.getBoundingClientRect();
+            return r.width > 0 && r.height > 0;
+          });
+        });
+        didSwitch = linkGone;
+        adGroupReport.switchToManual = `clicked|txt=${switchInfo.txt}|tag=${switchInfo.tag}|score=${switchInfo.score}|matches=${switchInfo.matches}|leaves=${switchInfo.leaves}|linkGone=${linkGone}`;
+      } else {
+        adGroupReport.switchToManual = `not-found|matches=${(switchInfo && switchInfo.matches) || 0}`;
       }
 
       // 12b. Country picker. TikTok's Locations input is a searchable
