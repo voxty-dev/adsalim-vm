@@ -1371,21 +1371,21 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
           return `picked:${optionText}|via:loose-fallback:${loose}`;
         }
 
-        // Snap a screenshot so we can SEE what's on the page when the
-        // option pick failed — much faster than guessing what TikTok
-        // mounted (or didn't).
+        // Put diag INFO first — the error text gets truncated in the
+        // adsalim UI at ~250 chars so the seen=[...] list was pushing
+        // trigger-html/screenshot out of view.
         let dbgUrl = "";
         try {
           const buf = await page.screenshot({ fullPage: false });
           if (buf && typeof saveScreenshot === "function") {
             const id = saveScreenshot(buf);
-            dbgUrl = `|screenshot-id=${id}`;
+            dbgUrl = `|shot=${id}`;
           }
         } catch {}
         const triggerSnippet = triggered && triggered.innerHTML
-          ? `|trigger-tag=${triggered.tag}|trigger-html=${triggered.innerHTML.slice(0, 200)}`
-          : "";
-        return `error:option-not-found:${optionText}|seen=${String(picked).slice(0, 200)}${triggerSnippet}${dbgUrl}`;
+          ? `|trig=${triggered.tag}|ihtml=${triggered.innerHTML.slice(0, 120).replace(/\s+/g, " ")}`
+          : "|trig=none";
+        return `error:option-not-found:${optionText}${triggerSnippet}${dbgUrl}|picked=${String(picked).slice(0, 100)}`;
       } catch (e) {
         const msg = (e.message || "").slice(0, 120).replace(/\s+/g, " ");
         return `error:${msg}`;
