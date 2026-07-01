@@ -2024,9 +2024,11 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
           // a plain dropdown. Dedicated handler: focus its input, type the
           // country name, wait for the results, click the match.
           const pickLocation = async (name) => {
-            // Find the search input inside the Locations field. Look for
-            // the "Locations" label, then the first input after it.
-            const inputPos = await page.evaluate(() => {
+            // Find the Locations FIELD BOX (the container showing the
+            // Vietnam chip + dropdown). Its search <input> is zero-width
+            // until the box is focused, so we click the box first, then
+            // type — the focused input receives the keystrokes.
+            const boxPos = await page.evaluate(() => {
               const all = Array.from(document.querySelectorAll("*"));
               let label = null;
               for (const el of all) {
@@ -2039,28 +2041,35 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
               }
               if (!label) return null;
               const lr = label.getBoundingClientRect();
-              // First visible input below the label within 200px.
-              const inputs = Array.from(document.querySelectorAll('input'));
-              let best = null, bestGap = Infinity;
-              for (const inp of inputs) {
-                const r = inp.getBoundingClientRect();
-                if (r.width === 0 || r.height === 0) continue;
+              // Field box: the widest sizable element directly below the
+              // label within 120px (the ks-select / input wrapper showing
+              // the Vietnam chip). Prefer one containing an input.
+              const cands = Array.from(document.querySelectorAll("div, [class*='select'], [class*='input'], ks-select, [role='combobox']"));
+              let best = null, bestScore = -1;
+              for (const c of cands) {
+                const r = c.getBoundingClientRect();
+                if (r.width < 200 || r.height < 20 || r.height > 90) continue;
                 const gap = r.top - lr.bottom;
-                if (gap < -10 || gap > 200) continue;
-                if (gap < bestGap) { best = inp; bestGap = gap; }
+                if (gap < -5 || gap > 120) continue;
+                const cs = window.getComputedStyle(c);
+                if (cs.display === "none" || cs.visibility === "hidden") continue;
+                const hasInput = c.querySelector("input") ? 1 : 0;
+                // Prefer closer + has input + not too tall.
+                const score = hasInput * 1000 + (120 - gap) - r.height;
+                if (score > bestScore) { best = c; bestScore = score; }
               }
               if (!best) return null;
               const r = best.getBoundingClientRect();
-              return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+              return { x: r.left + Math.min(60, r.width / 2), y: r.top + r.height / 2 };
             });
-            if (!inputPos) return "no-input";
-            // Focus, type, wait, click matching option.
+            if (!boxPos) return "no-box";
+            // Click the box to focus its search input, then type.
             try {
-              await page.mouse.click(inputPos.x, inputPos.y);
-              await page.waitForTimeout(200);
-              await page.keyboard.type(name, { delay: 40 });
+              await page.mouse.click(boxPos.x, boxPos.y);
+              await page.waitForTimeout(400);
+              await page.keyboard.type(name, { delay: 45 });
             } catch {}
-            await page.waitForTimeout(1000);
+            await page.waitForTimeout(1200);
             // Click the option in the results popup whose text starts with
             // the country name (TikTok shows "Italy" / "Italy, Rome" etc).
             const picked = await page.evaluate((needle) => {
@@ -2163,17 +2172,19 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
             };
             const results = [];
             const toClick = [];
-            const all = Array.from(document.querySelectorAll('button, [role="button"], [class*="chip" i], [class*="pill" i], [class*="tag" i], span, div'));
+            const seen = [];
+            const all = Array.from(document.querySelectorAll('button, [role="button"], [class*="chip" i], [class*="pill" i], [class*="tag" i], [class*="lego" i], span, div, label'));
             for (const label of chipLabels) {
               // chip whose trimmed text starts with the label and is short.
               const chip = all.find((c) => {
-                if (c.children.length > 3) return false;
+                if (c.children.length > 6) return false;
                 const t = (c.innerText || c.textContent || "").trim();
                 if (!t.startsWith(label)) return false;
-                if (t.length > label.length + 4) return false; // allow " ✓"
+                if (t.length > label.length + 5) return false; // allow " ✓"
                 if (!isVisible(c)) return false;
                 const r = c.getBoundingClientRect();
-                return r.width > 20 && r.width < 200 && r.height < 80;
+                if (seen.length < 12) seen.push(`${t.slice(0, 8)}@${Math.round(r.width)}x${Math.round(r.height)}`);
+                return r.width > 15 && r.width < 220 && r.height > 10 && r.height < 90;
               });
               if (!chip) { results.push(`${label}=missing`); continue; }
               const t = (chip.innerText || chip.textContent || "").trim();
@@ -2197,7 +2208,7 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
                 results.push(`${label}=ok(${selected ? "on" : "off"})`);
               }
             }
-            return { results, toClick };
+            return { results, toClick, seen };
           }, [...wantedLabels]);
 
           // Trusted clicks for chips needing a toggle.
@@ -2209,7 +2220,7 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
             } catch {}
             await page.waitForTimeout(300);
           }
-          adGroupReport.ageGroupPicks = chipInfo.results;
+          adGroupReport.ageGroupPicks = chipInfo.results.concat(chipInfo.toClick.length === 0 && chipInfo.results.every(r => /missing/.test(r)) ? [`seen=[${(chipInfo.seen || []).join(", ")}]`] : []);
         }
       }
     }
