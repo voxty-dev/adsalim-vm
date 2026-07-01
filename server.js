@@ -1182,23 +1182,37 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
 
           const t = bestPair.trigger;
           t.scrollIntoView({ block: "center" });
-          // For custom elements like <ks-input-selector-*>, programmatic
-          // .click() on the wrapper often doesn't open the popup. Click
-          // strategy stack:
-          //   a) the FIRST visible cursor:pointer descendant (the
-          //      actual TikTok-styled clickable inside the wrapper)
-          //   b) the FIRST input descendant (some triggers focus an
-          //      input that opens the dropdown on focus/click)
-          //   c) the wrapper itself with full pointer-event sequence
-          const innerPointer = Array.from(t.querySelectorAll("*")).find((el) => {
-            const r = el.getBoundingClientRect();
-            if (r.width === 0 || r.height === 0) return false;
-            const cs = window.getComputedStyle(el);
-            if (cs.cursor !== "pointer") return false;
-            return cs.display !== "none" && cs.visibility !== "hidden";
-          });
-          const innerInput = t.querySelector("input");
-          const targets = [innerPointer, innerInput, t].filter(Boolean);
+          // Custom-element wrapper <ks-input-selector-*> has a child with
+          // style="display: contents;" (Vue slot passthrough) that has NO
+          // bounding box. TikTok's actual clickable row is a nested
+          // descendant with a real box (typically has "max-h-[38px]" or
+          // "flex" utility classes). Skip the display:contents layer and
+          // find the deepest visible descendant with a real box.
+          const findRealClickable = (root) => {
+            const stack = Array.from(root.children);
+            let best = null;
+            let bestArea = 0;
+            while (stack.length) {
+              const el = stack.pop();
+              if (el.children) for (const c of el.children) stack.push(c);
+              const cs = window.getComputedStyle(el);
+              if (cs.display === "none" || cs.visibility === "hidden") continue;
+              if (cs.display === "contents") continue;
+              const r = el.getBoundingClientRect();
+              if (r.width < 10 || r.height < 10) continue;
+              // Prefer larger elements — actual dropdown rows are bigger
+              // than icon/arrow spans inside them.
+              const area = r.width * r.height;
+              if (area > bestArea) {
+                best = el;
+                bestArea = area;
+              }
+            }
+            return best;
+          };
+          const innerClickable = findRealClickable(t);
+          const innerInput = t.querySelector && t.querySelector("input");
+          const targets = [innerClickable, innerInput, t].filter(Boolean);
           for (const target of targets) {
             try { target.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true })); } catch {}
             try { target.dispatchEvent(new MouseEvent("mousedown", { bubbles: true })); } catch {}
@@ -1207,6 +1221,7 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
             try { target.click(); } catch {}
           }
           const tr = t.getBoundingClientRect();
+          const inner = innerClickable ? innerClickable.getBoundingClientRect() : null;
           return {
             ok: true,
             tag: t.tagName.toLowerCase(),
@@ -1214,33 +1229,67 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
             gap: Math.round(bestPair.gap),
             cx: tr.left + tr.width / 2,
             cy: tr.top + tr.height / 2,
+            innerCx: inner ? inner.left + inner.width / 2 : null,
+            innerCy: inner ? inner.top + inner.height / 2 : null,
+            innerTag: innerClickable ? innerClickable.tagName.toLowerCase() : null,
             innerHTML: t.innerHTML.slice(0, 400).replace(/\s+/g, " "),
           };
         }, labelText);
 
-        // For custom elements like <ks-input-selector-*>, .click()
-        // sometimes fails to trigger the popup mount. Follow up with a
-        // real mouse click at the trigger's center as insurance, then
-        // verify a popup actually appeared.
-        if (triggered && triggered.ok && triggered.cx) {
-          await page.waitForTimeout(250);
-          const popupAfter = await page.evaluate(() => {
-            return Array.from(document.querySelectorAll("*")).some((el) => {
-              const cs = window.getComputedStyle(el);
-              if (cs.position !== "fixed" && cs.position !== "absolute") return false;
-              const r = el.getBoundingClientRect();
-              if (r.width < 100 || r.height < 40) return false;
-              if (cs.display === "none" || cs.visibility === "hidden") return false;
-              const z = parseInt(cs.zIndex);
-              if (isNaN(z) || z < 100) return false;
-              // Skip top nav / sticky header (full-width, very narrow).
-              if (r.width >= window.innerWidth - 50 && r.height < 80) return false;
-              return true;
-            });
+        // For custom elements like <ks-input-selector-*>, programmatic
+        // events in-page often DONT trigger the popup mount because
+        // TikTok listens for trusted (isTrusted=true) events. Follow up
+        // with Playwrights real mouse click (fires OS-level trusted
+        // events) at the INNER clickable's center. If that still fails,
+        // try Enter/Space keyboard on the focused element.
+        const popupCheck = async () => await page.evaluate(() => {
+          return Array.from(document.querySelectorAll("*")).some((el) => {
+            const cs = window.getComputedStyle(el);
+            if (cs.position !== "fixed" && cs.position !== "absolute") return false;
+            const r = el.getBoundingClientRect();
+            if (r.width < 100 || r.height < 40) return false;
+            if (cs.display === "none" || cs.visibility === "hidden") return false;
+            const z = parseInt(cs.zIndex);
+            if (isNaN(z) || z < 100) return false;
+            if (r.width >= window.innerWidth - 50 && r.height < 80) return false;
+            if (r.width >= window.innerWidth - 50 && r.height >= window.innerHeight - 50) return false;
+            return true;
           });
+        });
+
+        if (triggered && triggered.ok) {
+          await page.waitForTimeout(250);
+          let popupAfter = await popupCheck();
+          // Strategy 1: mouse click at inner clickable center (the real
+          // dropdown row, not the display:contents wrapper).
+          if (!popupAfter && triggered.innerCx != null) {
+            try {
+              await page.mouse.move(triggered.innerCx, triggered.innerCy);
+              await page.waitForTimeout(80);
+              await page.mouse.click(triggered.innerCx, triggered.innerCy, { delay: 60 });
+            } catch {}
+            await page.waitForTimeout(400);
+            popupAfter = await popupCheck();
+          }
+          // Strategy 2: mouse click at outer trigger center.
+          if (!popupAfter && triggered.cx != null) {
+            try {
+              await page.mouse.move(triggered.cx, triggered.cy);
+              await page.waitForTimeout(80);
+              await page.mouse.click(triggered.cx, triggered.cy, { delay: 60 });
+            } catch {}
+            await page.waitForTimeout(400);
+            popupAfter = await popupCheck();
+          }
+          // Strategy 3: Enter / Space keyboard on any focused element.
           if (!popupAfter) {
-            try { await page.mouse.click(triggered.cx, triggered.cy); } catch {}
-            await page.waitForTimeout(300);
+            try { await page.keyboard.press("Enter"); } catch {}
+            await page.waitForTimeout(200);
+            popupAfter = await popupCheck();
+            if (!popupAfter) {
+              try { await page.keyboard.press("Space"); } catch {}
+              await page.waitForTimeout(200);
+            }
           }
         }
 
