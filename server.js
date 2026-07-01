@@ -1,5 +1,5 @@
 /**
- * adsalim-vm-service
+ * adsalim-vm-service   (build: auto-deploy test — Location picker + age chips)
  *
  * HTTP wrapper around Playwright. Exposes one endpoint, /publish-draft,
  * that takes a TikTok draft (sketch) ID and clicks "Publish all" in
