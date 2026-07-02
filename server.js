@@ -1397,6 +1397,12 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
           //    Pick the (label, trigger) pair where the vertical gap is
           //    smallest — that's the one TikTok actually rendered as a
           //    pair.
+          // NOTE: allTriggers is NOT in document order (tag-prefix matches
+          // then static-CSS matches, deduped) — so "break on first array
+          // hit" used to pick an arbitrary trigger or none at all (that's
+          // why Bid strategy came back trig=none while its dropdown sat
+          // right there). Instead: consider EVERY following trigger and
+          // keep the one with the smallest vertical gap to the label.
           let bestPair = null;
           for (const label of labelCandidates) {
             const labelRect = label.getBoundingClientRect();
@@ -1409,12 +1415,12 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
               if (r.top < labelRect.bottom - 10) continue;
               const gap = r.top - labelRect.bottom;
               if (gap > 600) continue;
+              // Horizontal sanity: the paired trigger starts near the
+              // label's column (within 250px) — rejects sidebar widgets.
+              if (Math.abs(r.left - labelRect.left) > 250) continue;
               if (!bestPair || gap < bestPair.gap) {
                 bestPair = { label, trigger: t, gap, labelRect, triggerRect: r };
               }
-              // Only take the FIRST following trigger per label — the
-              // rest are subsequent fields, not this label's trigger.
-              break;
             }
           }
           if (!bestPair) {
@@ -1486,15 +1492,12 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
             return best;
           };
           const innerClickable = findRealClickable(t);
-          const innerInput = t.querySelector && t.querySelector("input");
-          const targets = [innerClickable, innerInput, t].filter(Boolean);
-          for (const target of targets) {
-            try { target.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true })); } catch {}
-            try { target.dispatchEvent(new MouseEvent("mousedown", { bubbles: true })); } catch {}
-            try { target.dispatchEvent(new PointerEvent("pointerup", { bubbles: true })); } catch {}
-            try { target.dispatchEvent(new MouseEvent("mouseup", { bubbles: true })); } catch {}
-            try { target.click(); } catch {}
-          }
+          // Do NOT dispatch any synthetic clicks here. Dispatching the
+          // full pointer/mouse/click sequence on 3 successive targets
+          // toggled the dropdown open->closed->open unpredictably (pixel
+          // happened to land open, event/bid landed closed with popups=0).
+          // We only RETURN coordinates; the Node side does ONE trusted
+          // mouse click and verifies the popup after each attempt.
           const tr = t.getBoundingClientRect();
           const inner = innerClickable ? innerClickable.getBoundingClientRect() : null;
           return {
@@ -1533,17 +1536,16 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
         });
 
         if (triggered && triggered.ok) {
-          await page.waitForTimeout(250);
-          let popupAfter = await popupCheck();
-          // Strategy 1: mouse click at inner clickable center (the real
-          // dropdown row, not the display:contents wrapper).
-          if (!popupAfter && triggered.innerCx != null) {
+          // ONE trusted click at a time, verify the popup after each.
+          // Strategy 1: inner clickable center (the real dropdown row).
+          let popupAfter = false;
+          if (triggered.innerCx != null) {
             try {
               await page.mouse.move(triggered.innerCx, triggered.innerCy);
               await page.waitForTimeout(80);
               await page.mouse.click(triggered.innerCx, triggered.innerCy, { delay: 60 });
             } catch {}
-            await page.waitForTimeout(400);
+            await page.waitForTimeout(600);
             popupAfter = await popupCheck();
           }
           // Strategy 2: mouse click at outer trigger center.
@@ -1553,17 +1555,17 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
               await page.waitForTimeout(80);
               await page.mouse.click(triggered.cx, triggered.cy, { delay: 60 });
             } catch {}
-            await page.waitForTimeout(400);
+            await page.waitForTimeout(600);
             popupAfter = await popupCheck();
           }
           // Strategy 3: Enter / Space keyboard on any focused element.
           if (!popupAfter) {
             try { await page.keyboard.press("Enter"); } catch {}
-            await page.waitForTimeout(200);
+            await page.waitForTimeout(300);
             popupAfter = await popupCheck();
             if (!popupAfter) {
               try { await page.keyboard.press("Space"); } catch {}
-              await page.waitForTimeout(200);
+              await page.waitForTimeout(300);
             }
           }
         }
@@ -1720,7 +1722,11 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
         } catch {}
         const triggerSnippet = triggered && triggered.innerHTML
           ? `|trig=${triggered.tag}|ihtml=${triggered.innerHTML.slice(0, 120).replace(/\s+/g, " ")}`
-          : "|trig=none";
+          : `|trig=none|why=${(triggered && triggered.reason) || "?"}`;
+        // Close any half-open popup so it doesn't cover the NEXT field's
+        // trigger (a lingering event-dropdown was blocking the bid pick).
+        await page.keyboard.press("Escape").catch(() => {});
+        await page.waitForTimeout(200);
         return `error:option-not-found:${optionText}${triggerSnippet}${dbgUrl}|picked=${String(picked).slice(0, 100)}`;
       } catch (e) {
         const msg = (e.message || "").slice(0, 120).replace(/\s+/g, " ");
