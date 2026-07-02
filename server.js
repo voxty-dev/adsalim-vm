@@ -861,6 +861,45 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
     await dismissModals(page);
     await shot(page, "03-after-destination");
 
+    // 5.5. NEW unified-campaign flow: TikTok now opens a "Create new
+    // campaign" MODAL ("Manual and Smart+ campaigns have been unified
+    // into one workflow") with the objective + destination selectors,
+    // and a "Confirm" button that must be clicked to enter the editor.
+    // The page-footer "Continue" (which we used to click) shows "2
+    // errors" because the modal isnt confirmed. Click "Confirm" in the
+    // modal if present.
+    let confirmClicked = "not-present";
+    const confirmInfo = await page.evaluate(() => {
+      const isVisible = (el) => {
+        const cs = window.getComputedStyle(el);
+        if (cs.display === "none" || cs.visibility === "hidden") return false;
+        const r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+      };
+      // Look for a Confirm button inside a dialog/modal.
+      const btns = Array.from(document.querySelectorAll('button, [role="button"], [class*="btn" i]'));
+      for (const b of btns) {
+        const t = (b.innerText || b.textContent || "").trim();
+        if (!/^confirm$/i.test(t)) continue;
+        if (!isVisible(b)) continue;
+        if (b.disabled) continue;
+        const r = b.getBoundingClientRect();
+        return { cx: r.left + r.width / 2, cy: r.top + r.height / 2 };
+      }
+      return null;
+    });
+    if (confirmInfo) {
+      try {
+        await page.mouse.move(confirmInfo.cx, confirmInfo.cy);
+        await page.waitForTimeout(80);
+        await page.mouse.click(confirmInfo.cx, confirmInfo.cy, { delay: 60 });
+      } catch {}
+      confirmClicked = "clicked";
+      await page.waitForTimeout(2500);
+      await dismissModals(page);
+      await shot(page, "03b-after-confirm");
+    }
+
     // 6. Fill campaign name. The input is below the fold and TikTok
     //    pre-fills it with an auto-generated name ("Sales20260629…"),
     //    so we scroll into view, clear, then type. The label "Campaign
@@ -2230,6 +2269,7 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
       url: finalUrl,
       objectiveClicked: objClicked,
       destinationClicked: destClicked,
+      confirmClicked,
       nameFilled,
       catalogOff,
       continueClicked,
