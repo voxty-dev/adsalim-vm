@@ -825,6 +825,22 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
     await page.waitForSelector('button, [role="button"]', { timeout: 15_000 }).catch(() => {});
     await page.waitForTimeout(1500);
 
+    // The campaign-creation SPA sometimes renders a BLANK white body
+    // (hydration didnt fire). Detect that and reload up to 2 times —
+    // this is a transient TikTok load flake, not a logic error.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const hasContent = await page.evaluate(() => {
+        const t = (document.body.innerText || "").trim();
+        // A rendered editor shows objective/campaign text; blank body is
+        // just the top nav (a few words).
+        return t.length > 120 || /objective|campaign|sales|website|advertising/i.test(t);
+      }).catch(() => false);
+      if (hasContent) break;
+      await page.reload({ waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => {});
+      await page.waitForSelector('button, [role="button"]', { timeout: 15_000 }).catch(() => {});
+      await page.waitForTimeout(2500);
+    }
+
     await shot(page, "01-initial");
 
     // 3. Dismiss the "Find your tools in a new place" / coachmark modals.
