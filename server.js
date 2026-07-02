@@ -1684,9 +1684,32 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
           });
         });
 
+        // "Dropdown open" = a portal popup mounted OR the target option's
+        // text became visible anywhere. Some TikTok dropdowns render
+        // options INLINE (no fixed/absolute portal), so the portal-only
+        // popupCheck said "still closed", strategy 2 clicked again and
+        // TOGGLED the freshly-opened dropdown shut — that was the real
+        // cause of popups=0 on Event/Bid/Min-age while Pixel survived.
+        const dropdownOpen = async () => {
+          if (await popupCheck()) return true;
+          return await page.evaluate((needle) => {
+            const re = new RegExp("^\\s*" + needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+            const els = Array.from(document.querySelectorAll('[role="option"], li, [class*="option" i], [class*="item" i], [class*="menu" i] *'));
+            for (const o of els) {
+              if (o.children.length > 3) continue;
+              const t = (o.innerText || o.textContent || "").trim();
+              if (!t || t.length > 80) continue;
+              const r = o.getBoundingClientRect();
+              if (r.width === 0 || r.height === 0) continue;
+              if (re.test(t)) return true;
+            }
+            return false;
+          }, optionText).catch(() => false);
+        };
+
         if (triggered && triggered.ok) {
-          // ONE trusted click at a time, verify the popup after each.
-          // Strategy 1: inner clickable center (the real dropdown row).
+          // ONE trusted click at a time, verify after each — never click
+          // again once the dropdown is open (second click toggles it shut).
           let popupAfter = false;
           if (triggered.innerCx != null) {
             try {
@@ -1694,8 +1717,8 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
               await page.waitForTimeout(80);
               await page.mouse.click(triggered.innerCx, triggered.innerCy, { delay: 60 });
             } catch {}
-            await page.waitForTimeout(600);
-            popupAfter = await popupCheck();
+            await page.waitForTimeout(700);
+            popupAfter = await dropdownOpen();
           }
           // Strategy 2: mouse click at outer trigger center.
           if (!popupAfter && triggered.cx != null) {
@@ -1704,14 +1727,14 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
               await page.waitForTimeout(80);
               await page.mouse.click(triggered.cx, triggered.cy, { delay: 60 });
             } catch {}
-            await page.waitForTimeout(600);
-            popupAfter = await popupCheck();
+            await page.waitForTimeout(700);
+            popupAfter = await dropdownOpen();
           }
           // Strategy 3: Enter / Space keyboard on any focused element.
           if (!popupAfter) {
             try { await page.keyboard.press("Enter"); } catch {}
             await page.waitForTimeout(300);
-            popupAfter = await popupCheck();
+            popupAfter = await dropdownOpen();
             if (!popupAfter) {
               try { await page.keyboard.press("Space"); } catch {}
               await page.waitForTimeout(300);
@@ -2357,16 +2380,18 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
                   const cs = window.getComputedStyle(el);
                   return r.width > 0 && r.height > 0 && cs.display !== "none" && cs.visibility !== "hidden";
                 };
-                // Still loading? bail this round.
-                const bodyTxt = document.body.innerText || "";
+                // Scan for the MATCH first — an unrelated element that
+                // permanently says "Loading" was short-circuiting every
+                // round and we never even looked at the real results.
                 const opts = Array.from(document.querySelectorAll('[role="option"], li, [class*="option" i], [class*="item" i], [class*="lego-list" i], [class*="cascader" i], [class*="dropdown" i] *, [class*="select" i] *'));
                 const seen = [];
+                let sawLoading = false;
                 for (const o of opts) {
                   if (o.children.length > 2) continue;
                   const t = (o.innerText || o.textContent || "").trim();
                   if (!t || t.length > 60) continue;
                   if (!visible(o)) continue;
-                  if (/loading/i.test(t)) return "loading";
+                  if (/loading/i.test(t)) { sawLoading = true; continue; }
                   if (seen.length < 12) seen.push(t.slice(0, 20));
                   if (!re.test(t)) continue;
                   o.scrollIntoView({ block: "center" });
@@ -2375,6 +2400,7 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
                   o.click();
                   return "picked:" + t.slice(0, 30);
                 }
+                if (sawLoading) return "loading";
                 return "no-option|seen=[" + seen.slice(0, 8).join(", ") + "]";
               }, name);
               if (picked.startsWith("picked:")) break;
