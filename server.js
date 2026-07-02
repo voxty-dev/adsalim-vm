@@ -2069,38 +2069,45 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
               await page.waitForTimeout(400);
               await page.keyboard.type(name, { delay: 45 });
             } catch {}
-            await page.waitForTimeout(1400);
+            // Poll up to 6s for the results to load (typing shows a
+            // "Loading..." state first), then click the matching option.
+            let picked = "no-option";
+            for (let attempt = 0; attempt < 12; attempt++) {
+              await page.waitForTimeout(500);
+              picked = await page.evaluate((needle) => {
+                const re = new RegExp("(?:^|\\b)" + needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+                const visible = (el) => {
+                  const r = el.getBoundingClientRect();
+                  const cs = window.getComputedStyle(el);
+                  return r.width > 0 && r.height > 0 && cs.display !== "none" && cs.visibility !== "hidden";
+                };
+                // Still loading? bail this round.
+                const bodyTxt = document.body.innerText || "";
+                const opts = Array.from(document.querySelectorAll('[role="option"], li, [class*="option" i], [class*="item" i], [class*="lego-list" i], [class*="cascader" i], [class*="dropdown" i] *, [class*="select" i] *'));
+                const seen = [];
+                for (const o of opts) {
+                  if (o.children.length > 2) continue;
+                  const t = (o.innerText || o.textContent || "").trim();
+                  if (!t || t.length > 60) continue;
+                  if (!visible(o)) continue;
+                  if (/loading/i.test(t)) return "loading";
+                  if (seen.length < 12) seen.push(t.slice(0, 20));
+                  if (!re.test(t)) continue;
+                  o.scrollIntoView({ block: "center" });
+                  o.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+                  o.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+                  o.click();
+                  return "picked:" + t.slice(0, 30);
+                }
+                return "no-option|seen=[" + seen.slice(0, 8).join(", ") + "]";
+              }, name);
+              if (picked.startsWith("picked:")) break;
+              if (picked === "loading") continue;
+              // non-loading, non-picked: options are present but no match —
+              // give it one more round then stop.
+              if (attempt >= 3) break;
+            }
             await shot(page, `10-loc-typed-${name}`);
-            // Click the option in the results popup whose text contains the
-            // country name. Scan ALL visible short leaves (the results are
-            // rendered in a portal that doesnt always carry option classes)
-            // and dump what we saw for diagnostics.
-            const picked = await page.evaluate((needle) => {
-              const re = new RegExp("(?:^|\\b)" + needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
-              const visible = (el) => {
-                const r = el.getBoundingClientRect();
-                const cs = window.getComputedStyle(el);
-                return r.width > 0 && r.height > 0 && cs.display !== "none" && cs.visibility !== "hidden";
-              };
-              const seen = [];
-              const opts = Array.from(document.querySelectorAll('[role="option"], li, [class*="option" i], [class*="item" i], [class*="lego-list" i], [class*="cascader" i], [class*="dropdown" i] *, [class*="select" i] *'));
-              for (const o of opts) {
-                if (o.children.length > 2) continue;
-                const t = (o.innerText || o.textContent || "").trim();
-                if (!t || t.length > 60) continue;
-                if (!visible(o)) continue;
-                if (seen.length < 12) seen.push(t.slice(0, 20));
-                if (!re.test(t)) continue;
-                // Skip the chip we already have (the Vietnam token echoes
-                // in the field) — options live in a popup below the box.
-                o.scrollIntoView({ block: "center" });
-                o.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
-                o.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
-                o.click();
-                return "picked:" + t.slice(0, 30);
-              }
-              return "no-option|seen=[" + seen.slice(0, 8).join(", ") + "]";
-            }, name);
             await page.waitForTimeout(500);
             return picked;
           };
@@ -2154,6 +2161,20 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
           ? `clicked|opened=${editInfo.editorOpened}|fields=${editInfo.fieldDelta}|url=${(editInfo.urlAfter || "").slice(-40)}|cls=${editInfo.cls}`
           : `error:${editInfo && editInfo.reason}|hr=${editInfo && editInfo.headingRect}|diag=${editInfo && editInfo.diag}`;
         if (editInfo && editInfo.ok) {
+          // Scroll the "Ages" label into view first — the chips can be
+          // below the fold after both sections expand, and (more
+          // importantly) TikTok lazy-mounts them, so scanning before
+          // they render returned the empty seen=[] we saw.
+          await page.evaluate(() => {
+            const el = Array.from(document.querySelectorAll("*")).find((e) => {
+              if (e.children.length > 2) return false;
+              const t = (e.innerText || e.textContent || "").trim();
+              return /^ages(?:\s*[\?ⓘ])?$/i.test(t);
+            });
+            if (el) el.scrollIntoView({ block: "center" });
+          });
+          await page.waitForTimeout(600);
+          await shot(page, "11-ages-region");
           // Find each age chip + its selection state + click coords.
           // TikTok renders a selected chip with a ✓ checkmark and a teal
           // border (e.g. "18-24 ✓"). So chip text STARTS WITH the label
@@ -2183,17 +2204,29 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
             // (TikTok may render "18–24" with an en-dash, not a hyphen).
             const norm = (s) => s.replace(/[✓√✔\s]/g, "").replace(/[‐-―−]/g, "-");
             const all = Array.from(document.querySelectorAll('button, [role="button"], [class*="chip" i], [class*="pill" i], [class*="tag" i], [class*="lego" i], span, div, label'));
-            // Diagnostic: dump ALL short visible texts (2-10 chars) so we
-            // can see the actual chip rendering when matching fails.
+            // Diagnostic: find the "Ages" label, then dump EVERY short
+            // visible text within 200px below it — this shows the exact
+            // chip rendering (dash char, structure) so we stop guessing.
+            let agesLabel = null;
             for (const c of all) {
               if (c.children.length > 2) continue;
               const t = (c.innerText || c.textContent || "").trim();
-              if (t.length < 2 || t.length > 10) continue;
-              if (!/\d/.test(t)) continue;
+              if (/^ages$/i.test(t) && isVisible(c)) { agesLabel = c; break; }
+            }
+            const agesRect = agesLabel ? agesLabel.getBoundingClientRect() : null;
+            for (const c of all) {
+              if (c.children.length > 3) continue;
+              const t = (c.innerText || c.textContent || "").trim();
+              if (t.length < 1 || t.length > 12) continue;
               if (!isVisible(c)) continue;
               const r = c.getBoundingClientRect();
-              if (r.width < 15 || r.width > 220) continue;
-              if (seen.length < 16) seen.push(`${t.slice(0, 8)}@${Math.round(r.width)}x${Math.round(r.height)}`);
+              if (r.width < 10 || r.width > 240) continue;
+              // Restrict to the region just below the Ages label if found.
+              if (agesRect) {
+                const gap = r.top - agesRect.bottom;
+                if (gap < -20 || gap > 200) continue;
+              } else if (!/\d/.test(t)) continue;
+              if (seen.length < 20) seen.push(`${t.slice(0, 8)}@${Math.round(r.width)}x${Math.round(r.height)}`);
             }
             for (const label of chipLabels) {
               const nLabel = norm(label);
