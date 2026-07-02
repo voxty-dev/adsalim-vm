@@ -939,89 +939,108 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
     // we detect the payment URL (or time out), re-goto the creation URL
     // and re-run the objective/destination/Confirm dance — up to 2
     // recovery rounds.
-    // "Editor ready" at THIS stage means the CAMPAIGN step is showing
-    // (Campaign details / Campaign name) — the ad-group form only exists
-    // after the later Continue click, so don't look for it here. Also
-    // require the objective modal to be GONE (no visible Confirm button):
-    // the campaign page renders behind the modal, so text alone matches
-    // while the modal still blocks everything.
+    // "Editor ready" = the CAMPAIGN step is truly interactive: modal
+    // gone (no visible Confirm), campaign text present, AND a visible
+    // text input exists (the Campaign-name field) — text alone matches
+    // through the modal backdrop, which fooled the previous check.
     const editorReady = async () => await page.evaluate(() => {
+      const visible = (el) => {
+        const cs = window.getComputedStyle(el);
+        if (cs.display === "none" || cs.visibility === "hidden") return false;
+        const r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+      };
       const modalConfirm = Array.from(document.querySelectorAll('button, [role="button"]')).some((b) => {
         const t = (b.innerText || b.textContent || "").trim();
-        if (!/^confirm$/i.test(t)) return false;
-        const cs = window.getComputedStyle(b);
-        if (cs.display === "none" || cs.visibility === "hidden") return false;
-        const r = b.getBoundingClientRect();
-        return r.width > 0 && r.height > 0;
+        return /^confirm$/i.test(t) && visible(b);
       });
       if (modalConfirm) return false; // modal still open
-      return /campaign name|campaign details/i.test(document.body.innerText || "");
+      if (!/campaign name|campaign details/i.test(document.body.innerText || "")) return false;
+      return Array.from(document.querySelectorAll('input[type="text"], input:not([type])')).some(visible);
     }).catch(() => false);
 
+    // STRATEGY: TikTok A/B-serves two variants of this page. The OLD
+    // variant drops straight into the campaign editor (every successful
+    // run today came through it). The NEW variant opens the unified
+    // objective modal whose Confirm redirects to account/payment. So we
+    // treat the modal as a bad roll: CLOSE it (X / Cancel / Escape) and
+    // re-enter the creation URL until TikTok serves the old variant.
+    const closeObjectiveModal = async () => {
+      await page.evaluate(() => {
+        const visible = (el) => {
+          const cs = window.getComputedStyle(el);
+          if (cs.display === "none" || cs.visibility === "hidden") return false;
+          const r = el.getBoundingClientRect();
+          return r.width > 0 && r.height > 0;
+        };
+        const clickables = Array.from(document.querySelectorAll('button, [role="button"], [aria-label*="close" i], [class*="close" i]'));
+        for (const b of clickables) {
+          const t = (b.innerText || b.textContent || "").trim();
+          const aria = (b.getAttribute("aria-label") || "").toLowerCase();
+          if (/^cancel$/i.test(t) || /close/.test(aria) || (/close/i.test(b.className || "") && !t)) {
+            if (visible(b)) { try { b.click(); } catch {} return; }
+          }
+        }
+      }).catch(() => {});
+      await page.keyboard.press("Escape").catch(() => {});
+      await page.waitForTimeout(500);
+    };
+
     let editorState = "unknown";
-    recovery: for (let round = 0; round < 3; round++) {
-      // Poll for the editor within this round.
-      for (let i = 0; i < 20; i++) {
+    recovery: for (let round = 0; round < 5; round++) {
+      // Poll for a truly-interactive campaign editor within this round.
+      for (let i = 0; i < 12; i++) {
         if (await editorReady()) { editorState = round === 0 ? "ready" : `recovered@round${round}`; break recovery; }
         const url = page.url();
-        if (/account\/payment/i.test(url)) break; // bail this round early
+        if (/account\/payment/i.test(url)) break; // payment bounce — reroll now
+        // Modal present? close it instead of confirming (Confirm is the
+        // path that bounces to payment).
+        const modalOpen = await page.evaluate(() =>
+          Array.from(document.querySelectorAll('button, [role="button"]')).some((b) => {
+            const t = (b.innerText || b.textContent || "").trim();
+            if (!/^confirm$/i.test(t)) return false;
+            const cs = window.getComputedStyle(b);
+            const r = b.getBoundingClientRect();
+            return cs.display !== "none" && cs.visibility !== "hidden" && r.width > 0;
+          })
+        ).catch(() => false);
+        if (modalOpen && i >= 2) break; // give direct render 2s, then reroll
         await page.waitForTimeout(1000);
       }
       editorState = `recovering@round${round + 1}`;
-      // Re-enter the creation flow from scratch.
+      await closeObjectiveModal();
+      // Re-enter the creation flow from scratch (fresh A/B roll).
       await page.goto(
         `https://ads.tiktok.com/i18n/creation/1nn/create/campaign?aadvid=${encodeURIComponent(advertiserId)}&creation_type=create_new`,
         { waitUntil: "domcontentloaded", timeout: 45_000 },
       ).catch(() => {});
       await page.waitForSelector('button, [role="button"]', { timeout: 15_000 }).catch(() => {});
-      await page.waitForTimeout(2000);
+      await page.waitForTimeout(2500);
       await dismissModals(page);
-      // If the objective modal shows again: Sales -> Website -> Confirm.
+      // Re-pick objective + destination in case the direct variant needs
+      // them (harmless if the modal variant loaded instead).
       await clickByText(page, new RegExp(`^\\s*${objectiveLabel}\\s*$`, "i"), `objective-retry`);
-      await page.waitForTimeout(800);
+      await page.waitForTimeout(600);
       await clickByText(page, new RegExp(`^\\s*${destLabel}\\s*$`, "i"), `destination-retry`);
-      await page.waitForTimeout(800);
-      const confirmPos = await page.evaluate(() => {
-        const btns = Array.from(document.querySelectorAll('button, [role="button"], [class*="btn" i]'));
-        for (const b of btns) {
-          const t = (b.innerText || b.textContent || "").trim();
-          if (!/^confirm$/i.test(t)) continue;
-          const cs = window.getComputedStyle(b);
-          if (cs.display === "none" || cs.visibility === "hidden") continue;
-          if (b.disabled) continue;
-          const r = b.getBoundingClientRect();
-          if (r.width === 0 || r.height === 0) continue;
-          return { cx: r.left + r.width / 2, cy: r.top + r.height / 2 };
-        }
-        return null;
-      });
-      if (confirmPos) {
-        try {
-          await page.mouse.move(confirmPos.cx, confirmPos.cy);
-          await page.waitForTimeout(80);
-          await page.mouse.click(confirmPos.cx, confirmPos.cy, { delay: 60 });
-        } catch {}
-        await page.waitForTimeout(2500);
-        await dismissModals(page);
-      }
+      await page.waitForTimeout(600);
     }
     confirmClicked = `${confirmClicked}|editor=${editorState}`;
     await shot(page, "03c-editor-state");
 
     if (editorState.startsWith("recovering")) {
-      // Still not in the editor after all recovery rounds — fail loud
-      // with the URL so the user knows whether it's the payment gate.
+      // Still no interactive editor after all rerolls — fail loud with
+      // the URL so the user can tell if TikTok is forcing the new flow.
       const finalUrlNow = page.url();
       const shotBuf = await page.screenshot({ fullPage: false }).catch(() => null);
       const shotId = shotBuf ? saveScreenshot(shotBuf) : null;
       await browser.close();
       return res.status(500).json({
-        error: `Editor never loaded after ${3} attempts. Last URL: ${finalUrlNow}` +
+        error: `Editor never became interactive after 5 rerolls. Last URL: ${finalUrlNow}` +
           (/account\/payment/i.test(finalUrlNow)
-            ? " — TikTok is redirecting to the PAYMENT page. Check VOXTY-03 billing/payment method in Ads Manager."
-            : ""),
+            ? " — TikTok keeps redirecting to the PAYMENT page. Check VOXTY-03 billing/payment method in Ads Manager."
+            : " — TikTok may be forcing the new unified flow on this session; try re-capturing fresh cookies."),
         confirmClicked,
-        screenshots: shots.concat(shotId ? [{ label: "payment-redirect", url: `${base}/screenshots/${shotId}` }] : []),
+        screenshots: shots.concat(shotId ? [{ label: "final-state", url: `${base}/screenshots/${shotId}` }] : []),
       });
     }
 
