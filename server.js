@@ -1684,15 +1684,26 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
           });
         });
 
-        // "Dropdown open" = a portal popup mounted OR the target option's
-        // text became visible anywhere. Some TikTok dropdowns render
-        // options INLINE (no fixed/absolute portal), so the portal-only
-        // popupCheck said "still closed", strategy 2 clicked again and
-        // TOGGLED the freshly-opened dropdown shut — that was the real
-        // cause of popups=0 on Event/Bid/Min-age while Pixel survived.
+        // "Dropdown open" = portal popup mounted, OR the target option's
+        // text is visible, OR the count of visible option-ish rows grew
+        // (covers inline dropdowns whose options don't match the needle
+        // — e.g. the pixel's event list not containing "Shopping").
+        const countVisibleOptions = async () => await page.evaluate(() => {
+          let n = 0;
+          const els = Array.from(document.querySelectorAll('[role="option"], li, [class*="option" i]:not([class*="options" i]), [class*="menu-item" i], [class*="select-item" i]'));
+          for (const o of els) {
+            const r = o.getBoundingClientRect();
+            if (r.width === 0 || r.height === 0) continue;
+            const cs = window.getComputedStyle(o);
+            if (cs.display === "none" || cs.visibility === "hidden") continue;
+            n++;
+          }
+          return n;
+        }).catch(() => 0);
+        const optCountBefore = await countVisibleOptions();
         const dropdownOpen = async () => {
           if (await popupCheck()) return true;
-          return await page.evaluate((needle) => {
+          const needleVisible = await page.evaluate((needle) => {
             const re = new RegExp("^\\s*" + needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
             const els = Array.from(document.querySelectorAll('[role="option"], li, [class*="option" i], [class*="item" i], [class*="menu" i] *'));
             for (const o of els) {
@@ -1705,11 +1716,16 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
             }
             return false;
           }, optionText).catch(() => false);
+          if (needleVisible) return true;
+          return (await countVisibleOptions()) >= optCountBefore + 2;
         };
 
         if (triggered && triggered.ok) {
           // ONE trusted click at a time, verify after each — never click
-          // again once the dropdown is open (second click toggles it shut).
+          // again once the dropdown is open (second click toggles it
+          // shut). NO keyboard fallback: pressing Enter/Space on "whatever
+          // is focused" once activated the budget-recommendation Apply
+          // link and rewrote the budget to 254.79 USD.
           let popupAfter = false;
           if (triggered.innerCx != null) {
             try {
@@ -1717,28 +1733,19 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
               await page.waitForTimeout(80);
               await page.mouse.click(triggered.innerCx, triggered.innerCy, { delay: 60 });
             } catch {}
-            await page.waitForTimeout(700);
+            await page.waitForTimeout(1000);
             popupAfter = await dropdownOpen();
           }
-          // Strategy 2: mouse click at outer trigger center.
+          // Strategy 2: mouse click at outer trigger center — only when
+          // we're confident the dropdown is still closed.
           if (!popupAfter && triggered.cx != null) {
             try {
               await page.mouse.move(triggered.cx, triggered.cy);
               await page.waitForTimeout(80);
               await page.mouse.click(triggered.cx, triggered.cy, { delay: 60 });
             } catch {}
-            await page.waitForTimeout(700);
+            await page.waitForTimeout(1000);
             popupAfter = await dropdownOpen();
-          }
-          // Strategy 3: Enter / Space keyboard on any focused element.
-          if (!popupAfter) {
-            try { await page.keyboard.press("Enter"); } catch {}
-            await page.waitForTimeout(300);
-            popupAfter = await dropdownOpen();
-            if (!popupAfter) {
-              try { await page.keyboard.press("Space"); } catch {}
-              await page.waitForTimeout(300);
-            }
           }
         }
 
@@ -1807,6 +1814,14 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
         if (typeof picked === "string" && /^pass[123]:/.test(picked)) {
           return `picked:${optionText}|via:${picked}`;
         }
+        // The min-age failure screenshot showed the dropdown OPEN with
+        // the target option visible — the scan had simply run before the
+        // open animation finished. One patient rescan.
+        await page.waitForTimeout(900);
+        picked = await pickDropdownOption(page, exactRe);
+        if (typeof picked === "string" && /^pass[123]:/.test(picked)) {
+          return `picked:${optionText}|via:rescan:${picked}`;
+        }
 
         // Fallback: type-ahead. Find a visible input INSIDE a recently
         // mounted high-z overlay (the open popup) and type the option
@@ -1825,7 +1840,11 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
             return true;
           });
           popups.sort((a, b) => (parseInt(window.getComputedStyle(b).zIndex) || 0) - (parseInt(window.getComputedStyle(a).zIndex) || 0));
-          const scopes = popups.length ? popups.slice(0, 3) : [document.body];
+          // NEVER fall back to document.body here — with no popup open,
+          // the "first visible input on the page" was the global search
+          // bar / campaign fields and we typed option text into them.
+          const scopes = popups.slice(0, 3);
+          if (!scopes.length) return false;
           let candidate = null;
           for (const sc of scopes) {
             const inputs = Array.from(sc.querySelectorAll('input[type="text"], input[type="search"], input:not([type])'));
