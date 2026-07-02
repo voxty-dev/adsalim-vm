@@ -877,43 +877,57 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
     await dismissModals(page);
     await shot(page, "03-after-destination");
 
-    // 5.5. NEW unified-campaign flow: TikTok now opens a "Create new
-    // campaign" MODAL ("Manual and Smart+ campaigns have been unified
-    // into one workflow") with the objective + destination selectors,
-    // and a "Confirm" button that must be clicked to enter the editor.
-    // The page-footer "Continue" (which we used to click) shows "2
-    // errors" because the modal isnt confirmed. Click "Confirm" in the
-    // modal if present.
+    // 5.5. NEW unified-campaign flow (intermittent A/B): TikTok sometimes
+    // opens a "Create new campaign" MODAL ("Manual and Smart+ campaigns
+    // have been unified into one workflow") with objective + destination
+    // pickers and a "Confirm" button that must be clicked to enter the
+    // editor. Other times it drops straight into the editor. Poll up to
+    // ~7s for a visible "Confirm" button and trusted-click it; if the
+    // modal never appears, we're already in the editor and skip.
     let confirmClicked = "not-present";
-    const confirmInfo = await page.evaluate(() => {
-      const isVisible = (el) => {
-        const cs = window.getComputedStyle(el);
-        if (cs.display === "none" || cs.visibility === "hidden") return false;
-        const r = el.getBoundingClientRect();
-        return r.width > 0 && r.height > 0;
-      };
-      // Look for a Confirm button inside a dialog/modal.
-      const btns = Array.from(document.querySelectorAll('button, [role="button"], [class*="btn" i]'));
-      for (const b of btns) {
-        const t = (b.innerText || b.textContent || "").trim();
-        if (!/^confirm$/i.test(t)) continue;
-        if (!isVisible(b)) continue;
-        if (b.disabled) continue;
-        const r = b.getBoundingClientRect();
+    for (let attempt = 0; attempt < 10; attempt++) {
+      const confirmInfo = await page.evaluate(() => {
+        const isVisible = (el) => {
+          const cs = window.getComputedStyle(el);
+          if (cs.display === "none" || cs.visibility === "hidden") return false;
+          const r = el.getBoundingClientRect();
+          return r.width > 0 && r.height > 0;
+        };
+        // Confirm lives in the modal footer next to Cancel. Match a
+        // clickable whose exact text is Confirm and that sits near a
+        // Cancel sibling (to avoid other "confirm" buttons).
+        const clickables = Array.from(document.querySelectorAll('button, [role="button"], [class*="btn" i], a'));
+        let confirmEl = null;
+        for (const b of clickables) {
+          const t = (b.innerText || b.textContent || "").trim();
+          if (!/^confirm$/i.test(t)) continue;
+          if (!isVisible(b)) continue;
+          if (b.disabled || b.getAttribute("aria-disabled") === "true") continue;
+          confirmEl = b; break;
+        }
+        if (!confirmEl) return null;
+        const r = confirmEl.getBoundingClientRect();
         return { cx: r.left + r.width / 2, cy: r.top + r.height / 2 };
+      });
+      if (confirmInfo) {
+        try {
+          await page.mouse.move(confirmInfo.cx, confirmInfo.cy);
+          await page.waitForTimeout(80);
+          await page.mouse.click(confirmInfo.cx, confirmInfo.cy, { delay: 60 });
+        } catch {}
+        confirmClicked = `clicked@attempt${attempt}`;
+        await page.waitForTimeout(2500);
+        await dismissModals(page);
+        await shot(page, "03b-after-confirm");
+        break;
       }
-      return null;
-    });
-    if (confirmInfo) {
-      try {
-        await page.mouse.move(confirmInfo.cx, confirmInfo.cy);
-        await page.waitForTimeout(80);
-        await page.mouse.click(confirmInfo.cx, confirmInfo.cy, { delay: 60 });
-      } catch {}
-      confirmClicked = "clicked";
-      await page.waitForTimeout(2500);
-      await dismissModals(page);
-      await shot(page, "03b-after-confirm");
+      // No Confirm yet — if the ad-group form is already present, we're
+      // in the editor (no modal on this run); stop polling.
+      const inEditor = await page.evaluate(() =>
+        /ad group|optimization|data connection|bid strategy/i.test(document.body.innerText || "")
+      ).catch(() => false);
+      if (inEditor) { confirmClicked = "editor-direct"; break; }
+      await page.waitForTimeout(700);
     }
 
     // 6. Fill campaign name. The input is below the fold and TikTok
