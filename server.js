@@ -1024,21 +1024,70 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
       return true;
     };
 
+    // Fully resolve the unified objective modal: pick Sales + Website,
+    // force the Search-campaign toggle OFF (our own stray clicks flipped
+    // it ON in one run, which added validation errors), click Confirm,
+    // and VERIFY the modal actually closed. Safe to call repeatedly —
+    // returns immediately when no modal is open. TikTok re-opens this
+    // modal at later steps when campaign details are incomplete, so
+    // every major step calls this first.
+    const ensureObjectiveConfirmed = async () => {
+      for (let t = 0; t < 4; t++) {
+        const modalOpen = await page.evaluate(() => {
+          return Array.from(document.querySelectorAll('button, [role="button"]')).some((b) => {
+            const txt = (b.innerText || b.textContent || "").trim();
+            if (!/^confirm$/i.test(txt)) return false;
+            const cs = window.getComputedStyle(b);
+            const r = b.getBoundingClientRect();
+            return cs.display !== "none" && cs.visibility !== "hidden" && r.width > 0;
+          });
+        }).catch(() => false);
+        if (!modalOpen) return t === 0 ? "no-modal" : `confirmed@try${t}`;
+        // Re-assert objective + destination inside the modal.
+        await clickByText(page, new RegExp(`^\\s*${objectiveLabel}\\s*$`, "i"), "modal-objective");
+        await page.waitForTimeout(400);
+        await clickByText(page, new RegExp(`^\\s*${destLabel}\\s*$`, "i"), "modal-destination");
+        await page.waitForTimeout(400);
+        // Force the "Search campaign" toggle OFF if some stray click
+        // turned it on (it renders as ks-switch-* inside the modal).
+        await page.evaluate(() => {
+          const labels = Array.from(document.querySelectorAll("*")).filter((el) => {
+            if (el.children.length > 2) return false;
+            const t2 = (el.innerText || el.textContent || "").trim();
+            return /^search campaign$/i.test(t2);
+          });
+          for (const lab of labels) {
+            const lr = lab.getBoundingClientRect();
+            if (lr.width === 0) continue;
+            const switches = Array.from(document.querySelectorAll("*")).filter((el) => /^ks-switch/.test((el.tagName || "").toLowerCase()));
+            for (const sw of switches) {
+              const r = sw.getBoundingClientRect();
+              if (r.width === 0) continue;
+              if (Math.abs((r.top + r.height / 2) - (lr.top + lr.height / 2)) > 30) continue;
+              const on = sw.getAttribute("aria-checked") === "true" ||
+                /checked|active|on/.test((typeof sw.className === "string" ? sw.className : "")) ||
+                Array.from(sw.querySelectorAll("*")).some((c) => /checked|active/.test(typeof c.className === "string" ? c.className : ""));
+              if (on) { try { sw.click(); } catch {} }
+            }
+          }
+        }).catch(() => {});
+        await page.waitForTimeout(300);
+        await clickConfirmIfPresent();
+        await page.waitForTimeout(2500);
+      }
+      return "modal-stuck";
+    };
+
     let editorState = "unknown";
     recovery: for (let round = 0; round < 3; round++) {
-      // Within a round: confirm the modal whenever it shows, then poll
+      // Within a round: resolve the modal whenever it shows, then poll
       // for a truly-interactive editor.
-      for (let i = 0; i < 20; i++) {
+      for (let i = 0; i < 8; i++) {
+        await ensureObjectiveConfirmed();
         if (await editorReady()) { editorState = round === 0 ? "ready" : `recovered@round${round}`; break recovery; }
         const url = page.url();
         if (/account\/payment/i.test(url)) break; // genuine payment bounce — re-enter
-        const confirmed = await clickConfirmIfPresent();
-        if (confirmed) {
-          await page.waitForTimeout(2500);
-          await dismissModals(page);
-        } else {
-          await page.waitForTimeout(1000);
-        }
+        await page.waitForTimeout(1000);
       }
       editorState = `recovering@round${round + 1}`;
       // Re-enter the creation flow from scratch.
@@ -1049,11 +1098,6 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
       await page.waitForSelector('button, [role="button"]', { timeout: 15_000 }).catch(() => {});
       await page.waitForTimeout(2500);
       await dismissModals(page);
-      // Re-pick objective + destination inside the (re-)shown modal.
-      await clickByText(page, new RegExp(`^\\s*${objectiveLabel}\\s*$`, "i"), `objective-retry`);
-      await page.waitForTimeout(600);
-      await clickByText(page, new RegExp(`^\\s*${destLabel}\\s*$`, "i"), `destination-retry`);
-      await page.waitForTimeout(600);
     }
     confirmClicked = `${confirmClicked}|editor=${editorState}`;
     await shot(page, "03c-editor-state");
@@ -1947,6 +1991,12 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
       return last;
     };
 
+    // TikTok re-opens the objective modal whenever campaign details are
+    // incomplete (e.g. after the page-footer Continue) — resolve it
+    // before touching any ad-group field, else every pick fights the
+    // modal backdrop and stray clicks hit modal controls.
+    adGroupReport.modalBeforeAdgroup = await ensureObjectiveConfirmed();
+
     // 10a. Data connection (Pixel)
     if (pixelName) {
       adGroupReport.pixelPick = await pickWithRetry("Data connection", pixelName);
@@ -2019,6 +2069,10 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
     //       - "Automatic targeting guidance" -> Age groups
     //     We click each pencil to open its editor, then fill the values.
     if ((countryIds && countryIds.length) || (ageGroupIds && ageGroupIds.length)) {
+      // Resolve the objective modal if it re-opened — one run's audience
+      // pencil finder matched the modal's Search-campaign ks-switch and
+      // toggled it because the modal was covering the page here.
+      await ensureObjectiveConfirmed();
       const COUNTRY_MAP = {
         "6252001": "United States", "3175395": "Italy", "2510769": "Spain",
         "3017382": "France", "2635167": "United Kingdom", "2750405": "Netherlands",
