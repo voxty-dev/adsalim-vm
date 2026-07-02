@@ -939,9 +939,24 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
     // we detect the payment URL (or time out), re-goto the creation URL
     // and re-run the objective/destination/Confirm dance — up to 2
     // recovery rounds.
-    const editorReady = async () => await page.evaluate(() =>
-      /ad group name|optimization and bidding|data connection|bid strategy/i.test(document.body.innerText || "")
-    ).catch(() => false);
+    // "Editor ready" at THIS stage means the CAMPAIGN step is showing
+    // (Campaign details / Campaign name) — the ad-group form only exists
+    // after the later Continue click, so don't look for it here. Also
+    // require the objective modal to be GONE (no visible Confirm button):
+    // the campaign page renders behind the modal, so text alone matches
+    // while the modal still blocks everything.
+    const editorReady = async () => await page.evaluate(() => {
+      const modalConfirm = Array.from(document.querySelectorAll('button, [role="button"]')).some((b) => {
+        const t = (b.innerText || b.textContent || "").trim();
+        if (!/^confirm$/i.test(t)) return false;
+        const cs = window.getComputedStyle(b);
+        if (cs.display === "none" || cs.visibility === "hidden") return false;
+        const r = b.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+      });
+      if (modalConfirm) return false; // modal still open
+      return /campaign name|campaign details/i.test(document.body.innerText || "");
+    }).catch(() => false);
 
     let editorState = "unknown";
     recovery: for (let round = 0; round < 3; round++) {
