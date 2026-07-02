@@ -958,9 +958,14 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
       });
       if (modalConfirm) return false; // modal still open
       // Accept either the campaign step OR the new unified editor's
-      // combined layout (which may land on ad-group content directly).
-      if (!/campaign name|campaign details|ad group name|optimization and bidding/i.test(document.body.innerText || "")) return false;
-      return Array.from(document.querySelectorAll('input[type="text"], input:not([type])')).some(visible);
+      // combined layout. The NEW campaign step has NO text input at all
+      // (just objective radios + budget strategy + split test), so the
+      // old visible-input requirement rejected a perfectly good page.
+      // "Interactive editor" now = editor headings present AND the
+      // Exit/Continue footer is rendered.
+      const body = document.body.innerText || "";
+      if (!/advertising objective|campaign details|campaign name|ad group name|optimization and bidding/i.test(body)) return false;
+      return /\bexit\b/i.test(body) && /\bcontinue\b/i.test(body);
     }).catch(() => false);
 
     // STRATEGY (updated): TikTok has permanently rolled out the unified
