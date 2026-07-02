@@ -722,14 +722,16 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
         }
       }
 
-      // Scroll into view + report the click point for the outer trusted
-      // mouse-click.
+      // Scroll into view FIRST, then measure — the pre-scroll rect is
+      // stale after scrollIntoView and the trusted click landed on a
+      // random element (Goal-based looked "clicked" but stayed ON).
       t.scrollIntoView({ block: "center" });
+      const rNow = effectiveRect(t) || t.getBoundingClientRect();
       return {
         ok: true,
         checked,
-        cx: best.r.left + best.r.width / 2,
-        cy: best.r.top + best.r.height / 2,
+        cx: rNow.left + rNow.width / 2,
+        cy: rNow.top + rNow.height / 2,
         tag: t.tagName.toLowerCase(),
       };
     }, labelText);
@@ -1806,23 +1808,16 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
           }
         }
 
-        // Last resort: substring match, but WORD-BOUNDED so a numeric
-        // option like "25" can't match inside "254.79 USD" (that bug
-        // made Minimum age grab the budget-recommendation banner). For a
-        // fully-numeric option we also forbid an adjacent digit.
+        // Last resort: substring match — but for FULLY-NUMERIC options
+        // (Minimum age "25") the loose pass is disabled entirely: it
+        // matched the "25-34" age-suggestion chip and toggled it. A
+        // numeric dropdown option must match exactly or not at all.
         const isNumeric = /^\d+$/.test(optionText.trim());
-        const looseSrc = isNumeric
-          ? `(?<!\\d)${escaped}(?!\\d)`
-          : `\\b${escaped}\\b`;
-        let loose;
-        try {
-          const looseRe = new RegExp(looseSrc, "i");
-          loose = await pickDropdownOption(page, looseRe);
-        } catch {
-          loose = await pickDropdownOption(page, new RegExp(escaped, "i"));
-        }
-        if (typeof loose === "string" && /^pass[123]:/.test(loose)) {
-          return `picked:${optionText}|via:loose-fallback:${loose}`;
+        if (!isNumeric) {
+          const loose = await pickDropdownOption(page, new RegExp(`\\b${escaped}\\b`, "i"));
+          if (typeof loose === "string" && /^pass[123]:/.test(loose)) {
+            return `picked:${optionText}|via:loose-fallback:${loose}`;
+          }
         }
 
         // Put diag INFO first — the error text gets truncated in the
@@ -1863,14 +1858,27 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
       }
     }
 
+    // Retry wrapper: after the pixel changes, TikTok runs a server-side
+    // revalidation ("Your data connection has no recent activity" banner)
+    // during which the event/bid selectors are temporarily inert — a
+    // single attempt lands popups=0. Retry the whole open-and-pick up to
+    // 3 times with a growing pause.
+    const pickWithRetry = async (labelText, optionText) => {
+      let last = "";
+      for (let i = 0; i < 3; i++) {
+        last = await pickFromDropdown(labelText, optionText);
+        if (typeof last === "string" && last.startsWith("picked:")) return i === 0 ? last : `${last}|retry=${i}`;
+        await page.keyboard.press("Escape").catch(() => {});
+        await page.waitForTimeout(2000 + i * 1000);
+      }
+      return last;
+    };
+
     // 10a. Data connection (Pixel)
     if (pixelName) {
-      adGroupReport.pixelPick = await pickFromDropdown("Data connection", pixelName);
-      // TikTok reloads the Optimization-event list based on the new
-      // pixel — subsequent event/bid picks race that reload without a
-      // wait, hence popup=0 for event immediately after a successful
-      // pixel pick.
-      await page.waitForTimeout(1500);
+      adGroupReport.pixelPick = await pickWithRetry("Data connection", pixelName);
+      // Let TikTok's pixel revalidation settle before touching event/bid.
+      await page.waitForTimeout(3000);
     }
     void pixelId;
 
@@ -1892,7 +1900,7 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
         ON_WEB_SUBSCRIBE: "Subscribe",
       };
       const eventLabel = eventLabelMap[optimizationEvent] || optimizationEvent;
-      adGroupReport.eventPick = await pickFromDropdown("Optimization event", eventLabel);
+      adGroupReport.eventPick = await pickWithRetry("Optimization event", eventLabel);
       await page.waitForTimeout(600);
     }
 
@@ -1901,7 +1909,7 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
       const bidLabel = bidStrategy === "BID_TYPE_CUSTOM"
         ? "Target cost per result"
         : "Maximum delivery";
-      adGroupReport.bidPick = await pickFromDropdown("Bid strategy", bidLabel);
+      adGroupReport.bidPick = await pickWithRetry("Bid strategy", bidLabel);
       await page.waitForTimeout(400);
     }
 
@@ -2120,8 +2128,9 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
             if (cur.matches?.('button, [role="button"], [class*="btn" i]') || cs.cursor === "pointer") { clickTarget = cur; break; }
             cur = cur.parentElement; hops++;
           }
-          const tr = clickTarget.getBoundingClientRect();
+          // Scroll FIRST, then measure — pre-scroll coords go stale.
           clickTarget.scrollIntoView({ block: "center" });
+          const tr = clickTarget.getBoundingClientRect();
           // Tag the pencil so we can re-find it for in-page dispatch.
           pencil.setAttribute("data-vm-pencil", "1");
           return {
@@ -2304,10 +2313,11 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
               await page.waitForTimeout(400);
               await page.keyboard.type(name, { delay: 45 });
             } catch {}
-            // Poll up to 6s for the results to load (typing shows a
-            // "Loading..." state first), then click the matching option.
+            // Poll up to 15s for the results to load (typing shows a
+            // "Loading..." state first — last run was still loading when
+            // the 6s poll gave up), then click the matching option.
             let picked = "no-option";
-            for (let attempt = 0; attempt < 12; attempt++) {
+            for (let attempt = 0; attempt < 30; attempt++) {
               await page.waitForTimeout(500);
               picked = await page.evaluate((needle) => {
                 const re = new RegExp("(?:^|\\b)" + needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
@@ -2338,9 +2348,9 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
               }, name);
               if (picked.startsWith("picked:")) break;
               if (picked === "loading") continue;
-              // non-loading, non-picked: options are present but no match —
-              // give it one more round then stop.
-              if (attempt >= 3) break;
+              // non-loading, non-picked: options render progressively, so
+              // allow several no-match rounds before giving up.
+              if (attempt >= 10) break;
             }
             await shot(page, `10-loc-typed-${name}`);
             await page.waitForTimeout(500);
