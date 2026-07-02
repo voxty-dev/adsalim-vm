@@ -983,17 +983,39 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
           const t = (b.innerText || b.textContent || "").trim();
           if (!/^confirm$/i.test(t)) continue;
           if (!visible(b) || b.disabled) continue;
+          // Disabled-by-class ks-buttons carry a "disabled" class instead
+          // of the attribute — skip those too.
+          const cls = (typeof b.className === "string") ? b.className : "";
+          if (/disabled/i.test(cls)) continue;
           const r = b.getBoundingClientRect();
+          b.setAttribute("data-vm-confirm", "1");
           return { cx: r.left + r.width / 2, cy: r.top + r.height / 2 };
         }
         return null;
       });
       if (!pos) return false;
+      // Trusted click first (isTrusted handlers)...
       try {
         await page.mouse.move(pos.cx, pos.cy);
         await page.waitForTimeout(80);
         await page.mouse.click(pos.cx, pos.cy, { delay: 60 });
       } catch {}
+      // ...then an in-page click as backup — the floating "Ad Assistant"
+      // widget sits right over the modal footer, so the coordinate click
+      // can hit the overlay instead of Confirm. Element.click() ignores
+      // overlay hit-testing entirely.
+      await page.evaluate(() => {
+        const b = document.querySelector('[data-vm-confirm="1"]');
+        if (!b) return;
+        for (const type of ["pointerdown", "mousedown", "pointerup", "mouseup"]) {
+          try {
+            const Ctor = type.startsWith("pointer") ? PointerEvent : MouseEvent;
+            b.dispatchEvent(new Ctor(type, { bubbles: true, cancelable: true }));
+          } catch {}
+        }
+        try { b.click(); } catch {}
+        b.removeAttribute("data-vm-confirm");
+      }).catch(() => {});
       return true;
     };
 
@@ -1033,16 +1055,20 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
 
     if (editorState.startsWith("recovering")) {
       // Still no interactive editor after all rerolls — fail loud with
-      // the URL so the user can tell if TikTok is forcing the new flow.
+      // the URL + a body excerpt so we can see exactly what blocked it.
       const finalUrlNow = page.url();
+      const bodyNow = await page.evaluate(() =>
+        (document.body.innerText || "").replace(/\s+/g, " ").slice(0, 350)
+      ).catch(() => "");
       const shotBuf = await page.screenshot({ fullPage: false }).catch(() => null);
       const shotId = shotBuf ? saveScreenshot(shotBuf) : null;
       await browser.close();
       return res.status(500).json({
-        error: `Editor never became interactive after 5 rerolls. Last URL: ${finalUrlNow}` +
+        error: `Editor never became interactive after 3 rounds. Last URL: ${finalUrlNow}` +
           (/account\/payment/i.test(finalUrlNow)
-            ? " — TikTok keeps redirecting to the PAYMENT page. Check VOXTY-03 billing/payment method in Ads Manager."
-            : " — TikTok may be forcing the new unified flow on this session; try re-capturing fresh cookies."),
+            ? " — TikTok keeps redirecting to the PAYMENT page."
+            : "") +
+          ` | body="${bodyNow}"`,
         confirmClicked,
         screenshots: shots.concat(shotId ? [{ label: "final-state", url: `${base}/screenshots/${shotId}` }] : []),
       });
