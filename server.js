@@ -2029,6 +2029,10 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
             // until the box is focused, so we click the box first, then
             // type — the focused input receives the keystrokes.
             const boxPos = await page.evaluate(() => {
+              // Find the "Locations" label, then the input that FOLLOWS it
+              // in document order (the search field inside the Locations
+              // multi-select). Click a point on that input's row, in the
+              // empty area to the RIGHT of any chip, to focus it.
               const all = Array.from(document.querySelectorAll("*"));
               let label = null;
               for (const el of all) {
@@ -2041,26 +2045,25 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
               }
               if (!label) return null;
               const lr = label.getBoundingClientRect();
-              // Field box: the widest sizable element directly below the
-              // label within 120px (the ks-select / input wrapper showing
-              // the Vietnam chip). Prefer one containing an input.
-              const cands = Array.from(document.querySelectorAll("div, [class*='select'], [class*='input'], ks-select, [role='combobox']"));
-              let best = null, bestScore = -1;
-              for (const c of cands) {
-                const r = c.getBoundingClientRect();
-                if (r.width < 200 || r.height < 20 || r.height > 90) continue;
+              // The FIRST input after the Locations label in doc order that
+              // is within 130px below it — that's the Locations search box,
+              // NOT the interests field far below.
+              const inputs = Array.from(document.querySelectorAll("input"));
+              for (const inp of inputs) {
+                const pos = label.compareDocumentPosition(inp);
+                if (!(pos & Node.DOCUMENT_POSITION_FOLLOWING)) continue;
+                const r = inp.getBoundingClientRect();
                 const gap = r.top - lr.bottom;
-                if (gap < -5 || gap > 120) continue;
-                const cs = window.getComputedStyle(c);
-                if (cs.display === "none" || cs.visibility === "hidden") continue;
-                const hasInput = c.querySelector("input") ? 1 : 0;
-                // Prefer closer + has input + not too tall.
-                const score = hasInput * 1000 + (120 - gap) - r.height;
-                if (score > bestScore) { best = c; bestScore = score; }
+                if (gap < -5 || gap > 130) continue;
+                // Click the input's box (use its parent box if the input
+                // itself is zero-width). Click toward the right to avoid
+                // the existing chip.
+                let box = inp;
+                if (r.width < 30) box = inp.parentElement || inp;
+                const br = box.getBoundingClientRect();
+                return { x: br.right - 30, y: br.top + br.height / 2 };
               }
-              if (!best) return null;
-              const r = best.getBoundingClientRect();
-              return { x: r.left + Math.min(60, r.width / 2), y: r.top + r.height / 2 };
+              return null;
             });
             if (!boxPos) return "no-box";
             // Click the box to focus its search input, then type.
@@ -2144,136 +2147,23 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
             adGroupReport.countryPicks.push(`${name}=>${r}`);
             await page.waitForTimeout(600);
           }
-        }
-      }
 
-      // 12b. AGE via "Automatic targeting guidance" pencil.
-      if (ageGroupIds && ageGroupIds.length) {
-        const AGE_MAP = {
-          AGE_13_17: "13-17", AGE_18_24: "18-24", AGE_25_34: "25-34",
-          AGE_35_44: "35-44", AGE_45_54: "45-54", AGE_55_100: "55+",
-        };
-        const wantedLabels = new Set(ageGroupIds.map((id) => AGE_MAP[id]).filter(Boolean));
-        // TikTok renamed this section: "Automatic targeting guidance" ->
-        // "Audience suggestions". Match either, with optional "Optional".
-        const editInfo = await clickEditPencil(/^(?:automatic targeting guidance|audience suggestions)(?:\s*[·\-]?\s*optional)?(?:\s*[\?ⓘ])?$/i, "09-after-autoguid-pencil");
-        adGroupReport.autoGuidanceEdit = editInfo && editInfo.ok
-          ? `clicked|opened=${editInfo.editorOpened}|fields=${editInfo.fieldDelta}|url=${(editInfo.urlAfter || "").slice(-40)}|cls=${editInfo.cls}`
-          : `error:${editInfo && editInfo.reason}|hr=${editInfo && editInfo.headingRect}|diag=${editInfo && editInfo.diag}`;
-        if (editInfo && editInfo.ok) {
-          // Scroll the "Ages" label into view first — the chips can be
-          // below the fold after both sections expand, and (more
-          // importantly) TikTok lazy-mounts them, so scanning before
-          // they render returned the empty seen=[] we saw.
-          await page.evaluate(() => {
-            const el = Array.from(document.querySelectorAll("*")).find((e) => {
-              if (e.children.length > 2) return false;
-              const t = (e.innerText || e.textContent || "").trim();
-              return /^ages(?:\s*[\?ⓘ])?$/i.test(t);
-            });
-            if (el) el.scrollIntoView({ block: "center" });
-          });
-          await page.waitForTimeout(600);
-          await shot(page, "11-ages-region");
-          // Find each age chip + its selection state + click coords.
-          // TikTok renders a selected chip with a ✓ checkmark and a teal
-          // border (e.g. "18-24 ✓"). So chip text STARTS WITH the label
-          // (not equals), and "selected" = has a checkmark char / check
-          // icon / teal-ish border / selected class.
-          const chipInfo = await page.evaluate((wanted) => {
-            const chipLabels = ["13-17", "18-24", "25-34", "35-44", "45-54", "55+"];
-            const isVisible = (el) => {
-              const cs = window.getComputedStyle(el);
-              if (cs.display === "none" || cs.visibility === "hidden") return false;
-              const r = el.getBoundingClientRect();
-              return r.width > 0 && r.height > 0;
+          // MINIMUM AGE — the real, reliable age control lives in
+          // Audience controls (already expanded here). The "Ages" chips
+          // in Automatic targeting guidance are only soft SUGGESTIONS
+          // ("delivery isn't guaranteed"), so we skip those and set the
+          // hard floor via the Minimum age dropdown instead.
+          if (ageGroupIds && ageGroupIds.length) {
+            const AGE_FLOOR = {
+              AGE_13_17: 13, AGE_18_24: 18, AGE_25_34: 25,
+              AGE_35_44: 35, AGE_45_54: 45, AGE_55_100: 55,
             };
-            const tealBorder = (el) => {
-              const cs = window.getComputedStyle(el);
-              const bc = cs.borderColor || cs.borderTopColor || "";
-              const m = bc.match(/rgba?\(([^)]+)\)/);
-              if (!m) return false;
-              const [r, g, b] = m[1].split(",").map((x) => parseInt(x.trim()));
-              // TikTok teal ~ rgb(37-60, 180-220, 180-220): green+blue high, red low.
-              return g > 120 && b > 120 && r < 120;
-            };
-            const results = [];
-            const toClick = [];
-            const seen = [];
-            // Normalize: drop checkmarks/spaces, unify all dash variants
-            // (TikTok may render "18–24" with an en-dash, not a hyphen).
-            const norm = (s) => s.replace(/[✓√✔\s]/g, "").replace(/[‐-―−]/g, "-");
-            const all = Array.from(document.querySelectorAll('button, [role="button"], [class*="chip" i], [class*="pill" i], [class*="tag" i], [class*="lego" i], span, div, label'));
-            // Diagnostic: find the "Ages" label, then dump EVERY short
-            // visible text within 200px below it — this shows the exact
-            // chip rendering (dash char, structure) so we stop guessing.
-            let agesLabel = null;
-            for (const c of all) {
-              if (c.children.length > 2) continue;
-              const t = (c.innerText || c.textContent || "").trim();
-              if (/^ages$/i.test(t) && isVisible(c)) { agesLabel = c; break; }
+            const floors = ageGroupIds.map((id) => AGE_FLOOR[id]).filter((n) => typeof n === "number");
+            if (floors.length) {
+              const minAge = Math.min(...floors);
+              adGroupReport.minAgePick = await pickFromDropdown("Minimum age", String(minAge));
             }
-            const agesRect = agesLabel ? agesLabel.getBoundingClientRect() : null;
-            for (const c of all) {
-              if (c.children.length > 3) continue;
-              const t = (c.innerText || c.textContent || "").trim();
-              if (t.length < 1 || t.length > 12) continue;
-              if (!isVisible(c)) continue;
-              const r = c.getBoundingClientRect();
-              if (r.width < 10 || r.width > 240) continue;
-              // Restrict to the region just below the Ages label if found.
-              if (agesRect) {
-                const gap = r.top - agesRect.bottom;
-                if (gap < -20 || gap > 200) continue;
-              } else if (!/\d/.test(t)) continue;
-              if (seen.length < 20) seen.push(`${t.slice(0, 8)}@${Math.round(r.width)}x${Math.round(r.height)}`);
-            }
-            for (const label of chipLabels) {
-              const nLabel = norm(label);
-              const chip = all.find((c) => {
-                if (c.children.length > 6) return false;
-                const t = norm((c.innerText || c.textContent || "").trim());
-                if (t !== nLabel && !t.startsWith(nLabel)) return false;
-                if (t.length > nLabel.length + 2) return false;
-                if (!isVisible(c)) return false;
-                const r = c.getBoundingClientRect();
-                return r.width > 15 && r.width < 220 && r.height > 10 && r.height < 90;
-              });
-              if (!chip) { results.push(`${label}=missing`); continue; }
-              const t = (chip.innerText || chip.textContent || "").trim();
-              const cls = (chip.className && typeof chip.className === "string") ? chip.className : "";
-              const hasCheckIcon = !!chip.querySelector('svg, [class*="check" i], [class*="tick" i], [class*="selected" i]');
-              let selected =
-                /[✓√✔]/.test(t) ||
-                hasCheckIcon ||
-                /(?:^|[\s_-])(active|selected|checked)(?:[\s_-]|$)/i.test(cls) ||
-                chip.getAttribute("aria-pressed") === "true" ||
-                chip.getAttribute("aria-checked") === "true" ||
-                tealBorder(chip);
-              const want = wanted.includes(label);
-              if (want !== selected) {
-                const r = chip.getBoundingClientRect();
-                chip.scrollIntoView({ block: "center" });
-                const r2 = chip.getBoundingClientRect();
-                toClick.push({ label, cx: r2.left + r2.width / 2, cy: r2.top + r2.height / 2, was: selected, want });
-                results.push(`${label}=toggle(${selected}=>${want})`);
-              } else {
-                results.push(`${label}=ok(${selected ? "on" : "off"})`);
-              }
-            }
-            return { results, toClick, seen };
-          }, [...wantedLabels]);
-
-          // Trusted clicks for chips needing a toggle.
-          for (const c of chipInfo.toClick) {
-            try {
-              await page.mouse.move(c.cx, c.cy);
-              await page.waitForTimeout(60);
-              await page.mouse.click(c.cx, c.cy, { delay: 50 });
-            } catch {}
-            await page.waitForTimeout(300);
           }
-          adGroupReport.ageGroupPicks = chipInfo.results.concat([`seen=[${(chipInfo.seen || []).join(", ")}]`]);
         }
       }
     }
