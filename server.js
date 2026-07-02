@@ -955,61 +955,64 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
         return /^confirm$/i.test(t) && visible(b);
       });
       if (modalConfirm) return false; // modal still open
-      if (!/campaign name|campaign details/i.test(document.body.innerText || "")) return false;
+      // Accept either the campaign step OR the new unified editor's
+      // combined layout (which may land on ad-group content directly).
+      if (!/campaign name|campaign details|ad group name|optimization and bidding/i.test(document.body.innerText || "")) return false;
       return Array.from(document.querySelectorAll('input[type="text"], input:not([type])')).some(visible);
     }).catch(() => false);
 
-    // STRATEGY: TikTok A/B-serves two variants of this page. The OLD
-    // variant drops straight into the campaign editor (every successful
-    // run today came through it). The NEW variant opens the unified
-    // objective modal whose Confirm redirects to account/payment. So we
-    // treat the modal as a bad roll: CLOSE it (X / Cancel / Escape) and
-    // re-enter the creation URL until TikTok serves the old variant.
-    const closeObjectiveModal = async () => {
-      await page.evaluate(() => {
+    // STRATEGY (updated): TikTok has permanently rolled out the unified
+    // flow on this account — 5 rerolls all served the modal, the old
+    // direct variant is gone. So we CONFIRM the modal and wait for the
+    // new editor. (The account/payment drift in earlier runs was NOT
+    // caused by Confirm — the audience-pencil finder was clicking a
+    // 40x40 LEFT-NAV icon (ks-nav-item inside <a>), i.e. the Payment nav
+    // entry. Nav clicks are now excluded elsewhere.)
+    const clickConfirmIfPresent = async () => {
+      const pos = await page.evaluate(() => {
         const visible = (el) => {
           const cs = window.getComputedStyle(el);
           if (cs.display === "none" || cs.visibility === "hidden") return false;
           const r = el.getBoundingClientRect();
           return r.width > 0 && r.height > 0;
         };
-        const clickables = Array.from(document.querySelectorAll('button, [role="button"], [aria-label*="close" i], [class*="close" i]'));
-        for (const b of clickables) {
+        const btns = Array.from(document.querySelectorAll('button, [role="button"], [class*="btn" i]'));
+        for (const b of btns) {
           const t = (b.innerText || b.textContent || "").trim();
-          const aria = (b.getAttribute("aria-label") || "").toLowerCase();
-          if (/^cancel$/i.test(t) || /close/.test(aria) || (/close/i.test(b.className || "") && !t)) {
-            if (visible(b)) { try { b.click(); } catch {} return; }
-          }
+          if (!/^confirm$/i.test(t)) continue;
+          if (!visible(b) || b.disabled) continue;
+          const r = b.getBoundingClientRect();
+          return { cx: r.left + r.width / 2, cy: r.top + r.height / 2 };
         }
-      }).catch(() => {});
-      await page.keyboard.press("Escape").catch(() => {});
-      await page.waitForTimeout(500);
+        return null;
+      });
+      if (!pos) return false;
+      try {
+        await page.mouse.move(pos.cx, pos.cy);
+        await page.waitForTimeout(80);
+        await page.mouse.click(pos.cx, pos.cy, { delay: 60 });
+      } catch {}
+      return true;
     };
 
     let editorState = "unknown";
-    recovery: for (let round = 0; round < 5; round++) {
-      // Poll for a truly-interactive campaign editor within this round.
-      for (let i = 0; i < 12; i++) {
+    recovery: for (let round = 0; round < 3; round++) {
+      // Within a round: confirm the modal whenever it shows, then poll
+      // for a truly-interactive editor.
+      for (let i = 0; i < 20; i++) {
         if (await editorReady()) { editorState = round === 0 ? "ready" : `recovered@round${round}`; break recovery; }
         const url = page.url();
-        if (/account\/payment/i.test(url)) break; // payment bounce — reroll now
-        // Modal present? close it instead of confirming (Confirm is the
-        // path that bounces to payment).
-        const modalOpen = await page.evaluate(() =>
-          Array.from(document.querySelectorAll('button, [role="button"]')).some((b) => {
-            const t = (b.innerText || b.textContent || "").trim();
-            if (!/^confirm$/i.test(t)) return false;
-            const cs = window.getComputedStyle(b);
-            const r = b.getBoundingClientRect();
-            return cs.display !== "none" && cs.visibility !== "hidden" && r.width > 0;
-          })
-        ).catch(() => false);
-        if (modalOpen && i >= 2) break; // give direct render 2s, then reroll
-        await page.waitForTimeout(1000);
+        if (/account\/payment/i.test(url)) break; // genuine payment bounce — re-enter
+        const confirmed = await clickConfirmIfPresent();
+        if (confirmed) {
+          await page.waitForTimeout(2500);
+          await dismissModals(page);
+        } else {
+          await page.waitForTimeout(1000);
+        }
       }
       editorState = `recovering@round${round + 1}`;
-      await closeObjectiveModal();
-      // Re-enter the creation flow from scratch (fresh A/B roll).
+      // Re-enter the creation flow from scratch.
       await page.goto(
         `https://ads.tiktok.com/i18n/creation/1nn/create/campaign?aadvid=${encodeURIComponent(advertiserId)}&creation_type=create_new`,
         { waitUntil: "domcontentloaded", timeout: 45_000 },
@@ -1017,8 +1020,7 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
       await page.waitForSelector('button, [role="button"]', { timeout: 15_000 }).catch(() => {});
       await page.waitForTimeout(2500);
       await dismissModals(page);
-      // Re-pick objective + destination in case the direct variant needs
-      // them (harmless if the modal variant loaded instead).
+      // Re-pick objective + destination inside the (re-)shown modal.
       await clickByText(page, new RegExp(`^\\s*${objectiveLabel}\\s*$`, "i"), `objective-retry`);
       await page.waitForTimeout(600);
       await clickByText(page, new RegExp(`^\\s*${destLabel}\\s*$`, "i"), `destination-retry`);
@@ -2021,6 +2023,24 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
           if (!heading) return { ok: false, reason: "heading-not-found" };
           const hr = heading.getBoundingClientRect();
 
+          // Reject anything living in the LEFT NAV / any nav / inside an
+          // <a href> — a prior run's "pencil" was the nav Payment icon
+          // (ks-icon > ks-nav-item > a) and clicking it navigated the
+          // whole page to account/payment.
+          const inNavOrLink = (el) => {
+            let cur = el;
+            for (let i = 0; i < 8 && cur; i++) {
+              const tag = (cur.tagName || "").toLowerCase();
+              if (tag === "nav" || /^ks-nav/.test(tag) || tag === "a") return true;
+              const cls = clsOf(cur).toLowerCase();
+              if (/\bnav\b|sidebar|ksnav/.test(cls)) return true;
+              cur = cur.parentElement;
+            }
+            const r = el.getBoundingClientRect();
+            if (r.left < 100) return true; // left rail
+            return false;
+          };
+
           // PRIMARY: walk up ancestors from the heading; at each, find a
           // pencil descendant (lego-icons/edit, NOT chevron) that is
           // visible + icon-sized. This ties the pencil to the heading's
@@ -2037,6 +2057,7 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
               if (!isVisible(d)) continue;
               if (isChevron(d)) continue;
               if (!isPencilEl(d)) continue;
+              if (inNavOrLink(d)) continue;
               const r = d.getBoundingClientRect();
               if (r.width > 60 || r.height > 60 || r.width < 6 || r.height < 6) continue;
               pencil = d;
@@ -2057,6 +2078,7 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
               if (c === heading || c.contains(heading) || heading.contains(c)) continue;
               if (!isVisible(c)) continue;
               if (isChevron(c)) continue;
+              if (inNavOrLink(c)) continue;
               const r = c.getBoundingClientRect();
               if (Math.abs((r.top + r.height / 2) - hCenterY) > 60) continue;
               if (r.width > 60 || r.height > 60 || r.width < 6 || r.height < 6) continue;
@@ -2085,14 +2107,17 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
           }
 
           // Prefer a clickable ancestor (button/[role=button]/cursor:pointer)
-          // but fall back to the pencil itself. Also mark it for direct
-          // in-page dispatch as a second attempt.
+          // but fall back to the pencil itself. NEVER settle on an <a>
+          // (anchors navigate — that's how we ended up on the payment
+          // page). Also mark the pencil for direct in-page dispatch.
           let clickTarget = pencil;
           let hops = 0;
           let cur = pencil;
           while (cur && hops < 5) {
+            const tag = (cur.tagName || "").toLowerCase();
+            if (tag === "a") break; // stop before an anchor
             const cs = window.getComputedStyle(cur);
-            if (cur.matches?.('button, [role="button"], a, [class*="btn" i]') || cs.cursor === "pointer") { clickTarget = cur; break; }
+            if (cur.matches?.('button, [role="button"], [class*="btn" i]') || cs.cursor === "pointer") { clickTarget = cur; break; }
             cur = cur.parentElement; hops++;
           }
           const tr = clickTarget.getBoundingClientRect();
