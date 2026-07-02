@@ -2096,41 +2096,47 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
             // until the box is focused, so we click the box first, then
             // type — the focused input receives the keystrokes.
             const boxPos = await page.evaluate(() => {
-              // Find the "Locations" label, then the input that FOLLOWS it
-              // in document order (the search field inside the Locations
-              // multi-select). Click a point on that input's row, in the
-              // empty area to the RIGHT of any chip, to focus it.
+              // Find the "Locations" label. The field box sits directly
+              // below it (a bordered container with the Vietnam chip + a
+              // dropdown arrow). "Bulk upload" is the button right under
+              // that box, so the field box lives between the label bottom
+              // and the Bulk-upload top. Click the RIGHT-empty area of the
+              // box to focus its search input.
               const all = Array.from(document.querySelectorAll("*"));
+              const isVis = (el) => {
+                const cs = window.getComputedStyle(el);
+                if (cs.display === "none" || cs.visibility === "hidden") return false;
+                const r = el.getBoundingClientRect();
+                return r.width > 0 && r.height > 0;
+              };
               let label = null;
               for (const el of all) {
                 if (el.children.length > 2) continue;
                 const t = (el.innerText || el.textContent || "").trim();
-                if (/^locations(?:\s*[\?ⓘ])?$/i.test(t)) {
-                  const cs = window.getComputedStyle(el);
-                  if (cs.display !== "none" && cs.visibility !== "hidden") { label = el; break; }
-                }
+                if (/^locations(?:\s*[\?ⓘ])?$/i.test(t) && isVis(el)) { label = el; break; }
               }
               if (!label) return null;
               const lr = label.getBoundingClientRect();
-              // The FIRST input after the Locations label in doc order that
-              // is within 130px below it — that's the Locations search box,
-              // NOT the interests field far below.
-              const inputs = Array.from(document.querySelectorAll("input"));
-              for (const inp of inputs) {
-                const pos = label.compareDocumentPosition(inp);
-                if (!(pos & Node.DOCUMENT_POSITION_FOLLOWING)) continue;
-                const r = inp.getBoundingClientRect();
+              // Find the widest bordered box within ~110px below the label.
+              let box = null, bestScore = -1;
+              for (const el of all) {
+                const r = el.getBoundingClientRect();
+                if (r.width < 250 || r.height < 24 || r.height > 120) continue;
                 const gap = r.top - lr.bottom;
-                if (gap < -5 || gap > 130) continue;
-                // Click the input's box (use its parent box if the input
-                // itself is zero-width). Click toward the right to avoid
-                // the existing chip.
-                let box = inp;
-                if (r.width < 30) box = inp.parentElement || inp;
-                const br = box.getBoundingClientRect();
-                return { x: br.right - 30, y: br.top + br.height / 2 };
+                if (gap < -5 || gap > 110) continue;
+                if (!isVis(el)) continue;
+                // Prefer a box that contains the current chip text.
+                const txt = (el.innerText || el.textContent || "");
+                const hasChip = /vietnam|\bx\b/i.test(txt) ? 1 : 0;
+                const score = hasChip * 500 + (110 - gap) + r.width / 100;
+                if (score > bestScore) { box = el; bestScore = score; }
               }
-              return null;
+              if (!box) {
+                // Fallback: click a computed point in the field row.
+                return { x: lr.left + 220, y: lr.bottom + 35, fallback: true };
+              }
+              const br = box.getBoundingClientRect();
+              return { x: br.right - 40, y: br.top + br.height / 2 };
             });
             if (!boxPos) return "no-box";
             // Click the box to focus its search input, then type.
