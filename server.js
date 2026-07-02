@@ -930,6 +930,86 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
       await page.waitForTimeout(700);
     }
 
+    // 5.6. WAIT FOR THE EDITOR + PAYMENT-REDIRECT RECOVERY. On modal
+    // runs, Confirm sometimes redirects to account/payment/v1 instead of
+    // the editor (TikTok billing interstitial) — every prior such run
+    // then cascaded into label-not-found on all fields. And even on good
+    // runs the editor shows a spinner for several seconds; scanning too
+    // early also fails. So: poll up to 20s for real editor content; if
+    // we detect the payment URL (or time out), re-goto the creation URL
+    // and re-run the objective/destination/Confirm dance — up to 2
+    // recovery rounds.
+    const editorReady = async () => await page.evaluate(() =>
+      /ad group name|optimization and bidding|data connection|bid strategy/i.test(document.body.innerText || "")
+    ).catch(() => false);
+
+    let editorState = "unknown";
+    recovery: for (let round = 0; round < 3; round++) {
+      // Poll for the editor within this round.
+      for (let i = 0; i < 20; i++) {
+        if (await editorReady()) { editorState = round === 0 ? "ready" : `recovered@round${round}`; break recovery; }
+        const url = page.url();
+        if (/account\/payment/i.test(url)) break; // bail this round early
+        await page.waitForTimeout(1000);
+      }
+      editorState = `recovering@round${round + 1}`;
+      // Re-enter the creation flow from scratch.
+      await page.goto(
+        `https://ads.tiktok.com/i18n/creation/1nn/create/campaign?aadvid=${encodeURIComponent(advertiserId)}&creation_type=create_new`,
+        { waitUntil: "domcontentloaded", timeout: 45_000 },
+      ).catch(() => {});
+      await page.waitForSelector('button, [role="button"]', { timeout: 15_000 }).catch(() => {});
+      await page.waitForTimeout(2000);
+      await dismissModals(page);
+      // If the objective modal shows again: Sales -> Website -> Confirm.
+      await clickByText(page, new RegExp(`^\\s*${objectiveLabel}\\s*$`, "i"), `objective-retry`);
+      await page.waitForTimeout(800);
+      await clickByText(page, new RegExp(`^\\s*${destLabel}\\s*$`, "i"), `destination-retry`);
+      await page.waitForTimeout(800);
+      const confirmPos = await page.evaluate(() => {
+        const btns = Array.from(document.querySelectorAll('button, [role="button"], [class*="btn" i]'));
+        for (const b of btns) {
+          const t = (b.innerText || b.textContent || "").trim();
+          if (!/^confirm$/i.test(t)) continue;
+          const cs = window.getComputedStyle(b);
+          if (cs.display === "none" || cs.visibility === "hidden") continue;
+          if (b.disabled) continue;
+          const r = b.getBoundingClientRect();
+          if (r.width === 0 || r.height === 0) continue;
+          return { cx: r.left + r.width / 2, cy: r.top + r.height / 2 };
+        }
+        return null;
+      });
+      if (confirmPos) {
+        try {
+          await page.mouse.move(confirmPos.cx, confirmPos.cy);
+          await page.waitForTimeout(80);
+          await page.mouse.click(confirmPos.cx, confirmPos.cy, { delay: 60 });
+        } catch {}
+        await page.waitForTimeout(2500);
+        await dismissModals(page);
+      }
+    }
+    confirmClicked = `${confirmClicked}|editor=${editorState}`;
+    await shot(page, "03c-editor-state");
+
+    if (editorState.startsWith("recovering")) {
+      // Still not in the editor after all recovery rounds — fail loud
+      // with the URL so the user knows whether it's the payment gate.
+      const finalUrlNow = page.url();
+      const shotBuf = await page.screenshot({ fullPage: false }).catch(() => null);
+      const shotId = shotBuf ? saveScreenshot(shotBuf) : null;
+      await browser.close();
+      return res.status(500).json({
+        error: `Editor never loaded after ${3} attempts. Last URL: ${finalUrlNow}` +
+          (/account\/payment/i.test(finalUrlNow)
+            ? " — TikTok is redirecting to the PAYMENT page. Check VOXTY-03 billing/payment method in Ads Manager."
+            : ""),
+        confirmClicked,
+        screenshots: shots.concat(shotId ? [{ label: "payment-redirect", url: `${base}/screenshots/${shotId}` }] : []),
+      });
+    }
+
     // 6. Fill campaign name. The input is below the fold and TikTok
     //    pre-fills it with an auto-generated name ("Sales20260629…"),
     //    so we scroll into view, clear, then type. The label "Campaign
