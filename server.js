@@ -1674,9 +1674,21 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
           }
         }
 
-        // Last resort: substring match.
-        const looseRe = new RegExp(escaped, "i");
-        const loose = await pickDropdownOption(page, looseRe);
+        // Last resort: substring match, but WORD-BOUNDED so a numeric
+        // option like "25" can't match inside "254.79 USD" (that bug
+        // made Minimum age grab the budget-recommendation banner). For a
+        // fully-numeric option we also forbid an adjacent digit.
+        const isNumeric = /^\d+$/.test(optionText.trim());
+        const looseSrc = isNumeric
+          ? `(?<!\\d)${escaped}(?!\\d)`
+          : `\\b${escaped}\\b`;
+        let loose;
+        try {
+          const looseRe = new RegExp(looseSrc, "i");
+          loose = await pickDropdownOption(page, looseRe);
+        } catch {
+          loose = await pickDropdownOption(page, new RegExp(escaped, "i"));
+        }
         if (typeof loose === "string" && /^pass[123]:/.test(loose)) {
           return `picked:${optionText}|via:loose-fallback:${loose}`;
         }
