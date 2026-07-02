@@ -2069,31 +2069,37 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
               await page.waitForTimeout(400);
               await page.keyboard.type(name, { delay: 45 });
             } catch {}
-            await page.waitForTimeout(1200);
-            // Click the option in the results popup whose text starts with
-            // the country name (TikTok shows "Italy" / "Italy, Rome" etc).
+            await page.waitForTimeout(1400);
+            await shot(page, `10-loc-typed-${name}`);
+            // Click the option in the results popup whose text contains the
+            // country name. Scan ALL visible short leaves (the results are
+            // rendered in a portal that doesnt always carry option classes)
+            // and dump what we saw for diagnostics.
             const picked = await page.evaluate((needle) => {
-              const re = new RegExp("^\\s*" + needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+              const re = new RegExp("(?:^|\\b)" + needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
               const visible = (el) => {
                 const r = el.getBoundingClientRect();
                 const cs = window.getComputedStyle(el);
                 return r.width > 0 && r.height > 0 && cs.display !== "none" && cs.visibility !== "hidden";
               };
-              // Options render in a popup; scan option-ish leaves.
-              const opts = Array.from(document.querySelectorAll('[role="option"], li, [class*="option" i], [class*="item" i], [class*="lego-list" i], [class*="dropdown" i] *'));
+              const seen = [];
+              const opts = Array.from(document.querySelectorAll('[role="option"], li, [class*="option" i], [class*="item" i], [class*="lego-list" i], [class*="cascader" i], [class*="dropdown" i] *, [class*="select" i] *'));
               for (const o of opts) {
-                if (o.children.length > 3) continue;
+                if (o.children.length > 2) continue;
                 const t = (o.innerText || o.textContent || "").trim();
                 if (!t || t.length > 60) continue;
-                if (!re.test(t)) continue;
                 if (!visible(o)) continue;
+                if (seen.length < 12) seen.push(t.slice(0, 20));
+                if (!re.test(t)) continue;
+                // Skip the chip we already have (the Vietnam token echoes
+                // in the field) — options live in a popup below the box.
                 o.scrollIntoView({ block: "center" });
                 o.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
                 o.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
                 o.click();
-                return "picked:" + t.slice(0, 40);
+                return "picked:" + t.slice(0, 30);
               }
-              return "no-option";
+              return "no-option|seen=[" + seen.slice(0, 8).join(", ") + "]";
             }, name);
             await page.waitForTimeout(500);
             return picked;
@@ -2173,17 +2179,31 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
             const results = [];
             const toClick = [];
             const seen = [];
+            // Normalize: drop checkmarks/spaces, unify all dash variants
+            // (TikTok may render "18–24" with an en-dash, not a hyphen).
+            const norm = (s) => s.replace(/[✓√✔\s]/g, "").replace(/[‐-―−]/g, "-");
             const all = Array.from(document.querySelectorAll('button, [role="button"], [class*="chip" i], [class*="pill" i], [class*="tag" i], [class*="lego" i], span, div, label'));
+            // Diagnostic: dump ALL short visible texts (2-10 chars) so we
+            // can see the actual chip rendering when matching fails.
+            for (const c of all) {
+              if (c.children.length > 2) continue;
+              const t = (c.innerText || c.textContent || "").trim();
+              if (t.length < 2 || t.length > 10) continue;
+              if (!/\d/.test(t)) continue;
+              if (!isVisible(c)) continue;
+              const r = c.getBoundingClientRect();
+              if (r.width < 15 || r.width > 220) continue;
+              if (seen.length < 16) seen.push(`${t.slice(0, 8)}@${Math.round(r.width)}x${Math.round(r.height)}`);
+            }
             for (const label of chipLabels) {
-              // chip whose trimmed text starts with the label and is short.
+              const nLabel = norm(label);
               const chip = all.find((c) => {
                 if (c.children.length > 6) return false;
-                const t = (c.innerText || c.textContent || "").trim();
-                if (!t.startsWith(label)) return false;
-                if (t.length > label.length + 5) return false; // allow " ✓"
+                const t = norm((c.innerText || c.textContent || "").trim());
+                if (t !== nLabel && !t.startsWith(nLabel)) return false;
+                if (t.length > nLabel.length + 2) return false;
                 if (!isVisible(c)) return false;
                 const r = c.getBoundingClientRect();
-                if (seen.length < 12) seen.push(`${t.slice(0, 8)}@${Math.round(r.width)}x${Math.round(r.height)}`);
                 return r.width > 15 && r.width < 220 && r.height > 10 && r.height < 90;
               });
               if (!chip) { results.push(`${label}=missing`); continue; }
@@ -2220,7 +2240,7 @@ app.post("/create-smart-plus-campaign", async (req, res) => {
             } catch {}
             await page.waitForTimeout(300);
           }
-          adGroupReport.ageGroupPicks = chipInfo.results.concat(chipInfo.toClick.length === 0 && chipInfo.results.every(r => /missing/.test(r)) ? [`seen=[${(chipInfo.seen || []).join(", ")}]`] : []);
+          adGroupReport.ageGroupPicks = chipInfo.results.concat([`seen=[${(chipInfo.seen || []).join(", ")}]`]);
         }
       }
     }
